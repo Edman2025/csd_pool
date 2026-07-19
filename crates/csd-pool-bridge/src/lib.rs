@@ -690,7 +690,8 @@ async fn handle_client(
                                     }
                                     Err(err) => {
                                         pool_state.record_share_rejected(worker_address);
-                                        abuse.record_invalid_share(peer.ip());
+                                        // Vardiff transitions can produce routine low shares; banning
+                                        // their shared NAT address would evict otherwise valid miners.
                                         persist_share_event(
                                             repository.as_deref(),
                                             &share_event_from_submit(
@@ -701,7 +702,7 @@ async fn handle_client(
                                             ),
                                         )
                                         .await?;
-                                        warn!(%peer, session_id, %err, "share rejected");
+                                        debug!(%peer, session_id, %err, "low difficulty share rejected");
                                         response_error(
                                             request.id.unwrap_or(0),
                                             23,

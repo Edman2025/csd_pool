@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(config.pool.max_payout_batch_csd, "1000.0");
         assert_eq!(config.pool.max_daily_payout_csd, "5000.0");
         assert_eq!(config.pool.manual_payout_approval_csd, "250.0");
-        assert_eq!(config.abuse.max_connections_per_ip, 32);
-        assert_eq!(config.abuse.max_sessions_per_address, 64);
+        assert_eq!(config.abuse.max_connections_per_ip, 512);
+        assert_eq!(config.abuse.max_sessions_per_address, 1024);
     }
 }
