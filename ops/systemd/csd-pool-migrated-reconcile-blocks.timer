@@ -1,0 +1,12 @@
+[Unit]
+Description=Run CSD pool block receipt reconciliation
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+Unit=csd-pool-migrated-reconcile-blocks.service
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
