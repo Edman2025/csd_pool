@@ -1,0 +1,20 @@
+[Unit]
+Description=Sample CSD pool node and signer health
+After=network-online.target postgresql.service csd-pool-migrated-node.service csd-pool-migrated-signer.service
+Wants=network-online.target
+Requires=csd-pool-migrated-node.service csd-pool-migrated-signer.service
+
+[Service]
+Type=oneshot
+User=csd-pool
+Group=csd-pool
+WorkingDirectory=/data/csd-pool
+EnvironmentFile=/etc/csd-pool-migrated/csd-pool.env
+ExecStart=/data/csd-pool/release/bin/csd-pool-workers sample-health
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/data/csd-pool/state /data/csd-pool/log /data/csd-pool/backup
+TimeoutStartSec=30
+

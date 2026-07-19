@@ -1,0 +1,12 @@
+[Unit]
+Description=Sample CSD pool node and signer health periodically
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+Unit=csd-pool-migrated-sample-health.service
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
