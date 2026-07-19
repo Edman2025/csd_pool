@@ -1009,10 +1009,16 @@ require_file "ops/csd-node-adapter/compute-substrate-pool-adapter.patch"
 require_file "ops/csd-node-adapter/MANIFEST.txt"
 require_executable "ops/csd-node-adapter/apply-and-build.sh"
 require_text "ops/csd-node-adapter/MANIFEST.txt" "commit=d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c"
-require_text "ops/csd-node-adapter/MANIFEST.txt" "patch_sha256=b57eababa7db5228300bc013f95dbfc3c261c31b82edfe9388e29189cf02fbc8"
+require_text "ops/csd-node-adapter/MANIFEST.txt" "patch_sha256=6f3a42738202b21a04fd5f069552ea742baa122638757f399e70eedf215fced7"
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'CSD_POOL_ADAPTER_TOKEN'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/rpc/mining/template'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/rpc/block/submit'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'choose_pool_block_time'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'let time = now.max(min_ok);'
+require_no_regex \
+  "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" \
+  '^\+.*choose_block_time\(&st\.db' \
+  "pool template endpoint does not call the blocking miner clock"
 require_executable "ops/bin/csd-pool-node-adapter-run.sh"
 require_file "ops/systemd/csd-pool-node-adapter.service"
 require_file "ops/env/csd-pool-node.env.example"

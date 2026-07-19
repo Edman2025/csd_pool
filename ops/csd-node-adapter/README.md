@@ -27,6 +27,12 @@ The adapter adds authenticated endpoints at `/api/network`,
 `/tx/submit`, remain available. Keep the adapter RPC on a private network;
 do not expose it directly to miners or the public internet.
 
+Pool templates use a dedicated non-blocking timestamp selector. It chooses the
+later of wall clock and the parent's minimum consensus time, then enforces the
+official future-drift bound. The endpoint must never call the regular miner's
+blocking `choose_block_time`, because waiting there can return a template whose
+parent is already stale.
+
 The release also includes `ops/bin/csd-pool-node-adapter-run.sh` and
 `ops/systemd/csd-pool-node-adapter.service`. Install the compiled official node
 at `/opt/csd-node/bin/csd`, provision the canonical network genesis at

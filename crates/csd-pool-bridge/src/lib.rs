@@ -156,6 +156,11 @@ impl SharedJobWatch {
                 refresh_secs, "limiting live template tip polling interval"
             );
         }
+        info!(
+            refresh_secs,
+            template_mode = template_mode.as_str(),
+            "configured mining template refresh"
+        );
         Self::start_with_refresh(provider, repository, Duration::from_secs(refresh_secs)).await
     }
 
@@ -179,14 +184,15 @@ impl SharedJobWatch {
             loop {
                 ticker.tick().await;
                 let current = refresh_sender.borrow().clone();
-                match provider.current_tip().await {
+                let observed_tip = match provider.current_tip().await {
                     Ok(Some(tip)) if tip == current.template.prev => continue,
-                    Ok(_) => {}
+                    Ok(tip) => tip,
                     Err(err) => {
                         warn!(%err, "mining tip refresh failed; retaining current job");
                         continue;
                     }
-                }
+                };
+                let refresh_started = Instant::now();
                 let next = match provider.current_job().await {
                     Ok(job) => Arc::new(job),
                     Err(err) => {
@@ -194,6 +200,28 @@ impl SharedJobWatch {
                         continue;
                     }
                 };
+                let latest_tip = match provider.current_tip().await {
+                    Ok(tip) => tip.or(observed_tip),
+                    Err(err) => {
+                        warn!(
+                            %err,
+                            job_id = next.template.job_id,
+                            "mining tip revalidation failed; retaining current job"
+                        );
+                        continue;
+                    }
+                };
+                if let Some(tip) = latest_tip {
+                    if next.template.prev != tip {
+                        warn!(
+                            job_id = next.template.job_id,
+                            template_parent = %hex::encode(next.template.prev),
+                            live_tip = %hex::encode(tip),
+                            "discarding stale mining template"
+                        );
+                        continue;
+                    }
+                }
                 if next.template.job_id == refresh_sender.borrow().template.job_id {
                     continue;
                 }
@@ -208,6 +236,7 @@ impl SharedJobWatch {
                 }
                 info!(
                     job_id = next.template.job_id,
+                    refresh_ms = refresh_started.elapsed().as_millis(),
                     "broadcasting refreshed mining job"
                 );
                 refresh_sender.send_replace(next);
@@ -1490,6 +1519,31 @@ mod tests {
         }
     }
 
+    struct LaggingTemplateProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TemplateProvider for LaggingTemplateProvider {
+        async fn current_job(&self) -> csd_pool_node::Result<PoolJob> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut job = csd_pool_node::easy_static_job(match call {
+                0 => "job-initial",
+                1 => "job-stale",
+                _ => "job-fresh",
+            });
+            if call >= 2 {
+                job.template.prev = [1; 32];
+                job.notify.prev_hash_be_hex = "01".repeat(32);
+            }
+            Ok(job)
+        }
+
+        async fn current_tip(&self) -> csd_pool_node::Result<Option<[u8; 32]>> {
+            Ok(Some([1; 32]))
+        }
+    }
+
     struct FailingBlockSubmitter;
 
     #[test]
@@ -1553,6 +1607,25 @@ mod tests {
             .unwrap();
         assert_eq!(receiver.borrow().template.job_id, "job-refreshed");
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn shared_job_watch_discards_template_that_lags_live_tip() {
+        let provider = Arc::new(LaggingTemplateProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let jobs =
+            SharedJobWatch::start_with_refresh(provider.clone(), None, Duration::from_millis(10))
+                .await
+                .unwrap();
+        let mut receiver = jobs.subscribe();
+
+        tokio::time::timeout(Duration::from_secs(1), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receiver.borrow().template.job_id, "job-fresh");
+        assert!(provider.calls.load(Ordering::SeqCst) >= 3);
     }
 
     #[tokio::test]

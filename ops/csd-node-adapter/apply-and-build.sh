@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="${1:-${CSD_SOURCE_DIR:-}}"
 EXPECTED_COMMIT="d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c"
-EXPECTED_PATCH_SHA256="b57eababa7db5228300bc013f95dbfc3c261c31b82edfe9388e29189cf02fbc8"
+EXPECTED_PATCH_SHA256="6f3a42738202b21a04fd5f069552ea742baa122638757f399e70eedf215fced7"
 PATCH_FILE="$SCRIPT_DIR/compute-substrate-pool-adapter.patch"
 
 fail() {
@@ -17,6 +17,16 @@ sha256_value() {
     sha256sum "$1" | awk '{print $1}'
   else
     shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+search_source() {
+  local pattern="$1"
+  local path="$2"
+  if command -v rg >/dev/null 2>&1; then
+    rg -q "$pattern" "$path"
+  else
+    grep -Eq "$pattern" "$path"
   fi
 }
 
@@ -39,12 +49,17 @@ rustfmt --edition 2021 \
   "$SOURCE_DIR/src/cli/main.rs"
 patch -d "$SOURCE_DIR" -p1 --forward <"$PATCH_FILE"
 
-rg -q 'CSD_POOL_ADAPTER_TOKEN' "$SOURCE_DIR/src/api/mod.rs" || \
+search_source 'CSD_POOL_ADAPTER_TOKEN' "$SOURCE_DIR/src/api/mod.rs" || \
   fail "adapter authentication code missing after patch"
-rg -q '/api/rpc/mining/template' "$SOURCE_DIR/src/api/mod.rs" || \
+search_source '/api/rpc/mining/template' "$SOURCE_DIR/src/api/mod.rs" || \
   fail "mining template endpoint missing after patch"
-rg -q '/api/rpc/block/submit' "$SOURCE_DIR/src/api/mod.rs" || \
+search_source '/api/rpc/block/submit' "$SOURCE_DIR/src/api/mod.rs" || \
   fail "block submit endpoint missing after patch"
+search_source 'choose_pool_block_time' "$SOURCE_DIR/src/api/mod.rs" || \
+  fail "non-blocking pool template time is missing after patch"
+if search_source 'choose_block_time\(&st\.db' "$SOURCE_DIR/src/api/mod.rs"; then
+  fail "pool template endpoint still calls the blocking miner clock"
+fi
 
 if [[ "${CSD_NODE_ADAPTER_SKIP_BUILD:-0}" != "1" ]]; then
   cargo check --manifest-path "$SOURCE_DIR/Cargo.toml" --lib --bin csd
