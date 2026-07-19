@@ -33,6 +33,8 @@ sequenceDiagram
   P-->>M: true
   P-->>M: mining.set_difficulty [difficulty]
   P-->>M: mining.notify [job tuple]
+  M->>P: mining.suggest_difficulty [optional hint]
+  P-->>M: mining.set_difficulty [clamped hint]
   loop mining
     M->>P: mining.submit
     P-->>M: true or error
@@ -135,11 +137,28 @@ Server push:
 {
   "id": null,
   "method": "mining.set_difficulty",
-  "params": [8.0]
+  "params": [16.0]
 }
 ```
 
-### 4.4 `mining.notify`
+### 4.4 `mining.suggest_difficulty`
+
+Optional miner hint:
+
+```json
+{
+  "id": 3,
+  "method": "mining.suggest_difficulty",
+  "params": [14.0]
+}
+```
+
+The pool accepts one finite positive hint before the session's first accepted
+share, clamps it to the configured minimum and maximum, and remains authoritative
+for all later VarDiff changes. Invalid hints receive error code 20. An
+unauthorized session receives error code 24.
+
+### 4.5 `mining.notify`
 
 Server push:
 
@@ -177,7 +196,7 @@ Tuple order must be byte-compatible with the public miner:
 ]
 ```
 
-### 4.5 `mining.submit`
+### 4.6 `mining.submit`
 
 Request:
 

@@ -130,18 +130,60 @@ pub struct StratumSection {
     pub min_difficulty: f64,
     pub max_difficulty: f64,
     pub target_share_secs: u64,
+    #[serde(default = "default_vardiff_retarget_secs")]
+    pub vardiff_retarget_secs: u64,
+    #[serde(default = "default_vardiff_ewma_alpha")]
+    pub vardiff_ewma_alpha: f64,
+    #[serde(default = "default_vardiff_fast_share_ratio")]
+    pub vardiff_fast_share_ratio: f64,
+    #[serde(default = "default_vardiff_slow_share_ratio")]
+    pub vardiff_slow_share_ratio: f64,
+    #[serde(default = "default_vardiff_max_adjustment_factor")]
+    pub vardiff_max_adjustment_factor: f64,
+    #[serde(default = "default_vardiff_transition_grace_secs")]
+    pub vardiff_transition_grace_secs: u64,
 }
 
 impl Default for StratumSection {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:3333".to_owned(),
-            initial_difficulty: 8.0,
+            initial_difficulty: 16.0,
             min_difficulty: 8.0,
             max_difficulty: 512.0,
             target_share_secs: 20,
+            vardiff_retarget_secs: default_vardiff_retarget_secs(),
+            vardiff_ewma_alpha: default_vardiff_ewma_alpha(),
+            vardiff_fast_share_ratio: default_vardiff_fast_share_ratio(),
+            vardiff_slow_share_ratio: default_vardiff_slow_share_ratio(),
+            vardiff_max_adjustment_factor: default_vardiff_max_adjustment_factor(),
+            vardiff_transition_grace_secs: default_vardiff_transition_grace_secs(),
         }
     }
+}
+
+fn default_vardiff_retarget_secs() -> u64 {
+    120
+}
+
+fn default_vardiff_ewma_alpha() -> f64 {
+    0.25
+}
+
+fn default_vardiff_fast_share_ratio() -> f64 {
+    0.75
+}
+
+fn default_vardiff_slow_share_ratio() -> f64 {
+    1.5
+}
+
+fn default_vardiff_max_adjustment_factor() -> f64 {
+    1.5
+}
+
+fn default_vardiff_transition_grace_secs() -> u64 {
+    15
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -350,6 +392,12 @@ mod tests {
         assert_eq!(config.abuse.max_connections_per_ip, 32);
         assert_eq!(config.abuse.max_sessions_per_address, 64);
         assert_eq!(config.abuse.ban_secs, 600);
+        assert_eq!(config.stratum.vardiff_retarget_secs, 120);
+        assert_eq!(config.stratum.vardiff_ewma_alpha, 0.25);
+        assert_eq!(config.stratum.vardiff_fast_share_ratio, 0.75);
+        assert_eq!(config.stratum.vardiff_slow_share_ratio, 1.5);
+        assert_eq!(config.stratum.vardiff_max_adjustment_factor, 1.5);
+        assert_eq!(config.stratum.vardiff_transition_grace_secs, 15);
         assert_eq!(config.signer.listen, "127.0.0.1:8890");
         assert_eq!(config.signer.token_env, "CSD_POOL_SIGNER_TOKEN");
     }

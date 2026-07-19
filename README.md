@@ -633,9 +633,13 @@ and share counters are held in one shared runtime state, so `/api/pool`,
 same process.
 
 The bridge assigns `[stratum].initial_difficulty` on authorization and applies
-per-session vardiff after accepted shares. Shares faster than half the target
-interval double difficulty; shares slower than twice the target interval halve
-it, clamped to `[stratum].min_difficulty` and `[stratum].max_difficulty`.
+per-session vardiff after accepted shares. Share intervals feed an EWMA; the
+bridge evaluates a change no more often than
+`[stratum].vardiff_retarget_secs`, requires explicit fast/slow hysteresis, and
+caps each adjustment by `[stratum].vardiff_max_adjustment_factor`. A valid
+pre-share `mining.suggest_difficulty` hint is clamped to the configured
+difficulty range. When difficulty increases, the previous target remains valid
+for the short configured transition grace so in-flight work is not rejected.
 Assigned difficulty is enforced by validating submits against
 `base_share_target / ceil(difficulty)` before the share is persisted.
 

@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use csd_pool_consensus::{
-    SubmitSolution, VerifiedShare, WorkTemplate, coinbase_bytes, compose_extranonce,
-    difficulty_for_target, parse_le_u32_hex_bytes, parse_u32_hex, verify_share_with_difficulty,
+    ConsensusError, SubmitSolution, VerifiedShare, WorkTemplate, coinbase_bytes,
+    compose_extranonce, difficulty_for_target, parse_le_u32_hex_bytes, parse_u32_hex,
+    verify_share_with_difficulty,
 };
 use csd_pool_db::{JobRecord, MiningRepository, PgRepository, ShareEventRecord, ShareRecord};
 use csd_pool_node::{
@@ -355,10 +356,16 @@ pub fn vardiff_config_from_env() -> Result<VardiffConfig> {
     }
 
     Ok(VardiffConfig {
-        initial_difficulty: env_f64("CSD_POOL_INITIAL_DIFFICULTY", 8.0),
+        initial_difficulty: env_f64("CSD_POOL_INITIAL_DIFFICULTY", 16.0),
         min_difficulty: env_f64("CSD_POOL_MIN_DIFFICULTY", 8.0),
         max_difficulty: env_f64("CSD_POOL_MAX_DIFFICULTY", 512.0),
         target_share_secs: env_u64("CSD_POOL_TARGET_SHARE_SECS", 20),
+        retarget_secs: env_u64("CSD_POOL_VARDIFF_RETARGET_SECS", 120),
+        ewma_alpha: env_f64("CSD_POOL_VARDIFF_EWMA_ALPHA", 0.25),
+        fast_share_ratio: env_f64("CSD_POOL_VARDIFF_FAST_SHARE_RATIO", 0.75),
+        slow_share_ratio: env_f64("CSD_POOL_VARDIFF_SLOW_SHARE_RATIO", 1.5),
+        max_adjustment_factor: env_f64("CSD_POOL_VARDIFF_MAX_ADJUSTMENT_FACTOR", 1.5),
+        transition_grace_secs: env_u64("CSD_POOL_VARDIFF_TRANSITION_GRACE_SECS", 15),
     }
     .normalized())
 }
@@ -598,6 +605,20 @@ async fn handle_client(
                     }
                 }
             }
+            "mining.suggest_difficulty" => {
+                if authorized_worker.is_none() {
+                    response_error(request.id.unwrap_or(0), 24, "unauthorized")
+                } else {
+                    match parse_suggested_difficulty(&request.params) {
+                        Some(suggested_difficulty) => {
+                            pending_difficulty = vardiff
+                                .apply_suggested_difficulty(suggested_difficulty, Instant::now());
+                            response_ok(request.id.unwrap_or(0))
+                        }
+                        None => response_error(request.id.unwrap_or(0), 20, "invalid difficulty"),
+                    }
+                }
+            }
             "mining.submit" => {
                 if authorized_worker.is_none() {
                     response_error(request.id.unwrap_or(0), 24, "unauthorized")
@@ -648,22 +669,23 @@ async fn handle_client(
                                 response_error(request.id.unwrap_or(0), 22, "duplicate share")
                             } else {
                                 let validation_started = Instant::now();
-                                let validation_result = verify_submit(
+                                let validation_result = verify_submit_with_vardiff(
                                     &current_job.template,
                                     extranonce1_le,
                                     &submit,
-                                    vardiff.current_difficulty(),
+                                    &vardiff,
+                                    validation_started,
                                 );
                                 pool_state.record_share_validation(validation_started.elapsed());
                                 match validation_result {
-                                    Ok(share) => {
+                                    Ok((share, accepted_difficulty)) => {
                                         let persisted = persist_accepted_share(
                                             repository.as_deref(),
                                             &current_job,
                                             worker_address,
                                             &submit,
                                             &share,
-                                            vardiff.current_difficulty(),
+                                            accepted_difficulty,
                                         )
                                         .await?;
                                         if persisted {
@@ -677,17 +699,17 @@ async fn handle_client(
                                                     &submit,
                                                     &share,
                                                     extranonce1_le,
-                                                    vardiff.current_difficulty(),
+                                                    accepted_difficulty,
                                                 )
                                                 .await?;
                                             }
                                             pool_state.record_share_accepted(
                                                 worker_address,
-                                                vardiff.current_difficulty(),
+                                                accepted_difficulty,
                                                 share.is_block_candidate,
                                             );
                                             pending_difficulty =
-                                                vardiff.record_accepted_share(Instant::now());
+                                                vardiff.record_accepted_share(validation_started);
                                             info!(
                                                 %peer,
                                                 session_id,
@@ -1098,6 +1120,15 @@ fn parse_authorize_worker(params: &Value) -> Option<String> {
     Some(address.to_owned())
 }
 
+fn parse_suggested_difficulty(params: &Value) -> Option<f64> {
+    let values = params.as_array()?;
+    if values.len() != 1 {
+        return None;
+    }
+    let difficulty = values.first()?.as_f64()?;
+    (difficulty.is_finite() && difficulty > 0.0).then_some(difficulty)
+}
+
 fn valid_addr20(addr: &str) -> bool {
     addr.len() == 40 && addr.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -1138,6 +1169,27 @@ fn verify_submit(
     verify_share_with_difficulty(template, extranonce1_le, &solution, difficulty)
 }
 
+fn verify_submit_with_vardiff(
+    template: &WorkTemplate,
+    extranonce1_le: [u8; 4],
+    submit: &SubmitParams,
+    vardiff: &VardiffState,
+    now: Instant,
+) -> std::result::Result<(VerifiedShare, f64), ConsensusError> {
+    let current_difficulty = vardiff.current_difficulty();
+    match verify_submit(template, extranonce1_le, submit, current_difficulty) {
+        Ok(share) => Ok((share, current_difficulty)),
+        Err(ConsensusError::LowDifficultyShare) => {
+            let Some(previous_difficulty) = vardiff.previous_difficulty(now) else {
+                return Err(ConsensusError::LowDifficultyShare);
+            };
+            verify_submit(template, extranonce1_le, submit, previous_difficulty)
+                .map(|share| (share, previous_difficulty))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ShareKey {
     job_id: String,
@@ -1163,6 +1215,12 @@ pub struct VardiffConfig {
     pub min_difficulty: f64,
     pub max_difficulty: f64,
     pub target_share_secs: u64,
+    pub retarget_secs: u64,
+    pub ewma_alpha: f64,
+    pub fast_share_ratio: f64,
+    pub slow_share_ratio: f64,
+    pub max_adjustment_factor: f64,
+    pub transition_grace_secs: u64,
 }
 
 impl Default for VardiffConfig {
@@ -1178,6 +1236,12 @@ impl From<csd_pool_config::StratumSection> for VardiffConfig {
             min_difficulty: value.min_difficulty,
             max_difficulty: value.max_difficulty,
             target_share_secs: value.target_share_secs,
+            retarget_secs: value.vardiff_retarget_secs,
+            ewma_alpha: value.vardiff_ewma_alpha,
+            fast_share_ratio: value.vardiff_fast_share_ratio,
+            slow_share_ratio: value.vardiff_slow_share_ratio,
+            max_adjustment_factor: value.vardiff_max_adjustment_factor,
+            transition_grace_secs: value.vardiff_transition_grace_secs,
         }
         .normalized()
     }
@@ -1188,20 +1252,46 @@ impl VardiffConfig {
         if !self.min_difficulty.is_finite() || self.min_difficulty <= 0.0 {
             self.min_difficulty = 1.0;
         }
+        self.min_difficulty = self.min_difficulty.ceil();
         if !self.max_difficulty.is_finite() || self.max_difficulty < self.min_difficulty {
             self.max_difficulty = self.min_difficulty;
         }
+        self.max_difficulty = self.max_difficulty.floor().max(self.min_difficulty);
         if !self.initial_difficulty.is_finite() || self.initial_difficulty <= 0.0 {
             self.initial_difficulty = self.min_difficulty;
         }
         self.initial_difficulty = self
             .initial_difficulty
+            .ceil()
             .clamp(self.min_difficulty, self.max_difficulty);
         if self.target_share_secs == 0 {
             self.target_share_secs = 20;
         }
+        self.retarget_secs = self.retarget_secs.max(120);
+        if !self.ewma_alpha.is_finite() || self.ewma_alpha <= 0.0 || self.ewma_alpha > 1.0 {
+            self.ewma_alpha = 0.25;
+        }
+        if !self.fast_share_ratio.is_finite()
+            || self.fast_share_ratio <= 0.0
+            || self.fast_share_ratio >= 1.0
+        {
+            self.fast_share_ratio = 0.75;
+        }
+        if !self.slow_share_ratio.is_finite() || self.slow_share_ratio <= 1.0 {
+            self.slow_share_ratio = 1.5;
+        }
+        if !self.max_adjustment_factor.is_finite() || self.max_adjustment_factor <= 1.0 {
+            self.max_adjustment_factor = 1.5;
+        }
+        self.transition_grace_secs = self.transition_grace_secs.clamp(1, 60);
         self
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreviousDifficulty {
+    difficulty: f64,
+    expires_at: Instant,
 }
 
 #[derive(Debug)]
@@ -1209,15 +1299,25 @@ pub struct VardiffState {
     config: VardiffConfig,
     current_difficulty: f64,
     last_share_at: Option<Instant>,
+    last_retarget_at: Option<Instant>,
+    ewma_share_secs: f64,
+    previous_difficulty: Option<PreviousDifficulty>,
+    suggestion_received: bool,
 }
 
 impl VardiffState {
     pub fn new(config: VardiffConfig) -> Self {
         let config = config.normalized();
+        let current_difficulty = config.initial_difficulty;
+        let ewma_share_secs = config.target_share_secs as f64;
         Self {
-            current_difficulty: config.initial_difficulty,
+            current_difficulty,
             config,
             last_share_at: None,
+            last_retarget_at: None,
+            ewma_share_secs,
+            previous_difficulty: None,
+            suggestion_received: false,
         }
     }
 
@@ -1225,24 +1325,97 @@ impl VardiffState {
         self.current_difficulty
     }
 
+    pub fn previous_difficulty(&self, now: Instant) -> Option<f64> {
+        self.previous_difficulty
+            .filter(|previous| previous.expires_at >= now)
+            .map(|previous| previous.difficulty)
+    }
+
+    pub fn apply_suggested_difficulty(
+        &mut self,
+        suggested_difficulty: f64,
+        now: Instant,
+    ) -> Option<f64> {
+        if self.suggestion_received
+            || self.last_share_at.is_some()
+            || !suggested_difficulty.is_finite()
+            || suggested_difficulty <= 0.0
+        {
+            return None;
+        }
+        self.suggestion_received = true;
+
+        let suggested_difficulty = suggested_difficulty
+            .ceil()
+            .clamp(self.config.min_difficulty, self.config.max_difficulty);
+        let changed = self.transition_to(suggested_difficulty, now);
+        if changed.is_some() {
+            self.last_retarget_at = Some(now);
+            self.ewma_share_secs = self.config.target_share_secs as f64;
+        }
+        changed
+    }
+
     pub fn record_accepted_share(&mut self, now: Instant) -> Option<f64> {
-        let last_share_at = self.last_share_at.replace(now)?;
+        let Some(last_share_at) = self.last_share_at.replace(now) else {
+            self.last_retarget_at.get_or_insert(now);
+            return None;
+        };
         let elapsed_secs = now
             .checked_duration_since(last_share_at)
             .unwrap_or_default()
             .as_secs_f64();
         let target = self.config.target_share_secs as f64;
-        let next = if elapsed_secs < target / 2.0 {
-            self.current_difficulty * 2.0
-        } else if elapsed_secs > target * 2.0 {
-            self.current_difficulty / 2.0
+        let bounded_sample = elapsed_secs.clamp(target * 0.25, target * 4.0);
+        self.ewma_share_secs = self.config.ewma_alpha * bounded_sample
+            + (1.0 - self.config.ewma_alpha) * self.ewma_share_secs;
+
+        let last_retarget_at = self.last_retarget_at.get_or_insert(now);
+        if now
+            .checked_duration_since(*last_retarget_at)
+            .unwrap_or_default()
+            < Duration::from_secs(self.config.retarget_secs)
+        {
+            return None;
+        }
+
+        let too_fast = self.ewma_share_secs < target * self.config.fast_share_ratio;
+        let too_slow = self.ewma_share_secs > target * self.config.slow_share_ratio;
+        if !too_fast && !too_slow {
+            return None;
+        }
+
+        let desired = self.current_difficulty * target / self.ewma_share_secs;
+        let next = if desired > self.current_difficulty {
+            desired
+                .min(self.current_difficulty * self.config.max_adjustment_factor)
+                .floor()
         } else {
-            self.current_difficulty
+            desired
+                .max(self.current_difficulty / self.config.max_adjustment_factor)
+                .ceil()
         }
         .clamp(self.config.min_difficulty, self.config.max_difficulty);
 
+        let changed = self.transition_to(next, now);
+        if changed.is_some() {
+            self.last_retarget_at = Some(now);
+            self.ewma_share_secs = target;
+        }
+        changed
+    }
+
+    fn transition_to(&mut self, next: f64, now: Instant) -> Option<f64> {
         if (next - self.current_difficulty).abs() < f64::EPSILON {
             return None;
+        }
+        if next > self.current_difficulty {
+            self.previous_difficulty = Some(PreviousDifficulty {
+                difficulty: self.current_difficulty,
+                expires_at: now + Duration::from_secs(self.config.transition_grace_secs),
+            });
+        } else {
+            self.previous_difficulty = None;
         }
         self.current_difficulty = next;
         Some(next)
@@ -1684,6 +1857,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authorized_tcp_client_can_suggest_a_safely_clamped_difficulty() {
+        let provider = Arc::new(StaticTemplateProvider::easy_job("static-suggest"));
+        let jobs = SharedJobWatch::start(provider, None).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).await.unwrap();
+        let (server_stream, peer) = listener.accept().await.unwrap();
+        let abuse = Arc::new(AbuseManager::default());
+        let permit = abuse.try_open(peer.ip()).unwrap();
+        let session = tokio::spawn(handle_client(
+            server_stream,
+            peer,
+            SharedPoolState::new(),
+            jobs.subscribe(),
+            None,
+            None,
+            abuse,
+            test_vardiff_config(16.0),
+            permit,
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+        write_half
+            .write_all(
+                b"{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"0123456789abcdef0123456789abcdef01234567.rig-a\",\"x\"]}\n",
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        write_half
+            .write_all(b"{\"id\":2,\"method\":\"mining.suggest_difficulty\",\"params\":[1.0]}\n")
+            .await
+            .unwrap();
+        let mut response_line = String::new();
+        let mut difficulty_line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut response_line))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            reader.read_line(&mut difficulty_line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let response: Value = serde_json::from_str(response_line.trim()).unwrap();
+        let difficulty: Value = serde_json::from_str(difficulty_line.trim()).unwrap();
+        assert_eq!(response["id"], 2);
+        assert_eq!(response["result"], true);
+        assert_eq!(difficulty["method"], "mining.set_difficulty");
+        assert_eq!(difficulty["params"][0], 8.0);
+        session.abort();
+    }
+
+    #[tokio::test]
     async fn persists_candidate_without_ending_session_when_node_transport_fails() {
         let job = csd_pool_node::easy_static_job("static-1");
         let submit = SubmitParams {
@@ -1755,6 +1994,21 @@ mod tests {
         let invalid =
             serde_json::json!([format!("0123456789abcdef0123456789abcdef01234567/rig"), "x"]);
         assert!(parse_authorize_worker(&invalid).is_none());
+    }
+
+    #[test]
+    fn parses_only_one_finite_positive_suggested_difficulty() {
+        assert_eq!(
+            parse_suggested_difficulty(&serde_json::json!([14.25])),
+            Some(14.25)
+        );
+        assert_eq!(parse_suggested_difficulty(&serde_json::json!([0.0])), None);
+        assert_eq!(parse_suggested_difficulty(&serde_json::json!([-1.0])), None);
+        assert_eq!(
+            parse_suggested_difficulty(&serde_json::json!([14.0, 16.0])),
+            None
+        );
+        assert_eq!(parse_suggested_difficulty(&serde_json::json!(["14"])), None);
     }
 
     #[test]
@@ -2061,72 +2315,172 @@ mod tests {
         assert!(manager.is_banned(share_ip));
     }
 
-    #[test]
-    fn vardiff_increases_when_shares_arrive_too_fast() {
-        let mut vardiff = VardiffState::new(VardiffConfig {
-            initial_difficulty: 8.0,
+    fn test_vardiff_config(initial_difficulty: f64) -> VardiffConfig {
+        VardiffConfig {
+            initial_difficulty,
             min_difficulty: 8.0,
             max_difficulty: 64.0,
             target_share_secs: 20,
-        });
+            retarget_secs: 120,
+            ewma_alpha: 0.25,
+            fast_share_ratio: 0.75,
+            slow_share_ratio: 1.5,
+            max_adjustment_factor: 1.5,
+            transition_grace_secs: 15,
+        }
+    }
+
+    #[test]
+    fn vardiff_hysteresis_does_not_chase_alternating_share_jitter() {
+        let mut vardiff = VardiffState::new(test_vardiff_config(16.0));
+        let start = Instant::now();
+        let mut elapsed = 0;
+
+        assert_eq!(vardiff.record_accepted_share(start), None);
+        for interval_secs in [14_u64, 26].into_iter().cycle().take(20) {
+            elapsed += interval_secs;
+            assert_eq!(
+                vardiff.record_accepted_share(start + Duration::from_secs(elapsed)),
+                None
+            );
+        }
+        assert_eq!(vardiff.current_difficulty(), 16.0);
+    }
+
+    #[test]
+    fn vardiff_fast_shares_wait_for_retarget_window_and_are_step_limited() {
+        let mut vardiff = VardiffState::new(test_vardiff_config(8.0));
         let start = Instant::now();
 
         assert_eq!(vardiff.record_accepted_share(start), None);
+        for sample in 1..24 {
+            assert_eq!(
+                vardiff.record_accepted_share(start + Duration::from_secs(sample * 5)),
+                None
+            );
+        }
         assert_eq!(
-            vardiff.record_accepted_share(start + Duration::from_secs(5)),
-            Some(16.0)
+            vardiff.record_accepted_share(start + Duration::from_secs(120)),
+            Some(12.0)
         );
+        assert_eq!(vardiff.current_difficulty(), 12.0);
+
+        for sample in 25..48 {
+            assert_eq!(
+                vardiff.record_accepted_share(start + Duration::from_secs(sample * 5)),
+                None
+            );
+        }
         assert_eq!(
-            vardiff.record_accepted_share(start + Duration::from_secs(9)),
-            Some(32.0)
+            vardiff.record_accepted_share(start + Duration::from_secs(240)),
+            Some(18.0)
         );
     }
 
     #[test]
-    fn vardiff_decreases_when_shares_arrive_too_slow() {
-        let mut vardiff = VardiffState::new(VardiffConfig {
-            initial_difficulty: 32.0,
-            min_difficulty: 8.0,
-            max_difficulty: 64.0,
-            target_share_secs: 20,
-        });
+    fn vardiff_slow_shares_are_smoothed_and_step_limited() {
+        let mut vardiff = VardiffState::new(test_vardiff_config(32.0));
         let start = Instant::now();
 
         assert_eq!(vardiff.record_accepted_share(start), None);
         assert_eq!(
             vardiff.record_accepted_share(start + Duration::from_secs(45)),
-            Some(16.0)
+            None
         );
         assert_eq!(
             vardiff.record_accepted_share(start + Duration::from_secs(90)),
-            Some(8.0)
+            None
         );
         assert_eq!(
             vardiff.record_accepted_share(start + Duration::from_secs(135)),
+            Some(22.0)
+        );
+        assert_eq!(vardiff.current_difficulty(), 22.0);
+        assert_eq!(
+            vardiff.record_accepted_share(start + Duration::from_secs(180)),
             None
+        );
+        assert_eq!(
+            vardiff.record_accepted_share(start + Duration::from_secs(225)),
+            None
+        );
+        assert_eq!(
+            vardiff.record_accepted_share(start + Duration::from_secs(270)),
+            Some(15.0)
         );
     }
 
     #[test]
-    fn vardiff_clamps_initial_and_adjusted_values() {
-        let mut vardiff = VardiffState::new(VardiffConfig {
-            initial_difficulty: 1.0,
-            min_difficulty: 8.0,
-            max_difficulty: 16.0,
-            target_share_secs: 20,
-        });
+    fn suggested_difficulty_is_clamped_and_only_applies_before_first_share() {
         let start = Instant::now();
+        let mut low = VardiffState::new(test_vardiff_config(16.0));
+        assert_eq!(low.apply_suggested_difficulty(1.0, start), Some(8.0));
+        assert_eq!(low.current_difficulty(), 8.0);
+        assert_eq!(low.apply_suggested_difficulty(32.0, start), None);
+        assert_eq!(low.apply_suggested_difficulty(f64::INFINITY, start), None);
 
-        assert_eq!(vardiff.current_difficulty(), 8.0);
-        vardiff.record_accepted_share(start);
+        let mut invalid = VardiffState::new(test_vardiff_config(16.0));
         assert_eq!(
-            vardiff.record_accepted_share(start + Duration::from_secs(1)),
-            Some(16.0)
-        );
-        assert_eq!(
-            vardiff.record_accepted_share(start + Duration::from_secs(2)),
+            invalid.apply_suggested_difficulty(f64::INFINITY, start),
             None
         );
-        assert_eq!(vardiff.current_difficulty(), 16.0);
+        assert_eq!(invalid.apply_suggested_difficulty(14.0, start), Some(14.0));
+
+        let mut high = VardiffState::new(test_vardiff_config(16.0));
+        assert_eq!(high.apply_suggested_difficulty(10_000.0, start), Some(64.0));
+        assert_eq!(high.current_difficulty(), 64.0);
+        assert_eq!(high.record_accepted_share(start), None);
+        assert_eq!(
+            high.apply_suggested_difficulty(8.0, start + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(high.current_difficulty(), 64.0);
+    }
+
+    #[test]
+    fn previous_difficulty_is_accepted_only_during_transition_grace() {
+        let start = Instant::now();
+        let mut vardiff = VardiffState::new(test_vardiff_config(8.0));
+        assert_eq!(vardiff.apply_suggested_difficulty(16.0, start), Some(16.0));
+        let job = csd_pool_node::easy_static_job("transition-job");
+        let mut submit = SubmitParams {
+            worker_name: "0123456789abcdef0123456789abcdef01234567.rig-a".to_owned(),
+            job_id: job.template.job_id.clone(),
+            extranonce2_hex: "01020304".to_owned(),
+            ntime_hex: job.notify.ntime_hex.clone(),
+            nonce_hex: String::new(),
+        };
+        submit.nonce_hex = (0_u32..10_000)
+            .map(|nonce| format!("{nonce:08x}"))
+            .find(|nonce_hex| {
+                let mut candidate = submit.clone();
+                candidate.nonce_hex = nonce_hex.clone();
+                verify_submit(&job.template, [1, 0, 0, 0], &candidate, 8.0).is_ok()
+                    && matches!(
+                        verify_submit(&job.template, [1, 0, 0, 0], &candidate, 16.0),
+                        Err(ConsensusError::LowDifficultyShare)
+                    )
+            })
+            .expect("find a share valid at difficulty 8 but not 16");
+
+        let (_, accepted_difficulty) = verify_submit_with_vardiff(
+            &job.template,
+            [1, 0, 0, 0],
+            &submit,
+            &vardiff,
+            start + Duration::from_secs(14),
+        )
+        .unwrap();
+        assert_eq!(accepted_difficulty, 8.0);
+        assert!(matches!(
+            verify_submit_with_vardiff(
+                &job.template,
+                [1, 0, 0, 0],
+                &submit,
+                &vardiff,
+                start + Duration::from_secs(16),
+            ),
+            Err(ConsensusError::LowDifficultyShare)
+        ));
     }
 }

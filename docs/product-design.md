@@ -309,11 +309,15 @@ Requirements:
 
 Current implementation uses `[stratum].initial_difficulty`,
 `[stratum].min_difficulty`, `[stratum].max_difficulty`, and
-`[stratum].target_share_secs`. Accepted shares faster than half the target
-double the assigned difficulty; accepted shares slower than twice the target
-halve it. The assigned difficulty is enforced during share validation by
-dividing the base share target by the assigned difficulty. Multi-instance shared
-vardiff state remains a Redis-backed follow-up.
+`[stratum].target_share_secs`. It smooths accepted-share intervals with an EWMA,
+waits at least 120 seconds between changes, requires separate fast/slow
+hysteresis thresholds, and caps each adjustment. A finite positive
+`mining.suggest_difficulty` is accepted only before the first accepted share and
+is clamped to the configured range. Difficulty increases retain the prior
+difficulty for a bounded transition grace so already-running work can finish.
+The assigned difficulty is enforced during share validation by dividing the
+base share target by the assigned difficulty. Multi-instance shared vardiff
+state remains a Redis-backed follow-up.
 
 ## 5. Reward Design
 

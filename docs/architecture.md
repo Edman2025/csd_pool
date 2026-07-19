@@ -1076,10 +1076,16 @@ manual_payout_approval_csd = "250.0"
 
 [stratum.port_3333]
 listen = "0.0.0.0:3333"
-initial_difficulty = 8
+initial_difficulty = 16
 min_difficulty = 8
 max_difficulty = 512
 target_share_secs = 20
+vardiff_retarget_secs = 120
+vardiff_ewma_alpha = 0.25
+vardiff_fast_share_ratio = 0.75
+vardiff_slow_share_ratio = 1.5
+vardiff_max_adjustment_factor = 1.5
+vardiff_transition_grace_secs = 15
 
 [stratum.port_7777]
 listen = "0.0.0.0:7777"
@@ -1087,6 +1093,12 @@ initial_difficulty = 128
 min_difficulty = 64
 max_difficulty = 4096
 target_share_secs = 20
+vardiff_retarget_secs = 120
+vardiff_ewma_alpha = 0.25
+vardiff_fast_share_ratio = 0.75
+vardiff_slow_share_ratio = 1.5
+vardiff_max_adjustment_factor = 1.5
+vardiff_transition_grace_secs = 15
 
 [[csd_nodes]]
 name = "node-a"
@@ -1110,9 +1122,13 @@ url_env = "CSD_POOL_SIGNER_URL"
 
 Current implementation note: the bridge supports one `[stratum]` section and
 keeps vardiff state in each TCP session. It sends the initial difficulty on
-authorization, then sends `mining.set_difficulty` after accepted shares when the
-observed interval is faster than half or slower than twice the target share
-interval. The consensus adapter converts assigned difficulty into
+authorization, smooths share intervals with an EWMA, waits at least 120 seconds
+between adjustments, applies separate fast/slow hysteresis, and caps one change
+to the configured factor. A valid `mining.suggest_difficulty` sent before the
+first accepted share is clamped to the configured range. After an upward
+adjustment, the prior difficulty remains valid only for the configured
+transition grace; a share accepted through that grace is persisted at the prior
+difficulty. The consensus adapter converts assigned difficulty into
 `base_share_target / ceil(difficulty)` and validates the submit hash against
 that effective target before persisting the share. Multi-port difficulty tiers
 and Redis-backed shared vardiff state remain production scaling follow-ups.

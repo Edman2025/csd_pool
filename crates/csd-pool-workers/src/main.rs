@@ -640,7 +640,10 @@ fn check_config(path_arg: Option<&str>) -> Result<ConfigCheckRun> {
         }
     }
 
-    if config.stratum.initial_difficulty <= 0.0
+    if !config.stratum.initial_difficulty.is_finite()
+        || !config.stratum.min_difficulty.is_finite()
+        || !config.stratum.max_difficulty.is_finite()
+        || config.stratum.initial_difficulty <= 0.0
         || config.stratum.min_difficulty <= 0.0
         || config.stratum.max_difficulty <= 0.0
     {
@@ -654,6 +657,34 @@ fn check_config(path_arg: Option<&str>) -> Result<ConfigCheckRun> {
     }
     if config.stratum.target_share_secs == 0 {
         errors.push("stratum.target_share_secs must be greater than 0".to_owned());
+    }
+    if config.stratum.vardiff_retarget_secs < 120 {
+        errors.push("stratum.vardiff_retarget_secs must be at least 120".to_owned());
+    }
+    if !config.stratum.vardiff_ewma_alpha.is_finite()
+        || config.stratum.vardiff_ewma_alpha <= 0.0
+        || config.stratum.vardiff_ewma_alpha > 1.0
+    {
+        errors.push("stratum.vardiff_ewma_alpha must be in (0, 1]".to_owned());
+    }
+    if !config.stratum.vardiff_fast_share_ratio.is_finite()
+        || config.stratum.vardiff_fast_share_ratio <= 0.0
+        || config.stratum.vardiff_fast_share_ratio >= 1.0
+    {
+        errors.push("stratum.vardiff_fast_share_ratio must be in (0, 1)".to_owned());
+    }
+    if !config.stratum.vardiff_slow_share_ratio.is_finite()
+        || config.stratum.vardiff_slow_share_ratio <= 1.0
+    {
+        errors.push("stratum.vardiff_slow_share_ratio must be greater than 1".to_owned());
+    }
+    if !config.stratum.vardiff_max_adjustment_factor.is_finite()
+        || config.stratum.vardiff_max_adjustment_factor <= 1.0
+    {
+        errors.push("stratum.vardiff_max_adjustment_factor must be greater than 1".to_owned());
+    }
+    if !(1..=60).contains(&config.stratum.vardiff_transition_grace_secs) {
+        errors.push("stratum.vardiff_transition_grace_secs must be between 1 and 60".to_owned());
     }
     if config.abuse.max_connections_per_ip == 0
         || config.abuse.max_sessions_per_address == 0

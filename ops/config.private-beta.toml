@@ -11,10 +11,16 @@ manual_payout_approval_csd = "250.0"
 
 [stratum]
 listen = "127.0.0.1:33330"
-initial_difficulty = 8.0
+initial_difficulty = 16.0
 min_difficulty = 8.0
 max_difficulty = 512.0
 target_share_secs = 20
+vardiff_retarget_secs = 120
+vardiff_ewma_alpha = 0.25
+vardiff_fast_share_ratio = 0.75
+vardiff_slow_share_ratio = 1.5
+vardiff_max_adjustment_factor = 1.5
+vardiff_transition_grace_secs = 15
 
 [abuse]
 max_connections_per_ip = 512
