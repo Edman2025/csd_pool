@@ -44,10 +44,10 @@ pub fn router(settings: SignerSettings) -> Router {
 }
 
 pub fn signer_listen() -> String {
-    if let Ok(path) = std::env::var("CSD_POOL_CONFIG")
-        && let Ok(config) = csd_pool_config::PoolConfig::from_file(path)
-    {
-        return config.signer.listen;
+    if let Ok(path) = std::env::var("CSD_POOL_CONFIG") {
+        if let Ok(config) = csd_pool_config::PoolConfig::from_file(path) {
+            return config.signer.listen;
+        }
     }
     std::env::var("CSD_POOL_SIGNER_LISTEN").unwrap_or_else(|_| "127.0.0.1:8890".into())
 }

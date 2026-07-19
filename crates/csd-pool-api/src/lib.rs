@@ -136,10 +136,10 @@ pub fn router_from_pool_state_and_repository(
 }
 
 pub fn api_listen() -> String {
-    if let Ok(path) = std::env::var("CSD_POOL_CONFIG")
-        && let Ok(config) = csd_pool_config::PoolConfig::from_file(path)
-    {
-        return config.api.listen;
+    if let Ok(path) = std::env::var("CSD_POOL_CONFIG") {
+        if let Ok(config) = csd_pool_config::PoolConfig::from_file(path) {
+            return config.api.listen;
+        }
     }
     std::env::var("CSD_POOL_API_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into())
 }
@@ -1493,12 +1493,12 @@ fn public_stratum_endpoint() -> String {
 }
 
 fn public_port_tiers(default_endpoint: &str) -> Vec<PortTier> {
-    if let Ok(value) = std::env::var("CSD_POOL_PUBLIC_PORT_TIERS")
-        && !value.trim().is_empty()
-    {
-        let tiers: Vec<PortTier> = value.split(',').filter_map(parse_port_tier).collect();
-        if !tiers.is_empty() {
-            return tiers;
+    if let Ok(value) = std::env::var("CSD_POOL_PUBLIC_PORT_TIERS") {
+        if !value.trim().is_empty() {
+            let tiers: Vec<PortTier> = value.split(',').filter_map(parse_port_tier).collect();
+            if !tiers.is_empty() {
+                return tiers;
+            }
         }
     }
     let port = default_endpoint
@@ -1534,15 +1534,15 @@ fn parse_port_tier(value: &str) -> Option<PortTier> {
 }
 
 fn public_payout_rules() -> PayoutRules {
-    if let Ok(path) = std::env::var("CSD_POOL_CONFIG")
-        && let Ok(config) = csd_pool_config::PoolConfig::from_file(path)
-    {
-        return PayoutRules {
-            minimum_payout_csd: config.pool.minimum_payout_csd,
-            payout_interval_secs: config.pool.payout_interval_secs,
-            confirm_depth: config.pool.confirm_depth,
-            fee_percent: config.pool.fee_percent,
-        };
+    if let Ok(path) = std::env::var("CSD_POOL_CONFIG") {
+        if let Ok(config) = csd_pool_config::PoolConfig::from_file(path) {
+            return PayoutRules {
+                minimum_payout_csd: config.pool.minimum_payout_csd,
+                payout_interval_secs: config.pool.payout_interval_secs,
+                confirm_depth: config.pool.confirm_depth,
+                fee_percent: config.pool.fee_percent,
+            };
+        }
     }
     PayoutRules {
         minimum_payout_csd: "1.0".to_owned(),

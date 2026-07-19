@@ -3058,10 +3058,10 @@ fn now_ts() -> u64 {
 }
 
 fn configured_nodes() -> Vec<csd_pool_config::CsdNodeSection> {
-    if let Ok(path) = std::env::var("CSD_POOL_CONFIG")
-        && let Ok(config) = csd_pool_config::PoolConfig::from_file(path)
-    {
-        return config.csd_nodes;
+    if let Ok(path) = std::env::var("CSD_POOL_CONFIG") {
+        if let Ok(config) = csd_pool_config::PoolConfig::from_file(path) {
+            return config.csd_nodes;
+        }
     }
     vec![csd_pool_config::CsdNodeSection::default()]
 }

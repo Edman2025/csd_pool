@@ -177,13 +177,14 @@ impl SharedJobWatch {
                 if next.template.job_id == refresh_sender.borrow().template.job_id {
                     continue;
                 }
-                if let Some(repository) = repository.as_deref()
-                    && let Err(err) = repository
+                if let Some(repository) = repository.as_deref() {
+                    if let Err(err) = repository
                         .upsert_job(&job_record_from_pool_job(&next))
                         .await
-                {
-                    warn!(%err, job_id = next.template.job_id, "refusing unpersisted mining job");
-                    continue;
+                    {
+                        warn!(%err, job_id = next.template.job_id, "refusing unpersisted mining job");
+                        continue;
+                    }
                 }
                 info!(
                     job_id = next.template.job_id,
@@ -201,10 +202,10 @@ impl SharedJobWatch {
 }
 
 pub fn stratum_listen() -> String {
-    if let Ok(path) = std::env::var("CSD_POOL_CONFIG")
-        && let Ok(config) = csd_pool_config::PoolConfig::from_file(path)
-    {
-        return config.stratum.listen;
+    if let Ok(path) = std::env::var("CSD_POOL_CONFIG") {
+        if let Ok(config) = csd_pool_config::PoolConfig::from_file(path) {
+            return config.stratum.listen;
+        }
     }
     std::env::var("CSD_POOL_STRATUM_LISTEN").unwrap_or_else(|_| "127.0.0.1:3333".to_owned())
 }
@@ -398,15 +399,15 @@ fn require_candidate_submission(enabled: bool, template_mode: Option<&str>) -> R
 }
 
 fn submit_node_url_from_env() -> Result<String> {
-    if let Ok(url) = std::env::var("CSD_POOL_SUBMIT_NODE_URL")
-        && !url.is_empty()
-    {
-        return Ok(url);
+    if let Ok(url) = std::env::var("CSD_POOL_SUBMIT_NODE_URL") {
+        if !url.is_empty() {
+            return Ok(url);
+        }
     }
-    if let Ok(url) = std::env::var("CSD_POOL_NODE_URL")
-        && !url.is_empty()
-    {
-        return Ok(url);
+    if let Ok(url) = std::env::var("CSD_POOL_NODE_URL") {
+        if !url.is_empty() {
+            return Ok(url);
+        }
     }
     if let Ok(path) = std::env::var("CSD_POOL_CONFIG") {
         let config = csd_pool_config::PoolConfig::from_file(path)?;
@@ -452,9 +453,9 @@ async fn handle_client(
     let _connection_guard = pool_state.connection_guard();
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let extranonce1_le = (session_id as u32).to_le_bytes();
-    // Stratum sends the exact bytes inserted into coinbase. Keep this in the
-    // same little-endian representation used by share verification.
-    let extranonce1 = hex::encode(extranonce1_le);
+    // The deployed CSD v0.2.3 miner parses extranonce1 as a hex integer and
+    // serializes it to little-endian bytes before building the coinbase.
+    let extranonce1 = format!("{:08x}", session_id as u32);
     let mut authorized_worker: Option<String> = None;
     let mut _address_permit: Option<AddressSessionPermit> = None;
     let mut seen_shares = HashSet::new();
@@ -996,7 +997,7 @@ fn subscribe_response(id: Option<u64>, extranonce1: &str) -> Response {
 
 #[cfg(test)]
 fn extranonce1_for_session(session_id: u64) -> String {
-    hex::encode((session_id as u32).to_le_bytes())
+    format!("{:08x}", session_id as u32)
 }
 
 fn parse_authorize_worker(params: &Value) -> Option<String> {
@@ -1416,7 +1417,7 @@ mod tests {
 
     #[test]
     fn extranonce1_is_serialized_in_verification_byte_order() {
-        assert_eq!(extranonce1_for_session(0x01020304), "04030201");
+        assert_eq!(extranonce1_for_session(0x01020304), "01020304");
     }
 
     #[async_trait::async_trait]
