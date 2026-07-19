@@ -58,6 +58,22 @@ All production workers remained connected after the controlled daemon restart.
 The low-difficulty rejects were routine VarDiff transitions. No continuous
 rejected/stale pattern, connection ban, or shared-NAT eviction was observed.
 
+### Miner watchdog compatibility
+
+The deployed `v0.2.3-sm70-r72` miner has a client-side `job_stale=300s`
+watchdog. During one mainnet interval with no new tip/job for about 8.5 minutes,
+the miners repeatedly reconnected until the next job arrived. The pool kept
+accepting shares, did not ban the shared NAT addresses, and returned to 308
+sessions after the next tip update. This was not a daemon restart or template
+failure.
+
+The miner source only advances its job-liveness timestamp when `job_id`
+changes, so reconnecting and receiving the same still-valid job does not clear
+the watchdog. A future miner release should reset connection liveness after a
+successful re-handshake or use a longer quiet-chain threshold. That client
+change requires a separate single-rig canary before fleet rollout; it is not a
+blocker for the pool's mainnet template, share, block, or reward paths.
+
 ## Mainnet Block And Reward Closure
 
 Three pool blocks were confirmed and paid directly to the configured mining
