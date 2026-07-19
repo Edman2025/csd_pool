@@ -1179,6 +1179,11 @@ events to flag workers above `CSD_POOL_MAX_REJECT_RATE` or
 APIs expose `/api/operator/health` and `/api/operator/alerts`, and the built-in
 dashboard can resolve active alerts through the operator token flow.
 
+Public pool and status responses count a worker as online when its persisted
+`workers.last_seen_at` is within the last five minutes. Current in-memory
+Stratum sessions are used as an immediate floor, which keeps the count accurate
+for both persistent and short-connection miners.
+
 Export immutable accounting ledger entries:
 
 ```bash

@@ -1215,6 +1215,11 @@ rejected/stale submissions over
 `CSD_POOL_SHARE_QUALITY_WINDOW_MINUTES`. The operator API exposes latest health
 samples, active/resolved alerts, and manual alert resolution.
 
+Dashboard worker and miner counts come from distinct persisted workers seen in
+the last five minutes. The API takes the maximum of that value and the current
+in-memory Stratum session count so miners that reconnect for each submission do
+not collapse the displayed worker count to one wallet or one TCP connection.
+
 ## 18. Security Design
 
 ### 18.1 Network Security

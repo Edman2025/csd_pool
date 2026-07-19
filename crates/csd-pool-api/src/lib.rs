@@ -333,7 +333,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Result<Json<MetricsRespo
             .map(|(address, worker)| (address.clone(), worker_stats(worker)))
             .collect(),
         totals: Totals {
-            workers_online: active_worker_count(&snapshot.totals),
+            workers_online: reported_worker_count(db_stats.as_ref(), &snapshot.totals),
             shares_accepted: snapshot.totals.shares_accepted,
             shares_rejected: snapshot.totals.shares_rejected,
             shares_stale: snapshot.totals.shares_stale,
@@ -982,8 +982,8 @@ impl AppState {
                     .map(|stats| stats.avg_block_effort_pct_lifetime)
                     .unwrap_or_default(),
             ),
-            workers_online: active_worker_count(&snapshot.totals),
-            miners_online: snapshot.totals.workers_online,
+            workers_online: reported_worker_count(db_stats, &snapshot.totals),
+            miners_online: reported_miner_count(db_stats, &snapshot.totals),
             shares_accepted: snapshot.totals.shares_accepted,
             shares_rejected: snapshot.totals.shares_rejected,
             shares_stale: snapshot.totals.shares_stale,
@@ -1002,6 +1002,7 @@ impl AppState {
         let mut node_count = 0_u64;
         let mut latest_sample_at = None;
         let mut payouts_enabled = None;
+        let mut persistent_workers_online = None;
         let mut data_source = "memory";
 
         if let Some(repository) = self.repository.as_ref() {
@@ -1018,6 +1019,8 @@ impl AppState {
                 .max();
             active_alerts = repository.list_alerts(Some("active"), 500).await?.len() as u64;
             payouts_enabled = Some(repository.payouts_enabled().await?);
+            persistent_workers_online =
+                Some(repository.dashboard_pool_stats().await?.workers_online);
         }
 
         let status = if unhealthy_services > 0
@@ -1036,7 +1039,9 @@ impl AppState {
             config: self.config_summary_response(),
             data_source,
             api_ok: true,
-            workers_online: active_worker_count(&snapshot.totals),
+            workers_online: persistent_workers_online
+                .unwrap_or_default()
+                .max(active_worker_count(&snapshot.totals)),
             shares_accepted: snapshot.totals.shares_accepted,
             shares_rejected: snapshot.totals.shares_rejected,
             shares_stale: snapshot.totals.shares_stale,
@@ -1100,16 +1105,14 @@ impl AppState {
             .map(|stats| stats.orphaned_blocks)
             .unwrap_or_default();
         let updated_ts = snapshot.updated_ts.max(now_ts());
+        let workers_online = reported_worker_count(db_stats, &snapshot.totals);
 
         let mut body = String::new();
         body.push_str(
-            "# HELP csd_pool_workers_online Current authorized workers tracked in memory.\n",
+            "# HELP csd_pool_workers_online Workers active in the last five minutes, with current sessions as an immediate floor.\n",
         );
         body.push_str("# TYPE csd_pool_workers_online gauge\n");
-        body.push_str(&format!(
-            "csd_pool_workers_online {}\n",
-            active_worker_count(&snapshot.totals)
-        ));
+        body.push_str(&format!("csd_pool_workers_online {}\n", workers_online));
         body.push_str(
             "# HELP csd_pool_hashrate_hs Estimated pool hashrate from accepted Stratum shares.\n",
         );
@@ -1408,6 +1411,20 @@ fn worker_stats(stats: &WorkerSnapshot) -> WorkerStats {
 
 fn active_worker_count(totals: &TotalsSnapshot) -> u64 {
     totals.stratum_connections.max(totals.workers_online)
+}
+
+fn reported_worker_count(db_stats: Option<&DashboardPoolStats>, totals: &TotalsSnapshot) -> u64 {
+    db_stats
+        .map(|stats| stats.workers_online)
+        .unwrap_or_default()
+        .max(active_worker_count(totals))
+}
+
+fn reported_miner_count(db_stats: Option<&DashboardPoolStats>, totals: &TotalsSnapshot) -> u64 {
+    db_stats
+        .map(|stats| stats.miners_online)
+        .unwrap_or_default()
+        .max(totals.workers_online)
 }
 
 fn history_window(range: Option<&str>, default_interval_secs: u64) -> (u64, u64) {
@@ -3371,6 +3388,22 @@ mod tests {
         let pool = state.pool_response(None, None);
 
         assert_eq!(pool.workers_online, 2);
+        assert_eq!(pool.miners_online, 1);
+    }
+
+    #[test]
+    fn pool_response_uses_persisted_recent_worker_counts() {
+        let state = AppState::demo();
+        let pool = state.pool_response(
+            Some(&DashboardPoolStats {
+                workers_online: 220,
+                miners_online: 1,
+                ..DashboardPoolStats::default()
+            }),
+            None,
+        );
+
+        assert_eq!(pool.workers_online, 220);
         assert_eq!(pool.miners_online, 1);
     }
 

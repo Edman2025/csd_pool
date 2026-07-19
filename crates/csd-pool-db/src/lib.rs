@@ -243,6 +243,8 @@ pub struct RewardBlock {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DashboardPoolStats {
+    pub workers_online: u64,
+    pub miners_online: u64,
     pub total_blocks: u64,
     pub canonical_blocks: u64,
     pub immature_blocks: u64,
@@ -1197,6 +1199,16 @@ impl DashboardRepository for PgRepository {
     async fn dashboard_pool_stats(&self) -> Result<DashboardPoolStats> {
         let row = sqlx::query_as::<_, DashboardPoolStatsRow>(
             "select
+               coalesce((
+                 select count(*)
+                 from workers
+                 where last_seen_at >= now() - interval '5 minutes'
+               ), 0)::text as workers_online,
+               coalesce((
+                 select count(distinct miner_id)
+                 from workers
+                 where last_seen_at >= now() - interval '5 minutes'
+               ), 0)::text as miners_online,
                count(*)::text as total_blocks,
                count(*) filter (where status = 'confirmed')::text as canonical_blocks,
                count(*) filter (where status in ('seen_on_chain', 'immature'))::text as immature_blocks,
@@ -2327,6 +2339,8 @@ impl TryFrom<ShareWeightRow> for ShareWeight {
 
 #[derive(sqlx::FromRow)]
 struct DashboardPoolStatsRow {
+    workers_online: String,
+    miners_online: String,
     total_blocks: String,
     canonical_blocks: String,
     immature_blocks: String,
@@ -2353,6 +2367,8 @@ impl TryFrom<DashboardPoolStatsRow> for DashboardPoolStats {
 
     fn try_from(row: DashboardPoolStatsRow) -> Result<Self> {
         Ok(Self {
+            workers_online: row.workers_online.parse()?,
+            miners_online: row.miners_online.parse()?,
             total_blocks: row.total_blocks.parse()?,
             canonical_blocks: row.canonical_blocks.parse()?,
             immature_blocks: row.immature_blocks.parse()?,
