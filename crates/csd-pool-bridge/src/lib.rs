@@ -453,9 +453,11 @@ async fn handle_client(
     let _connection_guard = pool_state.connection_guard();
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let extranonce1_le = (session_id as u32).to_le_bytes();
-    // The deployed CSD v0.2.3 miner parses extranonce1 as a hex integer and
-    // serializes it to little-endian bytes before building the coinbase.
-    let extranonce1 = format!("{:08x}", session_id as u32);
+    // Stratum carries extranonce1 as the raw four-byte value encoded as hex.
+    // The official CSD v0.2.3 miner decodes those bytes and interprets them as
+    // a little-endian u32, so the wire value must be the LE byte encoding (for
+    // session 1 this is "01000000", not the integer formatting "00000001").
+    let extranonce1 = hex::encode(extranonce1_le);
     let mut authorized_worker: Option<String> = None;
     let mut _address_permit: Option<AddressSessionPermit> = None;
     let mut seen_shares = HashSet::new();
@@ -997,7 +999,7 @@ fn subscribe_response(id: Option<u64>, extranonce1: &str) -> Response {
 
 #[cfg(test)]
 fn extranonce1_for_session(session_id: u64) -> String {
-    format!("{:08x}", session_id as u32)
+    hex::encode((session_id as u32).to_le_bytes())
 }
 
 fn parse_authorize_worker(params: &Value) -> Option<String> {
@@ -1417,7 +1419,8 @@ mod tests {
 
     #[test]
     fn extranonce1_is_serialized_in_verification_byte_order() {
-        assert_eq!(extranonce1_for_session(0x01020304), "01020304");
+        assert_eq!(extranonce1_for_session(0x01020304), "04030201");
+        assert_eq!(extranonce1_for_session(1), "01000000");
     }
 
     #[async_trait::async_trait]
