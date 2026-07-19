@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if)] // Production remains on Rust 1.86, before stable let chains.
+
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -144,7 +146,16 @@ impl SharedJobWatch {
         provider: Arc<dyn TemplateProvider>,
         repository: Option<Arc<dyn MiningRepository>>,
     ) -> Result<Self> {
-        let refresh_secs = env_u64("CSD_POOL_TEMPLATE_REFRESH_SECS", 2).max(1);
+        let requested_refresh_secs = env_u64("CSD_POOL_TEMPLATE_REFRESH_SECS", 2);
+        let template_mode = std::env::var("CSD_POOL_TEMPLATE_MODE").unwrap_or_default();
+        let refresh_secs =
+            bounded_template_refresh_secs(requested_refresh_secs, template_mode.as_str());
+        if refresh_secs != requested_refresh_secs.max(1) {
+            warn!(
+                requested_refresh_secs,
+                refresh_secs, "limiting live template tip polling interval"
+            );
+        }
         Self::start_with_refresh(provider, repository, Duration::from_secs(refresh_secs)).await
     }
 
@@ -167,6 +178,15 @@ impl SharedJobWatch {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
+                let current = refresh_sender.borrow().clone();
+                match provider.current_tip().await {
+                    Ok(Some(tip)) if tip == current.template.prev => continue,
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!(%err, "mining tip refresh failed; retaining current job");
+                        continue;
+                    }
+                }
                 let next = match provider.current_job().await {
                     Ok(job) => Arc::new(job),
                     Err(err) => {
@@ -198,6 +218,15 @@ impl SharedJobWatch {
 
     fn subscribe(&self) -> watch::Receiver<Arc<PoolJob>> {
         self.sender.subscribe()
+    }
+}
+
+fn bounded_template_refresh_secs(requested: u64, template_mode: &str) -> u64 {
+    let requested = requested.max(1);
+    if template_mode.trim().eq_ignore_ascii_case("live") {
+        requested.min(5)
+    } else {
+        requested
     }
 }
 
@@ -806,7 +835,13 @@ async fn submit_block_candidate(
                     ))
                     .await?;
             }
-            return Err(err);
+            warn!(
+                job_id = request.job_id,
+                hash = request.hash_hex,
+                %err,
+                "block candidate submission transport failed; keeping miner session active"
+            );
+            return Ok(());
         }
     };
     if let Some(repository) = repository {
@@ -816,13 +851,22 @@ async fn submit_block_candidate(
             ))
             .await?;
     }
-    info!(
-        job_id = request.job_id,
-        hash = request.hash_hex,
-        ok = response.ok,
-        effort_pct,
-        "block candidate submitted"
-    );
+    if response.ok {
+        info!(
+            job_id = request.job_id,
+            hash = request.hash_hex,
+            effort_pct,
+            "block candidate submitted"
+        );
+    } else {
+        warn!(
+            job_id = request.job_id,
+            hash = request.hash_hex,
+            effort_pct,
+            response = %serde_json::to_string(&response).unwrap_or_default(),
+            "block candidate rejected; keeping miner session active"
+        );
+    }
     Ok(())
 }
 
@@ -1397,7 +1441,7 @@ enum OffenseKind {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     struct RotatingTemplateProvider {
         calls: AtomicUsize,
@@ -1411,6 +1455,36 @@ mod tests {
                 "job-initial"
             } else {
                 "job-refreshed"
+            }))
+        }
+    }
+
+    struct TipAwareTemplateProvider {
+        calls: AtomicUsize,
+        tip_changed: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl TemplateProvider for TipAwareTemplateProvider {
+        async fn current_job(&self) -> csd_pool_node::Result<PoolJob> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut job = csd_pool_node::easy_static_job(if call == 0 {
+                "job-initial"
+            } else {
+                "job-refreshed"
+            });
+            if call > 0 {
+                job.template.prev = [1; 32];
+                job.notify.prev_hash_be_hex = "01".repeat(32);
+            }
+            Ok(job)
+        }
+
+        async fn current_tip(&self) -> csd_pool_node::Result<Option<[u8; 32]>> {
+            Ok(Some(if self.tip_changed.load(Ordering::SeqCst) {
+                [1; 32]
+            } else {
+                [0; 32]
             }))
         }
     }
@@ -1454,6 +1528,30 @@ mod tests {
             .unwrap();
         assert_eq!(first.borrow().template.job_id, "job-refreshed");
         assert_eq!(second.borrow().template.job_id, "job-refreshed");
+    }
+
+    #[tokio::test]
+    async fn shared_job_watch_fetches_template_only_after_tip_change() {
+        let provider = Arc::new(TipAwareTemplateProvider {
+            calls: AtomicUsize::new(0),
+            tip_changed: AtomicBool::new(false),
+        });
+        let jobs =
+            SharedJobWatch::start_with_refresh(provider.clone(), None, Duration::from_millis(10))
+                .await
+                .unwrap();
+        let mut receiver = jobs.subscribe();
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        provider.tip_changed.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receiver.borrow().template.job_id, "job-refreshed");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1512,7 +1610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persists_candidate_when_node_submit_transport_fails() {
+    async fn persists_candidate_without_ending_session_when_node_transport_fails() {
         let job = csd_pool_node::easy_static_job("static-1");
         let submit = SubmitParams {
             worker_name: "0123456789abcdef0123456789abcdef01234567.rig-a".to_owned(),
@@ -1538,11 +1636,19 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        assert!(result.is_ok());
         let candidates = repository.list_block_candidates().unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].hash_hex, hex::encode(share.hash));
         assert_eq!(candidates[0].submit_response_json["retryable"], true);
+    }
+
+    #[test]
+    fn live_template_tip_polling_is_bounded() {
+        assert_eq!(bounded_template_refresh_secs(0, "live"), 1);
+        assert_eq!(bounded_template_refresh_secs(2, "live"), 2);
+        assert_eq!(bounded_template_refresh_secs(30, "LIVE"), 5);
+        assert_eq!(bounded_template_refresh_secs(30, "static"), 30);
     }
 
     #[test]

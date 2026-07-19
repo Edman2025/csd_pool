@@ -52,6 +52,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "payouts_default_paused",
         sql: include_str!("../../../migrations/0007_payouts_default_paused.sql"),
     },
+    Migration {
+        version: 8,
+        name: "classify_rejected_block_candidates",
+        sql: include_str!("../../../migrations/0008_classify_rejected_block_candidates.sql"),
+    },
 ];
 
 pub fn all_migrations() -> &'static [Migration] {
@@ -194,6 +199,19 @@ pub struct BlockCandidateRecord {
     pub effort_pct: f64,
     pub candidate_payload_json: serde_json::Value,
     pub submit_response_json: serde_json::Value,
+}
+
+fn block_candidate_initial_status(block: &BlockCandidateRecord) -> &'static str {
+    let submit_ok = block
+        .submit_response_json
+        .get("ok")
+        .and_then(serde_json::Value::as_bool);
+    let transport_ambiguous = block.submit_response_json.get("transport_error").is_some();
+    if submit_ok == Some(false) && !transport_ambiguous {
+        "orphaned"
+    } else {
+        "submitted"
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -993,18 +1011,23 @@ impl MiningRepository for PgRepository {
         let mut tx = self.pool.begin().await?;
         let miner_id = Self::miner_id_in_tx(&mut tx, &block.miner).await?;
         let worker_id = Self::worker_id_in_tx(&mut tx, miner_id, &block.worker_name).await?;
+        let initial_status = block_candidate_initial_status(block);
         let inserted = sqlx::query(
             "insert into blocks(
                hash, job_id, finder_worker_id, reward_base_units, status,
-               effort_pct, candidate_payload_json, submit_response_json, submitted_at
+               effort_pct, candidate_payload_json, submit_response_json, submitted_at, orphaned_at
              )
-             values ($1, $2, $3, $4::numeric, 'submitted', $5::numeric, $6::jsonb, $7::jsonb, now())
+             values (
+               $1, $2, $3, $4::numeric, $5, $6::numeric, $7::jsonb, $8::jsonb, now(),
+               case when $5 = 'orphaned' then now() else null end
+             )
              on conflict(hash) do nothing",
         )
         .bind(&block.hash_hex)
         .bind(&block.job_id)
         .bind(worker_id)
         .bind(block.reward_base_units.to_string())
+        .bind(initial_status)
         .bind(block.effort_pct.to_string())
         .bind(block.candidate_payload_json.to_string())
         .bind(block.submit_response_json.to_string())
@@ -3606,7 +3629,7 @@ impl MiningRepository for InMemoryRepository {
             BlockRecord {
                 hash_hex: block.hash_hex.clone(),
                 job_id: block.job_id.clone(),
-                status: "submitted".to_owned(),
+                status: block_candidate_initial_status(block).to_owned(),
                 height: None,
                 confirmations: 0,
                 reward_base_units: block.reward_base_units,
@@ -3914,6 +3937,15 @@ mod tests {
     }
 
     #[test]
+    fn rejected_candidate_migration_preserves_ambiguous_transport_failures() {
+        let sql = migration_by_version(8).unwrap().sql.to_lowercase();
+        assert!(sql.contains("set status = 'orphaned'"));
+        assert!(sql.contains("http_status"));
+        assert!(sql.contains("4[0-9]{2}"));
+        assert!(!sql.contains("5[0-9]{2}"));
+    }
+
+    #[test]
     fn converts_postgres_ledger_rows_to_domain_entries() {
         let entry = LedgerEntry::try_from(LedgerEntryRow {
             miner: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
@@ -4172,6 +4204,36 @@ mod tests {
         assert_eq!(alerts[0].hash_hex, "33".repeat(32));
         assert_eq!(alerts[0].submit_ok, Some(false));
         assert_eq!(alerts[0].reason, "submit_response_not_ok");
+        assert!(repo.list_blocks_to_reconcile(10).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn candidate_status_distinguishes_rejection_from_ambiguous_transport_failure() {
+        let mut block = BlockCandidateRecord {
+            hash_hex: "44".repeat(32),
+            job_id: "job-status".to_owned(),
+            miner: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            worker_name: "rig-a".to_owned(),
+            reward_base_units: 0,
+            effort_pct: 1.0,
+            candidate_payload_json: serde_json::json!({}),
+            submit_response_json: serde_json::json!({
+                "ok": false,
+                "http_status": 409,
+                "error": "stale tip"
+            }),
+        };
+        assert_eq!(block_candidate_initial_status(&block), "orphaned");
+
+        block.submit_response_json = serde_json::json!({
+            "ok": false,
+            "transport_error": "connection reset",
+            "retryable": true
+        });
+        assert_eq!(block_candidate_initial_status(&block), "submitted");
+
+        block.submit_response_json = serde_json::json!({"ok": true});
+        assert_eq!(block_candidate_initial_status(&block), "submitted");
     }
 
     #[test]

@@ -68,6 +68,8 @@ See:
 Set `CSD_POOL_NETWORK_URL=https://cairn-substrate.com` for `/api/pool` to fill
 `network_hashrate_hs` from public Cairn telemetry. The request is short-timeout
 and fails open so the dashboard stays available during telemetry outages.
+Public telemetry requests do not reuse `CSD_POOL_NODE_TOKEN`; a protected
+telemetry endpoint must use the separate `CSD_POOL_NETWORK_TOKEN`.
 `pool_hashrate_hs` is estimated from accepted Stratum share difficulty over the
 current process runtime; it starts at 0 until enough accepted-share timing data
 exists.

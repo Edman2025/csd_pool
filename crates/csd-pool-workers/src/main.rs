@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if)] // Production remains on Rust 1.86, before stable let chains.
+
 use csd_pool_accounting::{
     LedgerEntry, MinerBalance, PayoutBatchDraft, PayoutRecipient, ShareWeight, allocate_pplns,
     payout_batch_draft, reward_ledger_entries, select_payouts,

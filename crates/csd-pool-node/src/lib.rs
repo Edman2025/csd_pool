@@ -81,14 +81,13 @@ impl CsdNodeClient {
     pub async fn submit_raw_block(&self, raw_block_hex: &str) -> Result<SubmitBlockResponse> {
         let url = format!("{}/api/rpc/block/submit", self.base_url);
         let request = serde_json::json!({ "block": raw_block_hex });
-        Ok(self
-            .authorize(self.http.post(url))
-            .json(&request)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        parse_submit_block_response(
+            self.authorize(self.http.post(url))
+                .json(&request)
+                .send()
+                .await?,
+        )
+        .await
     }
 
     pub async fn submit_candidate(
@@ -96,14 +95,13 @@ impl CsdNodeClient {
         candidate: &BlockCandidateSubmitRequest,
     ) -> Result<SubmitBlockResponse> {
         let url = format!("{}/api/rpc/block/submit", self.base_url);
-        Ok(self
-            .authorize(self.http.post(url))
-            .json(candidate)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        parse_submit_block_response(
+            self.authorize(self.http.post(url))
+                .json(candidate)
+                .send()
+                .await?,
+        )
+        .await
     }
 
     pub async fn mining_template(&self, pool_address: &str) -> Result<NodeMiningTemplate> {
@@ -186,6 +184,21 @@ impl CsdNodeClient {
             .json()
             .await?)
     }
+}
+
+async fn parse_submit_block_response(response: reqwest::Response) -> Result<SubmitBlockResponse> {
+    let status = response.status();
+    let body = response.bytes().await?;
+    let mut parsed: SubmitBlockResponse = serde_json::from_slice(&body)?;
+    if !status.is_success() {
+        let mut extra = parsed.extra.as_object().cloned().unwrap_or_default();
+        extra.insert(
+            "http_status".to_owned(),
+            serde_json::Value::from(status.as_u16()),
+        );
+        parsed.extra = serde_json::Value::Object(extra);
+    }
+    Ok(parsed)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -321,6 +334,10 @@ pub struct PoolJob {
 #[async_trait]
 pub trait TemplateProvider: Send + Sync {
     async fn current_job(&self) -> Result<PoolJob>;
+
+    async fn current_tip(&self) -> Result<Option<Hash32>> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -350,6 +367,19 @@ impl TemplateProvider for LiveTemplateProvider {
             .mining_template(&self.pool_address)
             .await?
             .into_pool_job()
+    }
+
+    async fn current_tip(&self) -> Result<Option<Hash32>> {
+        self.node
+            .health()
+            .await?
+            .tip
+            .as_deref()
+            .map(|tip| {
+                decode_hash32_hex("node_tip", tip.strip_prefix("0x").unwrap_or(tip))
+                    .map_err(NodeError::from)
+            })
+            .transpose()
     }
 }
 
@@ -422,7 +452,11 @@ pub fn job_from_notify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, http::HeaderMap, routing::get};
+    use axum::{
+        Json, Router,
+        http::{HeaderMap, StatusCode},
+        routing::{get, post},
+    };
 
     #[tokio::test]
     async fn sends_bearer_token_to_adapter_endpoints() {
@@ -453,6 +487,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(snapshot.target_block_secs, 60);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn preserves_structured_candidate_rejection() {
+        async fn reject() -> (StatusCode, Json<serde_json::Value>) {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "stale or unknown pool job"
+                })),
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/api/rpc/block/submit", post(reject)),
+            )
+            .await
+            .unwrap();
+        });
+        let candidate = BlockCandidateSubmitRequest {
+            job_id: "job1".to_owned(),
+            worker_name: "worker".to_owned(),
+            header_hex: "aa".repeat(84),
+            hash_hex: "11".repeat(32),
+            coinbase_txid_hex: "22".repeat(32),
+            coinbase_hex: "44".repeat(80),
+            merkle_root_hex: "33".repeat(32),
+            extranonce2_hex: "01020304".to_owned(),
+            ntime_hex: "665544cc".to_owned(),
+            nonce_hex: "00000001".to_owned(),
+        };
+
+        let response = CsdNodeClient::new(format!("http://{address}"))
+            .submit_candidate(&candidate)
+            .await
+            .unwrap();
+
+        assert!(!response.ok);
+        assert_eq!(response.extra["http_status"], 409);
+        assert_eq!(response.extra["error"], "stale or unknown pool job");
         server.abort();
     }
 

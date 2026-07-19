@@ -228,7 +228,9 @@ When `CSD_POOL_NETWORK_URL` is set, the API requests
 `hashrate` in H/s or `hashrateGHs` converted to H/s. If the telemetry request
 times out or fails, the endpoint keeps serving pool data and returns `0` for
 network fields. `CSD_POOL_NETWORK_TIMEOUT_SECS` controls the timeout and
-defaults to 2 seconds.
+defaults to 2 seconds. The private adapter token is not forwarded to this
+endpoint; protected telemetry endpoints use the dedicated
+`CSD_POOL_NETWORK_TOKEN`.
 
 `pool_hashrate_hs` is estimated from accepted Stratum share difficulty over the
 current process lifetime using the standard difficulty-1 work unit. It remains

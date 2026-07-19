@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if)] // Production remains on Rust 1.86, before stable let chains.
+
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -12,7 +14,7 @@ use csd_pool_db::{
     PayoutAuditEvent, PayoutBatchRecord, PayoutRepository, PgRepository,
 };
 use csd_pool_node::CsdNodeClient;
-use csd_pool_state::{SharedPoolState, WorkerSnapshot};
+use csd_pool_state::{SharedPoolState, TotalsSnapshot, WorkerSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -331,7 +333,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Result<Json<MetricsRespo
             .map(|(address, worker)| (address.clone(), worker_stats(worker)))
             .collect(),
         totals: Totals {
-            workers_online: snapshot.totals.workers_online,
+            workers_online: active_worker_count(&snapshot.totals),
             shares_accepted: snapshot.totals.shares_accepted,
             shares_rejected: snapshot.totals.shares_rejected,
             shares_stale: snapshot.totals.shares_stale,
@@ -980,7 +982,7 @@ impl AppState {
                     .map(|stats| stats.avg_block_effort_pct_lifetime)
                     .unwrap_or_default(),
             ),
-            workers_online: snapshot.totals.workers_online,
+            workers_online: active_worker_count(&snapshot.totals),
             miners_online: snapshot.totals.workers_online,
             shares_accepted: snapshot.totals.shares_accepted,
             shares_rejected: snapshot.totals.shares_rejected,
@@ -1034,7 +1036,7 @@ impl AppState {
             config: self.config_summary_response(),
             data_source,
             api_ok: true,
-            workers_online: snapshot.totals.workers_online,
+            workers_online: active_worker_count(&snapshot.totals),
             shares_accepted: snapshot.totals.shares_accepted,
             shares_rejected: snapshot.totals.shares_rejected,
             shares_stale: snapshot.totals.shares_stale,
@@ -1106,7 +1108,7 @@ impl AppState {
         body.push_str("# TYPE csd_pool_workers_online gauge\n");
         body.push_str(&format!(
             "csd_pool_workers_online {}\n",
-            snapshot.totals.workers_online
+            active_worker_count(&snapshot.totals)
         ));
         body.push_str(
             "# HELP csd_pool_hashrate_hs Estimated pool hashrate from accepted Stratum shares.\n",
@@ -1404,6 +1406,10 @@ fn worker_stats(stats: &WorkerSnapshot) -> WorkerStats {
     }
 }
 
+fn active_worker_count(totals: &TotalsSnapshot) -> u64 {
+    totals.stratum_connections.max(totals.workers_online)
+}
+
 fn history_window(range: Option<&str>, default_interval_secs: u64) -> (u64, u64) {
     match range {
         Some("24h") => (24 * 60 * 60, 60),
@@ -1419,7 +1425,7 @@ fn memory_history_sample(state: &AppState) -> HistorySample {
         ts: snapshot.updated_ts.max(now_ts()),
         pool_hs: snapshot.totals.pool_hashrate_hs,
         net_hs: 0.0,
-        workers: snapshot.totals.workers_online,
+        workers: active_worker_count(&snapshot.totals),
         shares_accepted: snapshot.totals.shares_accepted,
         shares_rejected: snapshot.totals.shares_rejected,
         shares_stale: snapshot.totals.shares_stale,
@@ -1588,9 +1594,14 @@ struct NetworkTelemetry {
 async fn network_telemetry_from_env() -> Option<NetworkTelemetry> {
     let base_url = network_url_from_env()?;
     let timeout_secs = env_u64("CSD_POOL_NETWORK_TIMEOUT_SECS", 2).max(1);
+    let network_token = std::env::var("CSD_POOL_NETWORK_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
     match tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        CsdNodeClient::from_env(base_url.clone()).network(),
+        CsdNodeClient::new(base_url.clone())
+            .with_bearer_token(network_token)
+            .network(),
     )
     .await
     {
@@ -3347,6 +3358,20 @@ mod tests {
         assert_eq!(pool.confirm_depth, 10);
         assert_eq!(pool.payout_interval_secs, 1800);
         assert_eq!(pool.workers_online, 1);
+    }
+
+    #[test]
+    fn pool_response_reports_active_stratum_sessions_as_workers() {
+        let pool_state = SharedPoolState::new();
+        pool_state.record_authorized_worker("0123456789abcdef0123456789abcdef01234567");
+        let _first = pool_state.connection_guard();
+        let _second = pool_state.connection_guard();
+        let state = AppState::from_pool_state(pool_state, ApiSettings::default(), None);
+
+        let pool = state.pool_response(None, None);
+
+        assert_eq!(pool.workers_online, 2);
+        assert_eq!(pool.miners_online, 1);
     }
 
     #[test]
