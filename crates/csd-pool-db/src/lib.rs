@@ -378,6 +378,7 @@ pub struct AcceptedShareGapRecord {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct LatestJobRecord {
     pub job_id: String,
+    pub prev_hash: String,
     pub created_ts: u64,
     pub created_at: Option<String>,
     pub age_seconds: u64,
@@ -1616,6 +1617,7 @@ impl MonitoringRepository for PgRepository {
         let row = sqlx::query_as::<_, LatestJobRow>(
             "select
                id as job_id,
+               prev_hash,
                extract(epoch from created_at)::bigint::text as created_ts,
                created_at::text as created_at,
                greatest(0, extract(epoch from now() - created_at)::bigint)::text as age_seconds
@@ -2514,6 +2516,7 @@ impl TryFrom<AcceptedShareGapRow> for AcceptedShareGapRecord {
 #[derive(sqlx::FromRow)]
 struct LatestJobRow {
     job_id: String,
+    prev_hash: String,
     created_ts: String,
     created_at: Option<String>,
     age_seconds: String,
@@ -2525,6 +2528,7 @@ impl TryFrom<LatestJobRow> for LatestJobRecord {
     fn try_from(row: LatestJobRow) -> Result<Self> {
         Ok(Self {
             job_id: row.job_id,
+            prev_hash: row.prev_hash,
             created_ts: row.created_ts.parse()?,
             created_at: row.created_at,
             age_seconds: row.age_seconds.parse()?,
@@ -2937,6 +2941,7 @@ impl MonitoringRepository for InMemoryRepository {
         };
         Ok(Some(LatestJobRecord {
             job_id: job.job_id.clone(),
+            prev_hash: job.prev_hash_be_hex.clone(),
             created_ts: 0,
             created_at: None,
             age_seconds: 0,

@@ -1170,8 +1170,9 @@ and freshness metrics before real launch signoff.
 stuck in `created`, `signed`, or `submitted` longer than the configured
 threshold, block candidates whose submit response is not ok or whose submitted
 state is older than `CSD_POOL_BLOCK_SUBMISSION_STUCK_MINUTES`, pools with no
-accepted shares for `CSD_POOL_NO_ACCEPTED_SHARE_MINUTES`, stale latest mining
-jobs older than `CSD_POOL_MAX_TEMPLATE_AGE_SECS`, and workers whose
+accepted shares for `CSD_POOL_NO_ACCEPTED_SHARE_MINUTES`, mining jobs older than
+`CSD_POOL_MAX_TEMPLATE_AGE_SECS` that no longer match any configured node tip,
+and workers whose
 `last_seen_at` is older than `CSD_POOL_WORKER_OFFLINE_MINUTES`. It also uses persisted rejected/stale share
 events to flag workers above `CSD_POOL_MAX_REJECT_RATE` or
 `CSD_POOL_MAX_STALE_RATE` over the configured share quality window. Operator

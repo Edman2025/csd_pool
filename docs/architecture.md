@@ -1204,7 +1204,10 @@ and signer health into `node_samples`. `check-alerts` upserts `service_health`
 `alert_events`. Block-submission alerts use `blocks.submit_response_json` and
 `CSD_POOL_BLOCK_SUBMISSION_STUCK_MINUTES` to catch rejected submit responses and
 submitted blocks that do not advance through the watcher. Template-age alerts
-use latest `jobs.created_at` and `CSD_POOL_MAX_TEMPLATE_AGE_SECS`. No-share alerts are based on latest
+use latest `jobs.created_at` and `CSD_POOL_MAX_TEMPLATE_AGE_SECS`, then compare
+the job's previous hash with each configured node tip. This keeps a valid job
+active when the chain itself has not advanced while still detecting a daemon
+that failed to refresh after a new tip. No-share alerts are based on latest
 `shares.created_at` and `CSD_POOL_NO_ACCEPTED_SHARE_MINUTES`. Worker offline
 alerts are based on `workers.last_seen_at` and `CSD_POOL_WORKER_OFFLINE_MINUTES`.
 Share quality alerts use accepted shares plus persisted `share_events` for

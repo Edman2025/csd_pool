@@ -2652,7 +2652,7 @@ async fn check_alerts() -> Result<CheckAlertsRun> {
     let template_age_fingerprint = "template_age".to_owned();
     let max_template_age_secs = max_template_age_secs();
     if let Some(job) = repo.latest_job().await? {
-        if job.age_seconds > max_template_age_secs {
+        if job.age_seconds > max_template_age_secs && !job_matches_any_node_tip(&job).await {
             let alert = template_age_alert(
                 template_age_fingerprint.clone(),
                 &job,
@@ -3239,6 +3239,34 @@ fn max_template_age_secs() -> u64 {
         .unwrap_or(120)
 }
 
+async fn job_matches_any_node_tip(job: &csd_pool_db::LatestJobRecord) -> bool {
+    for node in configured_nodes() {
+        let client = CsdNodeClient::from_env(node.rpc_url);
+        let Ok(health) = client.health().await else {
+            continue;
+        };
+        let Some(tip) = health.tip.as_deref() else {
+            continue;
+        };
+        if node_tip_matches_job_prev_hash(tip, &job.prev_hash) {
+            return true;
+        }
+    }
+    false
+}
+
+fn node_tip_matches_job_prev_hash(tip: &str, job_prev_hash: &str) -> bool {
+    let tip = tip.strip_prefix("0x").unwrap_or(tip);
+    let Ok(mut bytes) = hex::decode(tip) else {
+        return false;
+    };
+    if bytes.len() != 32 {
+        return false;
+    }
+    bytes.reverse();
+    hex::encode(bytes).eq_ignore_ascii_case(job_prev_hash)
+}
+
 fn env_f64(name: &str, default: f64) -> f64 {
     std::env::var(name)
         .ok()
@@ -3354,6 +3382,7 @@ fn template_age_alert(
         resolved_at: None,
         details: serde_json::json!({
             "job_id": job.job_id,
+            "prev_hash": job.prev_hash,
             "created_ts": job.created_ts,
             "created_at": job.created_at,
             "age_seconds": job.age_seconds,
@@ -5027,6 +5056,7 @@ mod tests {
     fn template_age_alert_contains_job_age_and_threshold() {
         let job = csd_pool_db::LatestJobRecord {
             job_id: "job-old".to_owned(),
+            prev_hash: "11".repeat(32),
             created_ts: 100,
             created_at: Some("2026-06-16 01:00:00+00".to_owned()),
             age_seconds: 180,
@@ -5038,6 +5068,24 @@ mod tests {
         assert_eq!(alert.subject, "job-old");
         assert_eq!(alert.details["age_seconds"], 180);
         assert_eq!(alert.details["threshold_seconds"], 120);
+        assert_eq!(alert.details["prev_hash"], "11".repeat(32));
+    }
+
+    #[test]
+    fn node_tip_matching_handles_stratum_byte_order() {
+        let node_tip = format!("0x{}", "01".repeat(32));
+        assert!(node_tip_matches_job_prev_hash(&node_tip, &"01".repeat(32)));
+
+        let mut distinct_tip = [0_u8; 32];
+        distinct_tip[0] = 0x12;
+        distinct_tip[31] = 0x34;
+        let mut expected_prev_hash = distinct_tip;
+        expected_prev_hash.reverse();
+        assert!(node_tip_matches_job_prev_hash(
+            &format!("0x{}", hex::encode(distinct_tip)),
+            &hex::encode(expected_prev_hash)
+        ));
+        assert!(!node_tip_matches_job_prev_hash("not-hex", &"00".repeat(32)));
     }
 
     #[test]
