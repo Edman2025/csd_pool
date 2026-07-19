@@ -1,0 +1,11 @@
+[Unit]
+Description=Reconcile submitted CSD Pool payout batches every minute
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+Unit=csd-pool-payout-reconcile.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

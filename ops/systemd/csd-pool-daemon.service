@@ -1,0 +1,24 @@
+[Unit]
+Description=CSD Pool daemon (Stratum bridge and public API)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=csd-pool
+Group=csd-pool
+WorkingDirectory=/opt/csd-pool
+EnvironmentFile=/etc/csd-pool/csd-pool.env
+EnvironmentFile=-/opt/csd-pool/release.env
+ExecStart=/opt/csd-pool/bin/csd-pool-daemon
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/csd-pool /var/lib/csd-pool
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

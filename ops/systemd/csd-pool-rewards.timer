@@ -1,0 +1,11 @@
+[Unit]
+Description=Run CSD Pool reward settlement and maturity every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=csd-pool-rewards.service
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

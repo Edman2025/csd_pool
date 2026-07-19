@@ -1,0 +1,10 @@
+[Unit]
+Description=Run CSD Pool database backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+Unit=csd-pool-worker@backup-db.service
+
+[Install]
+WantedBy=timers.target

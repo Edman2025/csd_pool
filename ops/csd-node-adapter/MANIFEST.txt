@@ -1,0 +1,7 @@
+upstream=https://github.com/compute-substrate/compute-substrate.git
+commit=d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c
+patch=compute-substrate-pool-adapter.patch
+patch_sha256=b57eababa7db5228300bc013f95dbfc3c261c31b82edfe9388e29189cf02fbc8
+build_script=apply-and-build.sh
+adapter_token_env=CSD_POOL_ADAPTER_TOKEN
+pool_token_env=CSD_POOL_NODE_TOKEN

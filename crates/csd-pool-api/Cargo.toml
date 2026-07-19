@@ -1,0 +1,21 @@
+[package]
+name = "csd-pool-api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+csd-pool-accounting = { path = "../csd-pool-accounting" }
+csd-pool-config = { path = "../csd-pool-config" }
+csd-pool-db = { path = "../csd-pool-db" }
+csd-pool-node = { path = "../csd-pool-node" }
+csd-pool-state = { path = "../csd-pool-state" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+tower = { version = "0.5", features = ["util"] }

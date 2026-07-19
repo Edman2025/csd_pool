@@ -1,0 +1,167 @@
+name: CSD Pool CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust workspace and release gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: csd_pool
+          POSTGRES_PASSWORD: ci-secret
+          POSTGRES_DB: csd_pool_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U csd_pool -d csd_pool_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Check
+        run: cargo check --workspace
+
+      - name: Compile pinned official CSD node adapter
+        run: |
+          git clone https://github.com/compute-substrate/compute-substrate.git /tmp/compute-substrate
+          git -C /tmp/compute-substrate checkout d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c
+          CSD_NODE_ADAPTER_SKIP_RELEASE_BUILD=1 \
+            ops/csd-node-adapter/apply-and-build.sh /tmp/compute-substrate
+
+      - name: Build debug executables
+        run: cargo build --workspace
+
+      - name: Wallet signer SDK tests
+        run: |
+          npm ci --ignore-scripts --prefix ops/wallet-signer
+          npm test --prefix ops/wallet-signer
+
+      - name: Static release gate
+        run: ops/bin/csd-pool-release-check.sh
+
+      - name: Real environment doctor self-test
+        run: ops/bin/csd-pool-real-env-doctor-self-test.sh
+
+      - name: Public acceptance self-test
+        run: ops/bin/csd-pool-public-acceptance-self-test.sh
+
+      - name: Evidence redaction self-test
+        run: ops/bin/csd-pool-evidence-redaction-self-test.sh
+
+      - name: Launch handoff self-test
+        run: ops/bin/csd-pool-launch-handoff-self-test.sh
+
+      - name: Launch dossier self-test
+        run: ops/bin/csd-pool-launch-dossier-self-test.sh
+
+      - name: Launch gaps self-test
+        run: ops/bin/csd-pool-launch-gaps-self-test.sh
+
+      - name: Generate production-like env
+        run: |
+          CSD_POOL_DATABASE_URL=postgres://csd_pool:ci-secret@127.0.0.1:5432/csd_pool_ci \
+            ops/bin/csd-pool-generate-env.sh /tmp/csd-pool-ci.env
+
+      - name: Deployment preflight
+        run: |
+          CSD_POOL_ENV_FILE=/tmp/csd-pool-ci.env \
+          CSD_POOL_PREFLIGHT_CONFIG=ops/config.private-beta.toml \
+            ops/bin/csd-pool-preflight.sh
+
+      - name: Deployment verifier
+        run: |
+          CSD_POOL_VERIFY_HTTP=0 \
+          CSD_POOL_ENV_FILE=/tmp/csd-pool-ci.env \
+            ops/bin/csd-pool-verify.sh
+
+      - name: Local adapter e2e
+        run: |
+          CSD_POOL_E2E_DATABASE_URL=postgres://csd_pool:ci-secret@127.0.0.1:5432/csd_pool_ci \
+          CSD_POOL_BIN_DIR=target/debug \
+            ops/bin/csd-pool-local-e2e.sh
+
+      - name: Payout serialization self-test
+        run: |
+          CSD_POOL_PAYOUT_SERIALIZATION_DATABASE_URL=postgres://csd_pool:ci-secret@127.0.0.1:5432/csd_pool_ci \
+          CSD_POOL_BIN_DIR=target/debug \
+            ops/bin/csd-pool-payout-serialization-self-test.sh
+
+      - name: Build release artifact
+        run: ops/bin/csd-pool-build-release.sh
+
+      - name: Live startup policy self-test
+        run: |
+          latest="$(ls -td dist/csd-pool-*/ | head -1)"
+          CSD_POOL_BIN_DIR="$latest/bin" \
+            ops/bin/csd-pool-live-startup-policy-self-test.sh
+
+      - name: Verify release artifact
+        run: |
+          archive="$(ls -t dist/*.tar.gz | head -1)"
+          shasum -a 256 -c "$archive.sha256"
+          latest="$(ls -td dist/csd-pool-*/ | head -1)"
+          CSD_POOL_VERIFY_HTTP=0 \
+          CSD_POOL_VERIFY_RELEASE=1 \
+          CSD_POOL_BIN_DIR="$latest/bin" \
+          CSD_POOL_VERIFY_RELEASE_ARCHIVE="$archive" \
+            ops/bin/csd-pool-verify.sh
+          ops/bin/csd-pool-install-release-self-test.sh "$archive"
+          ops/bin/csd-pool-release-archive-self-test.sh "$archive"
+
+      - name: Optional final review package verification
+        if: ${{ env.CSD_POOL_CI_FINAL_REVIEW_PACKAGE != '' }}
+        run: |
+          sha="${CSD_POOL_CI_FINAL_REVIEW_PACKAGE_SHA256:-}"
+          if [ -z "$sha" ] && [ -f "$CSD_POOL_CI_FINAL_REVIEW_PACKAGE.sha256" ]; then
+            sha="$CSD_POOL_CI_FINAL_REVIEW_PACKAGE.sha256"
+          fi
+          if [ -n "$sha" ]; then
+            ops/bin/csd-pool-verify-final-review.sh "$CSD_POOL_CI_FINAL_REVIEW_PACKAGE" "$sha"
+            ops/bin/csd-pool-final-review-self-test.sh "$CSD_POOL_CI_FINAL_REVIEW_PACKAGE" "$sha"
+          else
+            ops/bin/csd-pool-verify-final-review.sh "$CSD_POOL_CI_FINAL_REVIEW_PACKAGE"
+            ops/bin/csd-pool-final-review-self-test.sh "$CSD_POOL_CI_FINAL_REVIEW_PACKAGE"
+          fi

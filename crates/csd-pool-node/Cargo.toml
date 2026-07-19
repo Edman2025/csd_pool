@@ -1,0 +1,19 @@
+[package]
+name = "csd-pool-node"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+csd-pool-consensus = { path = "../csd-pool-consensus" }
+csd-pool-protocol = { path = "../csd-pool-protocol" }
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true

@@ -1,0 +1,50 @@
+[pool]
+id = "csd-main"
+mining_address = "0123456789abcdef0123456789abcdef01234567"
+fee_percent = 1.0
+confirm_depth = 10
+payout_interval_secs = 1800
+minimum_payout_csd = "1.0"
+max_payout_batch_csd = "1000.0"
+max_daily_payout_csd = "5000.0"
+manual_payout_approval_csd = "250.0"
+
+[stratum]
+listen = "0.0.0.0:3333"
+initial_difficulty = 8.0
+min_difficulty = 8.0
+max_difficulty = 512.0
+target_share_secs = 20
+
+[abuse]
+max_connections_per_ip = 32
+max_sessions_per_address = 64
+malformed_frame_limit = 8
+auth_failure_limit = 5
+invalid_share_limit = 16
+ban_secs = 600
+
+[api]
+listen = "0.0.0.0:8080"
+operator_token_env = "CSD_POOL_OPERATOR_TOKEN"
+
+[[csd_nodes]]
+name = "node-a"
+rpc_url = "http://127.0.0.1:8790"
+role = "template,submit,watch"
+
+[[csd_nodes]]
+name = "node-b"
+rpc_url = "http://127.0.0.1:8791"
+role = "submit,watch"
+
+[database]
+url_env = "CSD_POOL_DATABASE_URL"
+
+[redis]
+url_env = "CSD_POOL_REDIS_URL"
+
+[signer]
+url_env = "CSD_POOL_SIGNER_URL"
+listen = "127.0.0.1:8890"
+token_env = "CSD_POOL_SIGNER_TOKEN"

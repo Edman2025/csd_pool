@@ -1,0 +1,11 @@
+[Unit]
+Description=Run CSD Pool block reconciliation every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Unit=csd-pool-worker@reconcile-blocks.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

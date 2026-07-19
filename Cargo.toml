@@ -1,0 +1,37 @@
+[workspace]
+members = [
+  "crates/csd-pool-accounting",
+  "crates/csd-pool-api",
+  "crates/csd-pool-bridge",
+  "crates/csd-pool-config",
+  "crates/csd-pool-consensus",
+  "crates/csd-pool-db",
+  "crates/csd-pool-daemon",
+  "crates/csd-pool-mock-node",
+  "crates/csd-pool-node",
+  "crates/csd-pool-protocol",
+  "crates/csd-pool-signer",
+  "crates/csd-pool-state",
+  "crates/csd-pool-workers",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/csd_pool"
+
+[workspace.dependencies]
+async-trait = "0.1"
+axum = "0.8"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json", "derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

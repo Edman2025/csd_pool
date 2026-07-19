@@ -1,0 +1,24 @@
+[Unit]
+Description=CSD Pool payout signer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=csd-signer
+Group=csd-signer
+WorkingDirectory=/opt/csd-pool
+EnvironmentFile=/etc/csd-pool/csd-pool.env
+EnvironmentFile=-/opt/csd-pool/release.env
+ExecStart=/usr/bin/node /opt/csd-pool/current/ops/wallet-signer/signer.mjs
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/csd-pool
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[package]
+name = "csd-pool-workers"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+csd-pool-accounting = { path = "../csd-pool-accounting" }
+csd-pool-config = { path = "../csd-pool-config" }
+csd-pool-consensus = { path = "../csd-pool-consensus" }
+csd-pool-db = { path = "../csd-pool-db" }
+csd-pool-node = { path = "../csd-pool-node" }
+csd-pool-protocol = { path = "../csd-pool-protocol" }
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

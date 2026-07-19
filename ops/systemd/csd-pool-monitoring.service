@@ -1,0 +1,19 @@
+[Unit]
+Description=CSD Pool health sampling and alert checks
+After=network-online.target postgresql.service csd-pool-signer.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=csd-pool
+Group=csd-pool
+WorkingDirectory=/opt/csd-pool
+EnvironmentFile=/etc/csd-pool/csd-pool.env
+EnvironmentFile=-/opt/csd-pool/release.env
+ExecStart=/opt/csd-pool/bin/csd-pool-workers sample-health
+ExecStart=/opt/csd-pool/bin/csd-pool-workers check-alerts
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/csd-pool /var/lib/csd-pool

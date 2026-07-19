@@ -1,0 +1,11 @@
+[Unit]
+Description=Run CSD Pool health sampling and alert checks every minute
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+Unit=csd-pool-monitoring.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

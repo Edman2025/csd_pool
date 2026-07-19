@@ -1,0 +1,23 @@
+[Unit]
+Description=CSD official node with pool mining adapter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=csd-node
+Group=csd-node
+WorkingDirectory=/opt/csd-pool/current
+EnvironmentFile=/etc/csd-pool/node.env
+ExecStart=/opt/csd-pool/current/ops/bin/csd-pool-node-adapter-run.sh
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/csd-node
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

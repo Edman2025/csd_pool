@@ -1,0 +1,11 @@
+[Unit]
+Description=Submit signed CSD Pool payout batches every two minutes
+
+[Timer]
+OnBootSec=7min
+OnUnitActiveSec=2min
+Unit=csd-pool-payout-submit.service
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

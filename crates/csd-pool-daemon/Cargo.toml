@@ -1,0 +1,14 @@
+[package]
+name = "csd-pool-daemon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+csd-pool-api = { path = "../csd-pool-api" }
+csd-pool-bridge = { path = "../csd-pool-bridge" }
+csd-pool-state = { path = "../csd-pool-state" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

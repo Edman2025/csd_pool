@@ -1,0 +1,20 @@
+[Unit]
+Description=CSD Pool reward settlement, maturity, and orphan reversal
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=csd-pool
+Group=csd-pool
+WorkingDirectory=/opt/csd-pool
+EnvironmentFile=/etc/csd-pool/csd-pool.env
+EnvironmentFile=-/opt/csd-pool/release.env
+ExecStart=/opt/csd-pool/bin/csd-pool-workers settle-rewards
+ExecStart=/opt/csd-pool/bin/csd-pool-workers mature-rewards
+ExecStart=/opt/csd-pool/bin/csd-pool-workers reverse-orphans
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/csd-pool /var/lib/csd-pool

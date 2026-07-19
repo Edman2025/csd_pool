@@ -1,0 +1,11 @@
+[Unit]
+Description=Create CSD Pool payout batches every thirty minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Unit=csd-pool-payout-create.service
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

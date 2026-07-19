@@ -1,0 +1,37 @@
+name: csd-pool-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: csd-pool-postgres
+    environment:
+      POSTGRES_DB: csd_pool
+      POSTGRES_USER: csd_pool
+      POSTGRES_PASSWORD: csd_pool_dev
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U csd_pool -d csd_pool"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - csd-pool-postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: csd-pool-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - csd-pool-redis-data:/data
+
+volumes:
+  csd-pool-postgres-data:
+  csd-pool-redis-data:
