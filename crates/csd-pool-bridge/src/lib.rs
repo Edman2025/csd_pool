@@ -451,8 +451,10 @@ async fn handle_client(
 ) -> Result<()> {
     let _connection_guard = pool_state.connection_guard();
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-    let extranonce1 = format!("{:08x}", session_id as u32);
     let extranonce1_le = (session_id as u32).to_le_bytes();
+    // Stratum sends the exact bytes inserted into coinbase. Keep this in the
+    // same little-endian representation used by share verification.
+    let extranonce1 = hex::encode(extranonce1_le);
     let mut authorized_worker: Option<String> = None;
     let mut _address_permit: Option<AddressSessionPermit> = None;
     let mut seen_shares = HashSet::new();
@@ -992,6 +994,11 @@ fn subscribe_response(id: Option<u64>, extranonce1: &str) -> Response {
     }
 }
 
+#[cfg(test)]
+fn extranonce1_for_session(session_id: u64) -> String {
+    hex::encode((session_id as u32).to_le_bytes())
+}
+
 fn parse_authorize_worker(params: &Value) -> Option<String> {
     let username = params
         .as_array()
@@ -1406,6 +1413,11 @@ mod tests {
     }
 
     struct FailingBlockSubmitter;
+
+    #[test]
+    fn extranonce1_is_serialized_in_verification_byte_order() {
+        assert_eq!(extranonce1_for_session(0x01020304), "04030201");
+    }
 
     #[async_trait::async_trait]
     impl BlockSubmitter for FailingBlockSubmitter {
