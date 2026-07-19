@@ -1610,7 +1610,7 @@ struct NetworkTelemetry {
 
 async fn network_telemetry_from_env() -> Option<NetworkTelemetry> {
     let base_url = network_url_from_env()?;
-    let timeout_secs = env_u64("CSD_POOL_NETWORK_TIMEOUT_SECS", 2).max(1);
+    let timeout_secs = env_u64("CSD_POOL_NETWORK_TIMEOUT_SECS", 5).max(1);
     let network_token = std::env::var("CSD_POOL_NETWORK_TOKEN")
         .ok()
         .filter(|token| !token.is_empty());

@@ -3221,7 +3221,7 @@ fn share_quality_min_total() -> u64 {
     std::env::var("CSD_POOL_SHARE_QUALITY_MIN_TOTAL")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(20)
+        .unwrap_or(50)
 }
 
 fn max_reject_rate() -> f64 {
