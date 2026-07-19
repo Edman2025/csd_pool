@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DIFFICULTY_ONE_HASHES: f64 = 4_294_967_296.0;
+const HASHRATE_WINDOW_SECS: u64 = 300;
 
 #[derive(Clone, Debug, Default)]
 pub struct SharedPoolState {
@@ -36,6 +37,16 @@ impl SharedPoolState {
     pub fn record_share_accepted(&self, address: &str, difficulty: f64, is_block_candidate: bool) {
         let mut state = self.inner.write().expect("pool state lock");
         let now = now_ts();
+        state
+            .recent_accepted_shares
+            .push_back((now, difficulty.max(0.0)));
+        while state
+            .recent_accepted_shares
+            .front()
+            .is_some_and(|(timestamp, _)| now.saturating_sub(*timestamp) > HASHRATE_WINDOW_SECS)
+        {
+            state.recent_accepted_shares.pop_front();
+        }
         let worker = state.workers.entry(address.to_owned()).or_default();
         worker.shares_accepted += 1;
         worker.last_difficulty = difficulty;
@@ -117,6 +128,7 @@ struct PoolState {
     share_validation_seconds_sum: f64,
     share_difficulty_sum: f64,
     round_share_difficulty_sum: f64,
+    recent_accepted_shares: VecDeque<(u64, f64)>,
     first_share_ts: Option<u64>,
     last_share_ts: Option<u64>,
     updated_ts: u64,
@@ -137,11 +149,7 @@ impl PoolState {
                 share_validation_seconds_sum: self.share_validation_seconds_sum,
                 share_difficulty_sum: self.share_difficulty_sum,
                 round_share_difficulty_sum: self.round_share_difficulty_sum,
-                pool_hashrate_hs: estimated_hashrate(
-                    self.share_difficulty_sum,
-                    self.first_share_ts,
-                    self.last_share_ts,
-                ),
+                pool_hashrate_hs: rolling_hashrate(&self.recent_accepted_shares),
             },
             updated_ts: self.updated_ts,
         }
@@ -201,6 +209,18 @@ fn estimated_hashrate(difficulty_sum: f64, first_ts: Option<u64>, last_ts: Optio
     if elapsed == 0 || difficulty_sum <= 0.0 {
         return 0.0;
     }
+    (difficulty_sum * DIFFICULTY_ONE_HASHES) / elapsed as f64
+}
+
+fn rolling_hashrate(samples: &VecDeque<(u64, f64)>) -> f64 {
+    let Some((first_ts, _)) = samples.front() else {
+        return 0.0;
+    };
+    let Some((last_ts, _)) = samples.back() else {
+        return 0.0;
+    };
+    let elapsed = last_ts.saturating_sub(*first_ts).max(1);
+    let difficulty_sum: f64 = samples.iter().map(|(_, difficulty)| *difficulty).sum();
     (difficulty_sum * DIFFICULTY_ONE_HASHES) / elapsed as f64
 }
 
