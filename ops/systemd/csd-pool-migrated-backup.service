@@ -1,0 +1,20 @@
+[Unit]
+Description=Back up the migrated CSD pool PostgreSQL database
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=csd-pool
+Group=csd-pool
+WorkingDirectory=/data/csd-pool
+EnvironmentFile=/etc/csd-pool-migrated/csd-pool.env
+UMask=0077
+ExecStart=/data/csd-pool/release/bin/csd-pool-workers backup-db
+ExecStartPost=/usr/bin/find /data/csd-pool/backup -maxdepth 1 -type f -name csd_pool-*.dump -mtime +14 -delete
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/data/csd-pool/backup
+TimeoutStartSec=10min

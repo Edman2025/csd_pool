@@ -1,0 +1,12 @@
+[Unit]
+Description=Back up the migrated CSD pool database daily
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=15min
+Persistent=true
+Unit=csd-pool-migrated-backup.service
+
+[Install]
+WantedBy=timers.target
+
