@@ -1201,7 +1201,11 @@ fn find_static_accepted_submit(
         ));
     }
     let job = csd_pool_node::easy_static_job(notify.job_id.clone());
-    if notify != &job.notify {
+    let mut expected_notify = job.notify.clone();
+    // clean_jobs controls miner job retention, not the serialized PoW. Allow
+    // the accepted-share probe to validate a same-tip heartbeat job.
+    expected_notify.clean_jobs = notify.clean_jobs;
+    if notify != &expected_notify {
         return Err(
             "known accepted share probe requires the exact static/easy template shape".to_owned(),
         );
@@ -4779,6 +4783,16 @@ mod tests {
         };
 
         assert!(verify_share_with_difficulty(&job.template, [1, 0, 0, 0], &solution, 8.0).is_ok());
+    }
+
+    #[test]
+    fn accepted_share_probe_allows_same_tip_heartbeat_clean_flag() {
+        let mut notify = csd_pool_node::easy_static_job("heartbeat-job").notify;
+        notify.clean_jobs = false;
+
+        let result = find_static_accepted_submit(&notify, "01000000", 4, 8.0);
+
+        assert!(result.is_ok());
     }
 
     #[test]

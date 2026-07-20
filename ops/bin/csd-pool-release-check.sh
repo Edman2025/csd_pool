@@ -1018,6 +1018,11 @@ require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/r
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/rpc/block/submit'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'node_observability'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'relay_enqueue_elapsed_us'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'chain_state_mismatch'
+require_text "ops/env/csd-pool.env.example" 'CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED=false'
+require_file "docs/validation/candidate-parallel-submit-canary-20260721.md"
+require_text "docs/validation/candidate-parallel-submit-canary-20260721.md" 'node-a remains authoritative'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'choose_pool_block_time'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'let time = now.max(min_ok);'
 require_text "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" 'ADDR_BACKOFF_RETENTION_SECS'

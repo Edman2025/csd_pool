@@ -14,7 +14,7 @@ use csd_pool_db::{
     JobRecord, MiningRepository, PgRepository, SessionRecord, ShareEventRecord, ShareRecord,
 };
 use csd_pool_node::{
-    BlockCandidateSubmitRequest, CsdNodeClient, LiveTemplateProvider, PoolJob,
+    BlockCandidateSubmitRequest, CsdNodeClient, LiveTemplateProvider, NodeHealth, PoolJob,
     StaticTemplateProvider, SubmitBlockResponse, TemplateProvider,
 };
 use csd_pool_protocol::{
@@ -27,7 +27,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
-use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval};
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval, timeout};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -583,8 +583,37 @@ pub fn block_submitter_from_env() -> Result<Option<Arc<dyn BlockSubmitter>>> {
         let (template_node_url, _) = live_template_config()?;
         require_template_submit_affinity(&template_node_url, &node_url)?;
     }
-    Ok(Some(Arc::new(CsdNodeBlockSubmitter::new(
+    if !csd_pool_config::env_flag_enabled(
+        std::env::var("CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED")
+            .ok()
+            .as_deref(),
+    ) {
+        return Ok(Some(Arc::new(CsdNodeBlockSubmitter::new(
+            CsdNodeClient::from_env(node_url),
+        ))));
+    }
+
+    let secondary_url = secondary_submit_node_url_from_env(&node_url)?;
+    if normalized_node_url(&node_url) == normalized_node_url(&secondary_url) {
+        return Err(BridgeError::InvalidConfig(
+            "parallel candidate submit requires distinct primary and secondary node URLs".into(),
+        ));
+    }
+    let primary = Arc::new(CsdCandidateNodeEndpoint::new(
+        submit_node_name_from_env(),
         CsdNodeClient::from_env(node_url),
+    ));
+    let secondary = Arc::new(CsdCandidateNodeEndpoint::new(
+        secondary_submit_node_name_from_env(),
+        CsdNodeClient::from_env(secondary_url),
+    ));
+    Ok(Some(Arc::new(ParallelNodeBlockSubmitter::new(
+        primary,
+        secondary,
+        Duration::from_millis(env_u64("CSD_POOL_PRIMARY_SUBMIT_TIMEOUT_MS", 2_000)),
+        Duration::from_millis(env_u64("CSD_POOL_SECONDARY_SUBMIT_TIMEOUT_MS", 750)),
+        Duration::from_millis(env_u64("CSD_POOL_PARALLEL_NODE_HEALTH_REFRESH_MS", 1_000)),
+        Duration::from_millis(env_u64("CSD_POOL_PARALLEL_NODE_HEALTH_MAX_AGE_MS", 3_000)),
     ))))
 }
 
@@ -645,6 +674,45 @@ fn submit_node_url_from_env() -> Result<String> {
     Err(BridgeError::InvalidConfig(
         "candidate submission enabled but no submit CSD node is configured".into(),
     ))
+}
+
+fn secondary_submit_node_url_from_env(primary_url: &str) -> Result<String> {
+    if let Ok(url) = std::env::var("CSD_POOL_SECONDARY_SUBMIT_NODE_URL") {
+        if !url.is_empty() {
+            return Ok(url);
+        }
+    }
+    if let Ok(path) = std::env::var("CSD_POOL_CONFIG") {
+        let config = csd_pool_config::PoolConfig::from_file(path)?;
+        if let Some(node) = config.csd_nodes.iter().find(|node| {
+            node.role.split(',').any(|role| role.trim() == "submit")
+                && normalized_node_url(&node.rpc_url) != normalized_node_url(primary_url)
+        }) {
+            return Ok(node.rpc_url.clone());
+        }
+    }
+    Err(BridgeError::InvalidConfig(
+        "parallel candidate submit enabled but no distinct secondary submit node is configured"
+            .into(),
+    ))
+}
+
+fn submit_node_name_from_env() -> String {
+    std::env::var("CSD_POOL_PRIMARY_SUBMIT_NODE_NAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "node-a".to_owned())
+}
+
+fn secondary_submit_node_name_from_env() -> String {
+    std::env::var("CSD_POOL_SECONDARY_SUBMIT_NODE_NAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "node-b".to_owned())
+}
+
+fn normalized_node_url(url: &str) -> &str {
+    url.trim().trim_end_matches('/')
 }
 
 fn database_url_from_env() -> Result<Option<String>> {
@@ -1101,6 +1169,18 @@ pub trait BlockSubmitter: Send + Sync {
     ) -> Result<SubmitBlockResponse>;
 }
 
+#[async_trait::async_trait]
+trait CandidateNodeEndpoint: Send + Sync {
+    fn name(&self) -> &str;
+
+    async fn health(&self) -> std::result::Result<NodeHealth, String>;
+
+    async fn submit_candidate(
+        &self,
+        candidate: &BlockCandidateSubmitRequest,
+    ) -> std::result::Result<SubmitBlockResponse, String>;
+}
+
 #[derive(Clone)]
 pub struct CsdNodeBlockSubmitter {
     node: CsdNodeClient,
@@ -1120,6 +1200,495 @@ impl BlockSubmitter for CsdNodeBlockSubmitter {
     ) -> Result<SubmitBlockResponse> {
         Ok(self.node.submit_candidate(candidate).await?)
     }
+}
+
+#[derive(Clone)]
+struct CsdCandidateNodeEndpoint {
+    name: String,
+    node: CsdNodeClient,
+}
+
+impl CsdCandidateNodeEndpoint {
+    fn new(name: String, node: CsdNodeClient) -> Self {
+        Self { name, node }
+    }
+}
+
+#[async_trait::async_trait]
+impl CandidateNodeEndpoint for CsdCandidateNodeEndpoint {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn health(&self) -> std::result::Result<NodeHealth, String> {
+        self.node.health().await.map_err(|err| err.to_string())
+    }
+
+    async fn submit_candidate(
+        &self,
+        candidate: &BlockCandidateSubmitRequest,
+    ) -> std::result::Result<SubmitBlockResponse, String> {
+        self.node
+            .submit_candidate(candidate)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+#[derive(Clone)]
+struct ParallelNodeBlockSubmitter {
+    primary: Arc<dyn CandidateNodeEndpoint>,
+    secondary: Arc<dyn CandidateNodeEndpoint>,
+    primary_timeout: Duration,
+    secondary_timeout: Duration,
+    health_refresh: Duration,
+    health_max_age: Duration,
+    health_snapshot: Arc<RwLock<Option<ParallelHealthSnapshot>>>,
+}
+
+impl ParallelNodeBlockSubmitter {
+    fn new(
+        primary: Arc<dyn CandidateNodeEndpoint>,
+        secondary: Arc<dyn CandidateNodeEndpoint>,
+        primary_timeout: Duration,
+        secondary_timeout: Duration,
+        health_refresh: Duration,
+        health_max_age: Duration,
+    ) -> Self {
+        let submitter = Self {
+            primary,
+            secondary,
+            primary_timeout: bounded_submit_timeout(primary_timeout),
+            secondary_timeout: bounded_submit_timeout(secondary_timeout),
+            health_refresh: health_refresh
+                .clamp(Duration::from_millis(100), Duration::from_secs(10)),
+            health_max_age: health_max_age
+                .clamp(Duration::from_millis(250), Duration::from_secs(30)),
+            health_snapshot: Arc::new(RwLock::new(None)),
+        };
+        submitter.start_health_watch();
+        submitter
+    }
+
+    fn start_health_watch(&self) {
+        let submitter = self.clone();
+        tokio::spawn(async move {
+            loop {
+                submitter.refresh_health_once().await;
+                tokio::time::sleep(submitter.health_refresh).await;
+            }
+        });
+    }
+
+    async fn refresh_health_once(&self) {
+        let (primary, secondary) = tokio::join!(
+            health_with_timeout(self.primary.as_ref(), self.secondary_timeout),
+            health_with_timeout(self.secondary.as_ref(), self.secondary_timeout)
+        );
+        let snapshot = ParallelHealthSnapshot {
+            primary,
+            secondary,
+            observed_at: Instant::now(),
+        };
+        *self
+            .health_snapshot
+            .write()
+            .expect("parallel health snapshot lock poisoned") = Some(snapshot);
+    }
+
+    fn current_health(&self) -> Option<ParallelHealthSnapshot> {
+        self.health_snapshot
+            .read()
+            .expect("parallel health snapshot lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl BlockSubmitter for ParallelNodeBlockSubmitter {
+    async fn submit_candidate(
+        &self,
+        candidate: &BlockCandidateSubmitRequest,
+    ) -> Result<SubmitBlockResponse> {
+        let health = self.current_health();
+        let eligibility =
+            secondary_submit_eligibility(health.as_ref(), self.health_max_age, candidate);
+        let primary_submit = submit_to_node(
+            self.primary.as_ref(),
+            candidate,
+            self.primary_timeout,
+            "authority",
+        );
+        let secondary_submit = async {
+            match eligibility {
+                Ok(()) => {
+                    submit_to_node(
+                        self.secondary.as_ref(),
+                        candidate,
+                        self.secondary_timeout,
+                        "best_effort",
+                    )
+                    .await
+                }
+                Err(reason) => skipped_submit_audit(self.secondary.name(), "best_effort", reason),
+            }
+        };
+        let (primary_audit, secondary_audit) = tokio::join!(primary_submit, secondary_submit);
+
+        let primary_ok = primary_audit
+            .response
+            .as_ref()
+            .is_some_and(|value| value.ok);
+        let secondary_ok = secondary_audit
+            .response
+            .as_ref()
+            .is_some_and(|value| value.ok);
+        let status = parallel_submit_status(primary_ok, secondary_ok, &secondary_audit);
+        let primary_health = health
+            .as_ref()
+            .map(|value| value.primary.clone())
+            .unwrap_or_else(|| unavailable_health_audit(self.primary.name()));
+        let secondary_health = health
+            .as_ref()
+            .map(|value| value.secondary.clone())
+            .unwrap_or_else(|| unavailable_health_audit(self.secondary.name()));
+        let mut response = primary_audit
+            .response
+            .clone()
+            .unwrap_or_else(|| SubmitBlockResponse {
+                ok: false,
+                hash: Some(candidate.hash_hex.clone()),
+                extra: serde_json::json!({
+                    "status": "authority_submit_failed",
+                    "retryable": true,
+                }),
+            });
+        let mut extra = response.extra.as_object().cloned().unwrap_or_default();
+        extra.insert(
+            "parallel_submit".to_owned(),
+            serde_json::json!({
+                "enabled": true,
+                "authority": self.primary.name(),
+                "secondary": self.secondary.name(),
+                "status": status,
+                "authority_ok": primary_ok,
+                "secondary_ok": secondary_ok,
+                "health_age_ms": health.as_ref().map(ParallelHealthSnapshot::age_ms),
+                "primary_health": primary_health_json(&primary_health),
+                "secondary_health": primary_health_json(&secondary_health),
+                "primary_submit": submit_audit_json(&primary_audit),
+                "secondary_submit": submit_audit_json(&secondary_audit),
+            }),
+        );
+        response.extra = serde_json::Value::Object(extra);
+        info!(
+            job_id = candidate.job_id,
+            hash = candidate.hash_hex,
+            authority = self.primary.name(),
+            secondary = self.secondary.name(),
+            status,
+            authority_ok = primary_ok,
+            secondary_ok,
+            primary_outcome = primary_audit.outcome,
+            secondary_outcome = secondary_audit.outcome,
+            secondary_skip_reason = secondary_audit.skip_reason.unwrap_or("none"),
+            primary_elapsed_us = primary_audit.elapsed_us,
+            secondary_elapsed_us = secondary_audit.elapsed_us,
+            "parallel candidate submission completed"
+        );
+        Ok(response)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HealthAudit {
+    node: String,
+    started_unix_ms: u64,
+    finished_unix_ms: u64,
+    elapsed_us: u64,
+    outcome: &'static str,
+    snapshot: Option<NodeHealth>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ParallelHealthSnapshot {
+    primary: HealthAudit,
+    secondary: HealthAudit,
+    observed_at: Instant,
+}
+
+impl ParallelHealthSnapshot {
+    fn age_ms(&self) -> u64 {
+        self.observed_at
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SubmitAudit {
+    node: String,
+    role: &'static str,
+    started_unix_ms: u64,
+    finished_unix_ms: u64,
+    elapsed_us: u64,
+    outcome: &'static str,
+    response: Option<SubmitBlockResponse>,
+    error: Option<String>,
+    skip_reason: Option<&'static str>,
+}
+
+async fn health_with_timeout(
+    endpoint: &dyn CandidateNodeEndpoint,
+    timeout_duration: Duration,
+) -> HealthAudit {
+    let started_unix_ms = unix_ms();
+    let started = Instant::now();
+    let result = timeout(timeout_duration, endpoint.health()).await;
+    let elapsed_us = elapsed_us(started);
+    let finished_unix_ms = unix_ms();
+    match result {
+        Ok(Ok(snapshot)) => HealthAudit {
+            node: endpoint.name().to_owned(),
+            started_unix_ms,
+            finished_unix_ms,
+            elapsed_us,
+            outcome: "ok",
+            snapshot: Some(snapshot),
+            error: None,
+        },
+        Ok(Err(error)) => HealthAudit {
+            node: endpoint.name().to_owned(),
+            started_unix_ms,
+            finished_unix_ms,
+            elapsed_us,
+            outcome: "error",
+            snapshot: None,
+            error: Some(error),
+        },
+        Err(_) => HealthAudit {
+            node: endpoint.name().to_owned(),
+            started_unix_ms,
+            finished_unix_ms,
+            elapsed_us,
+            outcome: "timeout",
+            snapshot: None,
+            error: Some(format!(
+                "health timeout after {} ms",
+                timeout_duration.as_millis()
+            )),
+        },
+    }
+}
+
+async fn submit_to_node(
+    endpoint: &dyn CandidateNodeEndpoint,
+    candidate: &BlockCandidateSubmitRequest,
+    timeout_duration: Duration,
+    role: &'static str,
+) -> SubmitAudit {
+    let started_unix_ms = unix_ms();
+    let started = Instant::now();
+    let result = timeout(timeout_duration, endpoint.submit_candidate(candidate)).await;
+    let elapsed_us = elapsed_us(started);
+    let finished_unix_ms = unix_ms();
+    match result {
+        Ok(Ok(response)) => SubmitAudit {
+            node: endpoint.name().to_owned(),
+            role,
+            started_unix_ms,
+            finished_unix_ms,
+            elapsed_us,
+            outcome: if response.ok { "accepted" } else { "rejected" },
+            response: Some(response),
+            error: None,
+            skip_reason: None,
+        },
+        Ok(Err(error)) => SubmitAudit {
+            node: endpoint.name().to_owned(),
+            role,
+            started_unix_ms,
+            finished_unix_ms,
+            elapsed_us,
+            outcome: "transport_error",
+            response: None,
+            error: Some(error),
+            skip_reason: None,
+        },
+        Err(_) => SubmitAudit {
+            node: endpoint.name().to_owned(),
+            role,
+            started_unix_ms,
+            finished_unix_ms,
+            elapsed_us,
+            outcome: "timeout",
+            response: None,
+            error: Some(format!(
+                "submit timeout after {} ms",
+                timeout_duration.as_millis()
+            )),
+            skip_reason: None,
+        },
+    }
+}
+
+fn secondary_submit_eligibility(
+    health: Option<&ParallelHealthSnapshot>,
+    max_age: Duration,
+    candidate: &BlockCandidateSubmitRequest,
+) -> std::result::Result<(), &'static str> {
+    let Some(health) = health else {
+        return Err("health_not_ready");
+    };
+    if health.observed_at.elapsed() > max_age {
+        return Err("health_stale");
+    }
+    let primary = &health.primary;
+    let secondary = &health.secondary;
+    let (Some(primary), Some(secondary)) = (primary.snapshot.as_ref(), secondary.snapshot.as_ref())
+    else {
+        return Err("health_unavailable");
+    };
+    let primary_complete = primary.height.is_some()
+        && primary
+            .tip
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && primary
+            .chainwork
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+    let secondary_complete = secondary.height.is_some()
+        && secondary
+            .tip
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && secondary
+            .chainwork
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+    if !primary_complete || !secondary_complete {
+        return Err("health_incomplete");
+    }
+    if primary.height != secondary.height
+        || normalized_hash(primary.tip.as_deref().unwrap_or_default())
+            != normalized_hash(secondary.tip.as_deref().unwrap_or_default())
+        || primary.chainwork != secondary.chainwork
+    {
+        return Err("chain_state_mismatch");
+    }
+    let candidate_parent = candidate_parent_tip(candidate).ok_or("candidate_parent_unavailable")?;
+    let primary_tip = primary.tip.as_deref().ok_or("health_incomplete")?;
+    if normalized_hash(primary_tip) != candidate_parent {
+        return Err("candidate_parent_mismatch");
+    }
+    Ok(())
+}
+
+fn candidate_parent_tip(candidate: &BlockCandidateSubmitRequest) -> Option<String> {
+    let header = hex::decode(&candidate.header_hex).ok()?;
+    if header.len() != 84 {
+        return None;
+    }
+    let mut parent = header[4..36].to_vec();
+    parent.reverse();
+    Some(hex::encode(parent))
+}
+
+fn normalized_hash(value: &str) -> String {
+    value
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or(value.trim())
+        .to_ascii_lowercase()
+}
+
+fn unavailable_health_audit(node: &str) -> HealthAudit {
+    let now = unix_ms();
+    HealthAudit {
+        node: node.to_owned(),
+        started_unix_ms: now,
+        finished_unix_ms: now,
+        elapsed_us: 0,
+        outcome: "not_observed",
+        snapshot: None,
+        error: None,
+    }
+}
+
+fn skipped_submit_audit(node: &str, role: &'static str, reason: &'static str) -> SubmitAudit {
+    let now = unix_ms();
+    SubmitAudit {
+        node: node.to_owned(),
+        role,
+        started_unix_ms: now,
+        finished_unix_ms: now,
+        elapsed_us: 0,
+        outcome: "skipped",
+        response: None,
+        error: None,
+        skip_reason: Some(reason),
+    }
+}
+
+fn parallel_submit_status(
+    primary_ok: bool,
+    secondary_ok: bool,
+    secondary: &SubmitAudit,
+) -> &'static str {
+    match (primary_ok, secondary_ok, secondary.outcome) {
+        (true, true, _) => "both_accepted",
+        (true, false, "skipped") => "authority_accepted_secondary_skipped",
+        (true, false, _) => "authority_accepted_secondary_failed",
+        (false, true, _) => "secondary_accepted_authority_failed",
+        (false, false, "skipped") => "authority_failed_secondary_skipped",
+        (false, false, _) => "both_failed",
+    }
+}
+
+fn primary_health_json(audit: &HealthAudit) -> serde_json::Value {
+    serde_json::json!({
+        "node": audit.node,
+        "started_unix_ms": audit.started_unix_ms,
+        "finished_unix_ms": audit.finished_unix_ms,
+        "elapsed_us": audit.elapsed_us,
+        "outcome": audit.outcome,
+        "height": audit.snapshot.as_ref().and_then(|value| value.height),
+        "tip": audit.snapshot.as_ref().and_then(|value| value.tip.as_deref()),
+        "chainwork": audit.snapshot.as_ref().and_then(|value| value.chainwork.as_deref()),
+        "peers": audit.snapshot.as_ref().and_then(|value| value.peers),
+        "error": audit.error,
+    })
+}
+
+fn submit_audit_json(audit: &SubmitAudit) -> serde_json::Value {
+    serde_json::json!({
+        "node": audit.node,
+        "role": audit.role,
+        "started_unix_ms": audit.started_unix_ms,
+        "finished_unix_ms": audit.finished_unix_ms,
+        "elapsed_us": audit.elapsed_us,
+        "outcome": audit.outcome,
+        "response": audit.response,
+        "error": audit.error,
+        "skip_reason": audit.skip_reason,
+    })
+}
+
+fn bounded_submit_timeout(value: Duration) -> Duration {
+    value.clamp(Duration::from_millis(100), Duration::from_secs(10))
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2120,6 +2689,7 @@ enum OffenseKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, extract::State, routing::post};
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
@@ -2215,6 +2785,153 @@ mod tests {
 
     struct FailingBlockSubmitter;
     struct ObservableBlockSubmitter;
+
+    #[derive(Clone)]
+    enum MockSubmitBehavior {
+        Response(bool),
+        Error(&'static str),
+        DelayedResponse(Duration, bool),
+    }
+
+    struct MockCandidateNodeEndpoint {
+        name: &'static str,
+        health: NodeHealth,
+        health_error: Option<&'static str>,
+        behavior: MockSubmitBehavior,
+        submit_calls: AtomicUsize,
+    }
+
+    impl MockCandidateNodeEndpoint {
+        fn healthy(name: &'static str, behavior: MockSubmitBehavior) -> Self {
+            Self {
+                name,
+                health: NodeHealth {
+                    height: Some(100),
+                    tip: Some(format!("0x{}", "00".repeat(32))),
+                    chainwork: Some("work-100".to_owned()),
+                    peers: Some(8),
+                    extra: serde_json::Value::Null,
+                },
+                health_error: None,
+                behavior,
+                submit_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_tip(mut self, tip: &str) -> Self {
+            self.health.tip = Some(tip.to_owned());
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CandidateNodeEndpoint for MockCandidateNodeEndpoint {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn health(&self) -> std::result::Result<NodeHealth, String> {
+            self.health_error
+                .map(|error| Err(error.to_owned()))
+                .unwrap_or_else(|| Ok(self.health.clone()))
+        }
+
+        async fn submit_candidate(
+            &self,
+            candidate: &BlockCandidateSubmitRequest,
+        ) -> std::result::Result<SubmitBlockResponse, String> {
+            self.submit_calls.fetch_add(1, Ordering::SeqCst);
+            let response = |ok| SubmitBlockResponse {
+                ok,
+                hash: Some(candidate.hash_hex.clone()),
+                extra: serde_json::json!({
+                    "status": if ok { "accepted" } else { "rejected" },
+                }),
+            };
+            match self.behavior {
+                MockSubmitBehavior::Response(ok) => Ok(response(ok)),
+                MockSubmitBehavior::Error(error) => Err(error.to_owned()),
+                MockSubmitBehavior::DelayedResponse(delay, ok) => {
+                    tokio::time::sleep(delay).await;
+                    Ok(response(ok))
+                }
+            }
+        }
+    }
+
+    fn mock_candidate() -> BlockCandidateSubmitRequest {
+        BlockCandidateSubmitRequest {
+            job_id: "job-1".to_owned(),
+            worker_name: "worker-1".to_owned(),
+            header_hex: "00".repeat(84),
+            hash_hex: "11".repeat(32),
+            coinbase_txid_hex: "22".repeat(32),
+            coinbase_hex: "33".repeat(16),
+            merkle_root_hex: "44".repeat(32),
+            extranonce2_hex: "01020304".to_owned(),
+            ntime_hex: "66554433".to_owned(),
+            nonce_hex: "00000001".to_owned(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct ReplayNodeState {
+        submit_calls: Arc<AtomicUsize>,
+    }
+
+    async fn replay_health() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "height": 100,
+            "tip": format!("0x{}", "00".repeat(32)),
+            "chainwork": "work-100",
+            "peers": 8,
+        }))
+    }
+
+    async fn replay_submit(
+        State(state): State<ReplayNodeState>,
+        Json(candidate): Json<BlockCandidateSubmitRequest>,
+    ) -> Json<SubmitBlockResponse> {
+        state.submit_calls.fetch_add(1, Ordering::SeqCst);
+        Json(SubmitBlockResponse {
+            ok: true,
+            hash: Some(candidate.hash_hex),
+            extra: serde_json::json!({"status": "accepted"}),
+        })
+    }
+
+    async fn spawn_replay_node() -> (String, Arc<AtomicUsize>) {
+        let submit_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/health", axum::routing::get(replay_health))
+            .route("/api/rpc/block/submit", post(replay_submit))
+            .with_state(ReplayNodeState {
+                submit_calls: submit_calls.clone(),
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), submit_calls)
+    }
+
+    async fn parallel_submitter(
+        primary: Arc<MockCandidateNodeEndpoint>,
+        secondary: Arc<MockCandidateNodeEndpoint>,
+        timeout_duration: Duration,
+    ) -> ParallelNodeBlockSubmitter {
+        let submitter = ParallelNodeBlockSubmitter::new(
+            primary,
+            secondary,
+            timeout_duration,
+            timeout_duration,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        );
+        submitter.refresh_health_once().await;
+        submitter
+    }
 
     #[test]
     fn extranonce1_is_serialized_in_verification_byte_order() {
@@ -2907,6 +3624,179 @@ mod tests {
             candidates[0].submit_response_json["pool_observability"]["node_roundtrip_us"]
                 .as_u64()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_submit_records_both_successes_and_keeps_primary_authoritative() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Response(true),
+        ));
+        let response =
+            parallel_submitter(primary.clone(), secondary.clone(), Duration::from_secs(1))
+                .await
+                .submit_candidate(&mock_candidate())
+                .await
+                .unwrap();
+
+        assert!(response.ok);
+        assert_eq!(response.extra["parallel_submit"]["status"], "both_accepted");
+        assert_eq!(
+            response.extra["parallel_submit"]["primary_submit"]["outcome"],
+            "accepted"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_submit"]["outcome"],
+            "accepted"
+        );
+        assert_eq!(primary.submit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_submit_keeps_primary_success_when_secondary_fails() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Error("node-b unavailable"),
+        ));
+        let response = parallel_submitter(primary, secondary, Duration::from_secs(1))
+            .await
+            .submit_candidate(&mock_candidate())
+            .await
+            .unwrap();
+
+        assert!(response.ok);
+        assert_eq!(
+            response.extra["parallel_submit"]["status"],
+            "authority_accepted_secondary_failed"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_submit"]["outcome"],
+            "transport_error"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_submit_reports_secondary_success_without_overriding_primary_failure() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(false),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Response(true),
+        ));
+        let response = parallel_submitter(primary, secondary, Duration::from_secs(1))
+            .await
+            .submit_candidate(&mock_candidate())
+            .await
+            .unwrap();
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.extra["parallel_submit"]["status"],
+            "secondary_accepted_authority_failed"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_submit"]["outcome"],
+            "accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_submit_bounds_both_node_timeouts() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::DelayedResponse(Duration::from_secs(1), true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::DelayedResponse(Duration::from_secs(1), true),
+        ));
+        let response = parallel_submitter(primary, secondary, Duration::from_millis(100))
+            .await
+            .submit_candidate(&mock_candidate())
+            .await
+            .unwrap();
+
+        assert!(!response.ok);
+        assert_eq!(response.extra["parallel_submit"]["status"], "both_failed");
+        assert_eq!(
+            response.extra["parallel_submit"]["primary_submit"]["outcome"],
+            "timeout"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_submit"]["outcome"],
+            "timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_submit_skips_secondary_when_chain_state_differs() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(
+            MockCandidateNodeEndpoint::healthy("node-b", MockSubmitBehavior::Response(true))
+                .with_tip("different-tip"),
+        );
+        let response = parallel_submitter(primary, secondary.clone(), Duration::from_secs(1))
+            .await
+            .submit_candidate(&mock_candidate())
+            .await
+            .unwrap();
+
+        assert!(response.ok);
+        assert_eq!(
+            response.extra["parallel_submit"]["status"],
+            "authority_accepted_secondary_skipped"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "chain_state_mismatch"
+        );
+        assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_submit_replays_over_two_real_http_node_clients() {
+        let (primary_url, primary_calls) = spawn_replay_node().await;
+        let (secondary_url, secondary_calls) = spawn_replay_node().await;
+        let submitter = ParallelNodeBlockSubmitter::new(
+            Arc::new(CsdCandidateNodeEndpoint::new(
+                "node-a".to_owned(),
+                CsdNodeClient::new(primary_url),
+            )),
+            Arc::new(CsdCandidateNodeEndpoint::new(
+                "node-b".to_owned(),
+                CsdNodeClient::new(secondary_url),
+            )),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        );
+        submitter.refresh_health_once().await;
+
+        let response = submitter.submit_candidate(&mock_candidate()).await.unwrap();
+
+        assert!(response.ok);
+        assert_eq!(response.extra["parallel_submit"]["status"], "both_accepted");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            response.extra["parallel_submit"]["primary_health"]["tip"],
+            format!("0x{}", "00".repeat(32))
         );
     }
 

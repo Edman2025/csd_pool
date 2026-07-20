@@ -658,6 +658,14 @@ submits structured candidate payloads to the configured submit node and can
 record the submitted candidate in `blocks`. Without a database URL, it runs in
 in-memory development mode.
 
+Candidate fanout is a separate, default-off safety feature. When
+`CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED=true`, the bridge starts the
+authoritative node-a submission immediately and submits best-effort to node-b
+only when fresh health snapshots have identical height, tip, and chainwork.
+Both outcomes are persisted in the candidate submit response. Node-a remains
+authoritative, and this mode does not change the accepted-share, candidate DB,
+or notification ordering.
+
 It should not:
 
 - sign payout transactions
