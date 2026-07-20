@@ -1,6 +1,7 @@
 # Candidate Parallel Submit Canary
 
-Status: code and isolated validation only. Production remains disabled.
+Status: parent-hash repair is code and isolated validation only. Production
+parallel submit is disabled after the one-shot rollback described below.
 
 ## Scope
 
@@ -175,6 +176,53 @@ the final capture.
 Durable evidence is stored under
 `/data/csd-pool/parallel-canary/0a173be-one-shot/`. Its evidence archive SHA256
 is `49c2d6d74f46142c7c5a2d58bb876792c51d15381d81823c04b7d3d120c865fa`.
+
+## Production One-Shot Result And Parent Repair
+
+The one-shot production canary started at `2026-07-21 06:13:04 CST`. Its
+process-local budget behaved safely, but the intended node-b submit was not
+exercised:
+
+- height `58427`, hash
+  `00000000000010bd7b85f08688ee8322818820686b6726426ce861dd851469fd`,
+  claimed the `1` budget and left `0`; node-a accepted it while node-b was
+  skipped with `candidate_parent_mismatch`;
+- height `58437`, hash
+  `0000000000001287afc7245997b6de859c53576a833f0583fc8902df6d2cbed2`,
+  saw the exhausted budget and remained node-a only;
+- both blocks reached the pool's `10` confirmation threshold, remained
+  non-orphaned, and paid `5,000,000,000` base units to the configured mining
+  address; the public block feed independently reported both hashes as final;
+- node-b logs showed only later P2P receipt of each block and no local submit
+  call.
+
+The first candidate's serialized header contains parent
+`00000000000013c6d2db4280dd807f75740a3300e84c53d4114b944b9012d56b`,
+exactly matching both node health tips. The gate incorrectly reversed the
+already canonical header bytes before comparing them with the display hash,
+creating a false mismatch. Production was rolled back to the A-only
+observability daemon; node-a, node-b, signer, wallet, and miners were not
+restarted or changed.
+
+The repair represents node health tips and candidate parents as one
+`CanonicalBlockHash([u8; 32])` type. Display hashes are decoded once, candidate
+parents are copied directly from serialized header bytes `4..36`, and the
+eligibility gate compares the structured values without an implicit reverse.
+The real height-58427 header is a regression fixture. Additional tests prove:
+
+- matching display/header forms, including prefix and hex case differences,
+  call node-b exactly once;
+- the reversed byte order is not accepted as the same parent;
+- a genuine parent mismatch still consumes the one-shot budget;
+- the next candidate reports `candidate_budget_exhausted`;
+- two concurrent candidates still issue at most one node-b call;
+- malformed display hashes and malformed header lengths fail closed.
+
+The repaired local tree passed formatting and diff checks, workspace tests
+(`195` passed), strict clippy, and release check (`1793` passed, `0` failed).
+It is not authorized for production. A fresh Linux artifact and isolated
+two-node replay are required, followed by a separately approved production
+window after the miner expansion finishes.
 
 ## Residual Miner Liveness Evidence
 

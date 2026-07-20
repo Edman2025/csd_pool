@@ -1642,37 +1642,49 @@ fn secondary_submit_eligibility(
     if !primary_complete || !secondary_complete {
         return Err("health_incomplete");
     }
+    let primary_tip =
+        CanonicalBlockHash::from_display_hex(primary.tip.as_deref().ok_or("health_incomplete")?)
+            .ok_or("health_incomplete")?;
+    let secondary_tip =
+        CanonicalBlockHash::from_display_hex(secondary.tip.as_deref().ok_or("health_incomplete")?)
+            .ok_or("health_incomplete")?;
     if primary.height != secondary.height
-        || normalized_hash(primary.tip.as_deref().unwrap_or_default())
-            != normalized_hash(secondary.tip.as_deref().unwrap_or_default())
+        || primary_tip != secondary_tip
         || primary.chainwork != secondary.chainwork
     {
         return Err("chain_state_mismatch");
     }
-    let candidate_parent = candidate_parent_tip(candidate).ok_or("candidate_parent_unavailable")?;
-    let primary_tip = primary.tip.as_deref().ok_or("health_incomplete")?;
-    if normalized_hash(primary_tip) != candidate_parent {
+    let candidate_parent = CanonicalBlockHash::from_candidate_header(candidate)
+        .ok_or("candidate_parent_unavailable")?;
+    if primary_tip != candidate_parent {
         return Err("candidate_parent_mismatch");
     }
     Ok(())
 }
 
-fn candidate_parent_tip(candidate: &BlockCandidateSubmitRequest) -> Option<String> {
-    let header = hex::decode(&candidate.header_hex).ok()?;
-    if header.len() != 84 {
-        return None;
-    }
-    let mut parent = header[4..36].to_vec();
-    parent.reverse();
-    Some(hex::encode(parent))
-}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CanonicalBlockHash([u8; 32]);
 
-fn normalized_hash(value: &str) -> String {
-    value
-        .trim()
-        .strip_prefix("0x")
-        .unwrap_or(value.trim())
-        .to_ascii_lowercase()
+impl CanonicalBlockHash {
+    fn from_display_hex(value: &str) -> Option<Self> {
+        let value = value.trim();
+        let value = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .unwrap_or(value);
+        let decoded = hex::decode(value).ok()?;
+        let bytes: [u8; 32] = decoded.try_into().ok()?;
+        Some(Self(bytes))
+    }
+
+    fn from_candidate_header(candidate: &BlockCandidateSubmitRequest) -> Option<Self> {
+        let header = hex::decode(&candidate.header_hex).ok()?;
+        if header.len() != 84 {
+            return None;
+        }
+        let bytes: [u8; 32] = header[4..36].try_into().ok()?;
+        Some(Self(bytes))
+    }
 }
 
 fn unavailable_health_audit(node: &str) -> HealthAudit {
@@ -2943,6 +2955,30 @@ mod tests {
         }
     }
 
+    const H58427_PARENT_DISPLAY: &str =
+        "00000000000013c6d2db4280dd807f75740a3300e84c53d4114b944b9012d56b";
+
+    fn h58427_candidate() -> BlockCandidateSubmitRequest {
+        BlockCandidateSubmitRequest {
+            job_id: "91005efd84e1d198c0006cbab54c83b95d0592c870d73bdc5056daec97572dd7"
+                .to_owned(),
+            worker_name: "V100-JN-20260719-1-22-CS".to_owned(),
+            header_hex: "0100000000000000000013c6d2db4280dd807f75740a3300e84c53d4114b944b9012d56b5cde0ff8e025e5027b9ecfcf22dadd8c287c23504d689ec8d27fdce929690bbe70a35e6a00000000eb8d1d1aa71be588".to_owned(),
+            hash_hex: "00000000000010bd7b85f08688ee8322818820686b6726426ce861dd851469fd"
+                .to_owned(),
+            coinbase_txid_hex:
+                "5cde0ff8e025e5027b9ecfcf22dadd8c287c23504d689ec8d27fdce929690bbe"
+                    .to_owned(),
+            coinbase_hex: "00".repeat(64),
+            merkle_root_hex:
+                "5cde0ff8e025e5027b9ecfcf22dadd8c287c23504d689ec8d27fdce929690bbe"
+                    .to_owned(),
+            extranonce2_hex: "a29747fe".to_owned(),
+            ntime_hex: "6a5ea370".to_owned(),
+            nonce_hex: "88e51ba7".to_owned(),
+        }
+    }
+
     #[derive(Clone)]
     struct ReplayNodeState {
         submit_calls: Arc<AtomicUsize>,
@@ -3697,6 +3733,124 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_block_hash_uses_display_order_without_implicit_reversal() {
+        let display =
+            CanonicalBlockHash::from_display_hex(&format!("0x{}", H58427_PARENT_DISPLAY)).unwrap();
+        let uppercase = CanonicalBlockHash::from_display_hex(&format!(
+            "0X{}",
+            H58427_PARENT_DISPLAY.to_ascii_uppercase()
+        ))
+        .unwrap();
+        let candidate_parent =
+            CanonicalBlockHash::from_candidate_header(&h58427_candidate()).unwrap();
+        let mut reversed = hex::decode(H58427_PARENT_DISPLAY).unwrap();
+        reversed.reverse();
+        let reversed_display =
+            CanonicalBlockHash::from_display_hex(&hex::encode(reversed)).unwrap();
+
+        assert_eq!(display, uppercase);
+        assert_eq!(display, candidate_parent);
+        assert_ne!(display, reversed_display);
+        assert!(CanonicalBlockHash::from_display_hex("00").is_none());
+
+        let mut malformed = h58427_candidate();
+        malformed.header_hex = "00".repeat(83);
+        assert!(CanonicalBlockHash::from_candidate_header(&malformed).is_none());
+    }
+
+    #[tokio::test]
+    async fn parallel_submit_real_h58427_parent_allows_secondary() {
+        let primary = Arc::new(
+            MockCandidateNodeEndpoint::healthy("node-a", MockSubmitBehavior::Response(true))
+                .with_tip(&format!("0x{H58427_PARENT_DISPLAY}")),
+        );
+        let secondary = Arc::new(
+            MockCandidateNodeEndpoint::healthy("node-b", MockSubmitBehavior::Response(true))
+                .with_tip(&format!("0X{}", H58427_PARENT_DISPLAY.to_ascii_uppercase())),
+        );
+        let response =
+            parallel_submitter(primary.clone(), secondary.clone(), Duration::from_secs(1))
+                .await
+                .submit_candidate(&h58427_candidate())
+                .await
+                .unwrap();
+
+        assert!(response.ok);
+        assert_eq!(response.extra["parallel_submit"]["status"], "both_accepted");
+        assert_eq!(primary.submit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_submit_real_parent_mismatch_consumes_one_shot_budget() {
+        let primary = Arc::new(
+            MockCandidateNodeEndpoint::healthy("node-a", MockSubmitBehavior::Response(true))
+                .with_tip(&format!("0x{H58427_PARENT_DISPLAY}")),
+        );
+        let secondary = Arc::new(
+            MockCandidateNodeEndpoint::healthy("node-b", MockSubmitBehavior::Response(true))
+                .with_tip(&format!("0x{H58427_PARENT_DISPLAY}")),
+        );
+        let submitter =
+            parallel_submitter(primary.clone(), secondary.clone(), Duration::from_secs(1)).await;
+        let mut mismatch = h58427_candidate();
+        let mut header = hex::decode(&mismatch.header_hex).unwrap();
+        header[4] ^= 0x01;
+        mismatch.header_hex = hex::encode(header);
+
+        let first = submitter.submit_candidate(&mismatch).await.unwrap();
+        assert_eq!(
+            first.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "candidate_parent_mismatch"
+        );
+        assert_eq!(
+            first.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
+            true
+        );
+        assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 0);
+
+        let second = submitter
+            .submit_candidate(&h58427_candidate())
+            .await
+            .unwrap();
+        assert_eq!(
+            second.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "candidate_budget_exhausted"
+        );
+        assert_eq!(
+            second.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
+            false
+        );
+        assert_eq!(primary.submit_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_submit_malformed_candidate_parent_skips_secondary() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Response(true),
+        ));
+        let mut candidate = mock_candidate();
+        candidate.header_hex = "00".repeat(83);
+        let response = parallel_submitter(primary, secondary.clone(), Duration::from_secs(1))
+            .await
+            .submit_candidate(&candidate)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "candidate_parent_unavailable"
+        );
+        assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn parallel_submit_records_both_successes_and_keeps_primary_authoritative() {
         let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
@@ -3878,7 +4032,7 @@ mod tests {
         ));
         let secondary = Arc::new(
             MockCandidateNodeEndpoint::healthy("node-b", MockSubmitBehavior::Response(true))
-                .with_tip("different-tip"),
+                .with_tip(&format!("0x{}", "11".repeat(32))),
         );
         let response = parallel_submitter(primary, secondary.clone(), Duration::from_secs(1))
             .await
@@ -3906,7 +4060,7 @@ mod tests {
         ));
         let secondary = Arc::new(
             MockCandidateNodeEndpoint::healthy("node-b", MockSubmitBehavior::Response(true))
-                .with_tip("different-tip"),
+                .with_tip(&format!("0x{}", "11".repeat(32))),
         );
         let submitter =
             parallel_submitter(primary, secondary.clone(), Duration::from_secs(1)).await;
