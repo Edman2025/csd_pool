@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 const DEFAULT_REWARD_BASE_UNITS: u128 = 5_000_000_000;
@@ -95,6 +96,13 @@ async fn submit_block(
     State(state): State<MockState>,
     Json(payload): Json<serde_json::Value>,
 ) -> Json<SubmitBlockResponse> {
+    let request_started = Instant::now();
+    let request_received_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
     let hash = payload
         .get("hash_hex")
         .and_then(|value| value.as_str())
@@ -120,10 +128,28 @@ async fn submit_block(
         .lock()
         .expect("block lock")
         .insert(hash.clone(), status);
+    let accept_elapsed_us: u64 = request_started
+        .elapsed()
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let relay_enqueue_elapsed_us: u64 = request_started
+        .elapsed()
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX);
     Json(SubmitBlockResponse {
         ok: true,
         hash: Some(hash),
-        extra: serde_json::json!({ "source": "csd-pool-mock-node" }),
+        extra: serde_json::json!({
+            "source": "csd-pool-mock-node",
+            "node_observability": {
+                "request_received_unix_ms": request_received_unix_ms,
+                "accept_elapsed_us": accept_elapsed_us,
+                "relay_enqueue_elapsed_us": relay_enqueue_elapsed_us,
+                "relay_queued": true,
+            },
+        }),
     })
 }
 
@@ -282,6 +308,17 @@ mod tests {
             .unwrap();
         let submitted: SubmitBlockResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(submitted.hash, Some("22".repeat(32)));
+        assert_eq!(submitted.extra["node_observability"]["relay_queued"], true);
+        assert!(
+            submitted.extra["node_observability"]["request_received_unix_ms"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            submitted.extra["node_observability"]["accept_elapsed_us"]
+                .as_u64()
+                .is_some()
+        );
 
         let response = app
             .oneshot(

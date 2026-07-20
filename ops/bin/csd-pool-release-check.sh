@@ -1011,11 +1011,13 @@ require_file "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch"
 require_file "ops/csd-node-adapter/MANIFEST.txt"
 require_executable "ops/csd-node-adapter/apply-and-build.sh"
 require_text "ops/csd-node-adapter/MANIFEST.txt" "commit=d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c"
-require_text "ops/csd-node-adapter/MANIFEST.txt" "patch_sha256=6f3a42738202b21a04fd5f069552ea742baa122638757f399e70eedf215fced7"
+require_text "ops/csd-node-adapter/MANIFEST.txt" "patch_sha256=264dae8654edb876c8abab07d3dc5fb01e1d0ef463d4e6ea28a29f6ef960fd44"
 require_text "ops/csd-node-adapter/MANIFEST.txt" "p2p_patch_sha256=cb56d3625876cff5fc2f8ad4833405631b47f073d89217e9b93647f99a394bb3"
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'CSD_POOL_ADAPTER_TOKEN'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/rpc/mining/template'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/rpc/block/submit'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'node_observability'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'relay_enqueue_elapsed_us'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'choose_pool_block_time'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'let time = now.max(min_ok);'
 require_text "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" 'ADDR_BACKOFF_RETENTION_SECS'

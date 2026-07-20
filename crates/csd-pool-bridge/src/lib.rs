@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use csd_pool_consensus::{
     SubmitSolution, VerifiedShare, WorkTemplate, coinbase_bytes, compose_extranonce,
@@ -901,6 +901,8 @@ async fn handle_client(
                                 pool_state.record_share_validation(validation_started.elapsed());
                                 match validation_result {
                                     Ok((share, accepted_difficulty)) => {
+                                        let candidate_observation =
+                                            share.is_block_candidate.then(CandidateObservation::now);
                                         let persisted = persist_accepted_share(
                                             repository.as_deref(),
                                             &submitted_job,
@@ -924,6 +926,8 @@ async fn handle_client(
                                                     &share,
                                                     extranonce1_le,
                                                     accepted_difficulty,
+                                                    candidate_observation
+                                                        .expect("candidate observation recorded"),
                                                 )
                                                 .await?;
                                             }
@@ -1118,6 +1122,34 @@ impl BlockSubmitter for CsdNodeBlockSubmitter {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CandidateObservation {
+    detected_at: Instant,
+    detected_unix_ms: u64,
+}
+
+impl CandidateObservation {
+    fn now() -> Self {
+        Self {
+            detected_at: Instant::now(),
+            detected_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        }
+    }
+
+    fn elapsed_us(self) -> u64 {
+        self.detected_at
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn submit_block_candidate(
     submitter: Option<&dyn BlockSubmitter>,
@@ -1129,6 +1161,7 @@ async fn submit_block_candidate(
     share: &VerifiedShare,
     extranonce1_le: [u8; 4],
     difficulty: f64,
+    observation: CandidateObservation,
 ) -> Result<()> {
     let Some(submitter) = submitter else {
         warn!(
@@ -1141,13 +1174,25 @@ async fn submit_block_candidate(
 
     let effort_pct = block_effort_pct(job, pool_state, difficulty);
     let request = block_candidate_submit_request(job, miner, submit, share, extranonce1_le);
-    let response = match submitter.submit_candidate(&request).await {
-        Ok(response) => response,
+    let detected_to_submit_start_us = observation.elapsed_us();
+    let node_submit_started = Instant::now();
+    let submit_result = submitter.submit_candidate(&request).await;
+    let node_roundtrip_us = elapsed_us(node_submit_started);
+    let response = match submit_result {
+        Ok(mut response) => {
+            attach_candidate_observability(
+                &mut response,
+                observation,
+                detected_to_submit_start_us,
+                node_roundtrip_us,
+            );
+            response
+        }
         Err(err) => {
             // Keep the solved header auditable and queryable by the block
             // reconciler even when the node call fails before returning HTTP.
             if let Some(repository) = repository {
-                let failed_response = SubmitBlockResponse {
+                let mut failed_response = SubmitBlockResponse {
                     ok: false,
                     hash: Some(request.hash_hex.clone()),
                     extra: serde_json::json!({
@@ -1155,6 +1200,13 @@ async fn submit_block_candidate(
                         "retryable": true,
                     }),
                 };
+                attach_candidate_observability(
+                    &mut failed_response,
+                    observation,
+                    detected_to_submit_start_us,
+                    node_roundtrip_us,
+                );
+                let record_started = Instant::now();
                 repository
                     .record_block_candidate(&block_candidate_record(
                         miner,
@@ -1163,16 +1215,51 @@ async fn submit_block_candidate(
                         effort_pct,
                     ))
                     .await?;
+                let candidate_record_us = elapsed_us(record_started);
+                let candidate_total_us = observation.elapsed_us();
+                pool_state.record_candidate_propagation(
+                    Duration::from_micros(detected_to_submit_start_us),
+                    Duration::from_micros(node_roundtrip_us),
+                    Duration::from_micros(candidate_record_us),
+                    Duration::from_micros(candidate_total_us),
+                    None,
+                    None,
+                );
+                warn!(
+                    job_id = request.job_id,
+                    hash = request.hash_hex,
+                    candidate_detected_to_submit_start_us = detected_to_submit_start_us,
+                    node_roundtrip_us,
+                    candidate_record_us,
+                    candidate_total_us,
+                    %err,
+                    "block candidate submission transport failed; keeping miner session active"
+                );
+                return Ok(());
             }
+            let candidate_total_us = observation.elapsed_us();
+            pool_state.record_candidate_propagation(
+                Duration::from_micros(detected_to_submit_start_us),
+                Duration::from_micros(node_roundtrip_us),
+                Duration::ZERO,
+                Duration::from_micros(candidate_total_us),
+                None,
+                None,
+            );
             warn!(
                 job_id = request.job_id,
                 hash = request.hash_hex,
+                candidate_detected_to_submit_start_us = detected_to_submit_start_us,
+                node_roundtrip_us,
+                candidate_record_us = 0,
+                candidate_total_us,
                 %err,
                 "block candidate submission transport failed; keeping miner session active"
             );
             return Ok(());
         }
     };
+    let record_started = Instant::now();
     if let Some(repository) = repository {
         repository
             .record_block_candidate(&block_candidate_record(
@@ -1180,11 +1267,29 @@ async fn submit_block_candidate(
             ))
             .await?;
     }
+    let candidate_record_us = elapsed_us(record_started);
+    let candidate_total_us = observation.elapsed_us();
+    let node_observability = candidate_node_observability(&response);
+    let node_accept = candidate_node_duration(&response, "accept_elapsed_us");
+    let relay_enqueue = candidate_node_duration(&response, "relay_enqueue_elapsed_us");
+    pool_state.record_candidate_propagation(
+        Duration::from_micros(detected_to_submit_start_us),
+        Duration::from_micros(node_roundtrip_us),
+        Duration::from_micros(candidate_record_us),
+        Duration::from_micros(candidate_total_us),
+        node_accept,
+        relay_enqueue,
+    );
     if response.ok {
         info!(
             job_id = request.job_id,
             hash = request.hash_hex,
             effort_pct,
+            candidate_detected_to_submit_start_us = detected_to_submit_start_us,
+            node_roundtrip_us,
+            candidate_record_us,
+            candidate_total_us,
+            node_observability = %node_observability,
             "block candidate submitted"
         );
     } else {
@@ -1192,11 +1297,57 @@ async fn submit_block_candidate(
             job_id = request.job_id,
             hash = request.hash_hex,
             effort_pct,
+            candidate_detected_to_submit_start_us = detected_to_submit_start_us,
+            node_roundtrip_us,
+            candidate_record_us,
+            candidate_total_us,
+            node_observability = %node_observability,
             response = %serde_json::to_string(&response).unwrap_or_default(),
             "block candidate rejected; keeping miner session active"
         );
     }
     Ok(())
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
+}
+
+fn attach_candidate_observability(
+    response: &mut SubmitBlockResponse,
+    observation: CandidateObservation,
+    detected_to_submit_start_us: u64,
+    node_roundtrip_us: u64,
+) {
+    let mut extra = response.extra.as_object().cloned().unwrap_or_default();
+    extra.insert(
+        "pool_observability".to_owned(),
+        serde_json::json!({
+            "candidate_detected_unix_ms": observation.detected_unix_ms,
+            "candidate_detected_to_submit_start_us": detected_to_submit_start_us,
+            "node_roundtrip_us": node_roundtrip_us,
+        }),
+    );
+    response.extra = serde_json::Value::Object(extra);
+}
+
+fn candidate_node_observability(response: &SubmitBlockResponse) -> String {
+    serde_json::to_string(
+        response
+            .extra
+            .get("node_observability")
+            .unwrap_or(&serde_json::Value::Null),
+    )
+    .unwrap_or_else(|_| "null".to_owned())
+}
+
+fn candidate_node_duration(response: &SubmitBlockResponse, field: &str) -> Option<Duration> {
+    response
+        .extra
+        .get("node_observability")
+        .and_then(|value| value.get(field))
+        .and_then(serde_json::Value::as_u64)
+        .map(Duration::from_micros)
 }
 
 fn block_effort_pct(job: &PoolJob, pool_state: &SharedPoolState, current_difficulty: f64) -> f64 {
@@ -2063,6 +2214,7 @@ mod tests {
     }
 
     struct FailingBlockSubmitter;
+    struct ObservableBlockSubmitter;
 
     #[test]
     fn extranonce1_is_serialized_in_verification_byte_order() {
@@ -2077,6 +2229,27 @@ mod tests {
             _candidate: &BlockCandidateSubmitRequest,
         ) -> Result<SubmitBlockResponse> {
             Err(BridgeError::InvalidConfig("node unavailable".to_owned()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlockSubmitter for ObservableBlockSubmitter {
+        async fn submit_candidate(
+            &self,
+            candidate: &BlockCandidateSubmitRequest,
+        ) -> Result<SubmitBlockResponse> {
+            Ok(SubmitBlockResponse {
+                ok: true,
+                hash: Some(candidate.hash_hex.clone()),
+                extra: serde_json::json!({
+                    "status": "accepted",
+                    "node_observability": {
+                        "accept_elapsed_us": 125,
+                        "relay_enqueue_elapsed_us": 140,
+                        "relay_queued": true,
+                    },
+                }),
+            })
         }
     }
 
@@ -2656,17 +2829,19 @@ mod tests {
         let share = verify_submit(&job.template, [1, 0, 0, 0], &submit, 1.0).unwrap();
         let repository = csd_pool_db::InMemoryRepository::new();
         let submitter = FailingBlockSubmitter;
+        let pool_state = SharedPoolState::new();
 
         let result = submit_block_candidate(
             Some(&submitter),
             Some(&repository),
             &job,
-            &SharedPoolState::new(),
+            &pool_state,
             "0123456789abcdef0123456789abcdef01234567",
             &submit,
             &share,
             [1, 0, 0, 0],
             1.0,
+            CandidateObservation::now(),
         )
         .await;
 
@@ -2675,6 +2850,64 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].hash_hex, hex::encode(share.hash));
         assert_eq!(candidates[0].submit_response_json["retryable"], true);
+        assert!(
+            candidates[0].submit_response_json["pool_observability"]["candidate_detected_unix_ms"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            candidates[0].submit_response_json["pool_observability"]["node_roundtrip_us"]
+                .as_u64()
+                .is_some()
+        );
+        assert_eq!(pool_state.snapshot().totals.candidate_propagation_count, 1);
+    }
+
+    #[tokio::test]
+    async fn records_successful_candidate_propagation_metrics() {
+        let job = csd_pool_node::easy_static_job("static-1");
+        let submit = SubmitParams {
+            worker_name: "0123456789abcdef0123456789abcdef01234567.rig-a".to_owned(),
+            job_id: job.template.job_id.clone(),
+            extranonce2_hex: "01020304".to_owned(),
+            ntime_hex: job.notify.ntime_hex.clone(),
+            nonce_hex: "00000001".to_owned(),
+        };
+        let share = verify_submit(&job.template, [1, 0, 0, 0], &submit, 1.0).unwrap();
+        let repository = csd_pool_db::InMemoryRepository::new();
+        let pool_state = SharedPoolState::new();
+
+        submit_block_candidate(
+            Some(&ObservableBlockSubmitter),
+            Some(&repository),
+            &job,
+            &pool_state,
+            "0123456789abcdef0123456789abcdef01234567",
+            &submit,
+            &share,
+            [1, 0, 0, 0],
+            1.0,
+            CandidateObservation::now(),
+        )
+        .await
+        .unwrap();
+
+        let totals = pool_state.snapshot().totals;
+        assert_eq!(totals.candidate_propagation_count, 1);
+        assert_eq!(totals.candidate_node_accept_count, 1);
+        assert_eq!(totals.candidate_relay_enqueue_count, 1);
+        assert!((totals.candidate_node_accept_seconds_sum - 0.000_125).abs() < f64::EPSILON);
+        assert!((totals.candidate_relay_enqueue_seconds_sum - 0.000_140).abs() < f64::EPSILON);
+        let candidates = repository.list_block_candidates().unwrap();
+        assert_eq!(
+            candidates[0].submit_response_json["node_observability"]["relay_queued"],
+            true
+        );
+        assert!(
+            candidates[0].submit_response_json["pool_observability"]["node_roundtrip_us"]
+                .as_u64()
+                .is_some()
+        );
     }
 
     #[test]
@@ -2857,6 +3090,53 @@ mod tests {
         assert_eq!(record.effort_pct, 91.25);
         assert_eq!(record.candidate_payload_json["job_id"], "static-1");
         assert_eq!(record.submit_response_json["ok"], true);
+    }
+
+    #[test]
+    fn candidate_observability_preserves_node_response_fields() {
+        let mut response = SubmitBlockResponse {
+            ok: true,
+            hash: Some("22".repeat(32)),
+            extra: serde_json::json!({
+                "status": "accepted",
+                "node_observability": {
+                    "accept_elapsed_us": 125,
+                    "relay_queued": true,
+                },
+            }),
+        };
+        let observation = CandidateObservation {
+            detected_at: Instant::now(),
+            detected_unix_ms: 123_456,
+        };
+
+        attach_candidate_observability(&mut response, observation, 42, 87);
+
+        assert_eq!(response.extra["status"], "accepted");
+        assert_eq!(
+            response.extra["node_observability"]["accept_elapsed_us"],
+            125
+        );
+        assert_eq!(
+            response.extra["pool_observability"]["candidate_detected_unix_ms"],
+            123_456
+        );
+        assert_eq!(
+            response.extra["pool_observability"]["candidate_detected_to_submit_start_us"],
+            42
+        );
+        assert_eq!(
+            response.extra["pool_observability"]["node_roundtrip_us"],
+            87
+        );
+        assert_eq!(
+            candidate_node_duration(&response, "accept_elapsed_us"),
+            Some(Duration::from_micros(125))
+        );
+        assert_eq!(
+            candidate_node_duration(&response, "relay_enqueue_elapsed_us"),
+            None
+        );
     }
 
     #[test]

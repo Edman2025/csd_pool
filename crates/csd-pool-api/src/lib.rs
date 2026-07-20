@@ -1235,6 +1235,83 @@ impl AppState {
             "csd_pool_share_validation_seconds_avg {validation_avg:.9}\n"
         ));
         body.push_str(
+            "# HELP csd_pool_candidate_propagation_seconds Block-candidate hot-path timing summaries. relay_enqueue measures local broadcast-queue admission, not peer receipt.\n",
+        );
+        body.push_str("# TYPE csd_pool_candidate_propagation_seconds summary\n");
+        for (phase, sum, count) in [
+            (
+                "detected_to_submit_start",
+                snapshot.totals.candidate_detected_to_submit_seconds_sum,
+                snapshot.totals.candidate_propagation_count,
+            ),
+            (
+                "node_roundtrip",
+                snapshot.totals.candidate_node_roundtrip_seconds_sum,
+                snapshot.totals.candidate_propagation_count,
+            ),
+            (
+                "candidate_record",
+                snapshot.totals.candidate_record_seconds_sum,
+                snapshot.totals.candidate_propagation_count,
+            ),
+            (
+                "candidate_total",
+                snapshot.totals.candidate_total_seconds_sum,
+                snapshot.totals.candidate_propagation_count,
+            ),
+            (
+                "node_accept",
+                snapshot.totals.candidate_node_accept_seconds_sum,
+                snapshot.totals.candidate_node_accept_count,
+            ),
+            (
+                "relay_enqueue",
+                snapshot.totals.candidate_relay_enqueue_seconds_sum,
+                snapshot.totals.candidate_relay_enqueue_count,
+            ),
+        ] {
+            body.push_str(&format!(
+                "csd_pool_candidate_propagation_seconds_sum{{phase=\"{phase}\"}} {sum:.9}\n"
+            ));
+            body.push_str(&format!(
+                "csd_pool_candidate_propagation_seconds_count{{phase=\"{phase}\"}} {count}\n"
+            ));
+        }
+        body.push_str(
+            "# HELP csd_pool_candidate_propagation_seconds_max Maximum observed block-candidate hot-path timing by phase.\n",
+        );
+        body.push_str("# TYPE csd_pool_candidate_propagation_seconds_max gauge\n");
+        for (phase, max) in [
+            (
+                "detected_to_submit_start",
+                snapshot.totals.candidate_detected_to_submit_seconds_max,
+            ),
+            (
+                "node_roundtrip",
+                snapshot.totals.candidate_node_roundtrip_seconds_max,
+            ),
+            (
+                "candidate_record",
+                snapshot.totals.candidate_record_seconds_max,
+            ),
+            (
+                "candidate_total",
+                snapshot.totals.candidate_total_seconds_max,
+            ),
+            (
+                "node_accept",
+                snapshot.totals.candidate_node_accept_seconds_max,
+            ),
+            (
+                "relay_enqueue",
+                snapshot.totals.candidate_relay_enqueue_seconds_max,
+            ),
+        ] {
+            body.push_str(&format!(
+                "csd_pool_candidate_propagation_seconds_max{{phase=\"{phase}\"}} {max:.9}\n"
+            ));
+        }
+        body.push_str(
             "# HELP csd_pool_job_notify_total Mining job publications grouped by reason.\n",
         );
         body.push_str("# TYPE csd_pool_job_notify_total counter\n");
@@ -3933,6 +4010,14 @@ mod tests {
         state.record_share_rejected("0123456789abcdef0123456789abcdef01234567");
         state.record_share_validation(std::time::Duration::from_millis(20));
         state.record_share_validation(std::time::Duration::from_millis(30));
+        state.record_candidate_propagation(
+            std::time::Duration::from_millis(2),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(3),
+            std::time::Duration::from_millis(25),
+            Some(std::time::Duration::from_millis(15)),
+            Some(std::time::Duration::from_millis(16)),
+        );
         let app = router_from_pool_state(state);
 
         let response = app
@@ -3961,6 +4046,17 @@ mod tests {
         assert!(text.contains("csd_pool_share_validation_seconds_sum 0.050000000"));
         assert!(text.contains("csd_pool_share_validation_seconds_count 2"));
         assert!(text.contains("csd_pool_share_validation_seconds_avg 0.025000000"));
+        assert!(text.contains(
+            "csd_pool_candidate_propagation_seconds_sum{phase=\"detected_to_submit_start\"} 0.002000000"
+        ));
+        assert!(
+            text.contains(
+                "csd_pool_candidate_propagation_seconds_count{phase=\"candidate_total\"} 1"
+            )
+        );
+        assert!(text.contains(
+            "csd_pool_candidate_propagation_seconds_max{phase=\"relay_enqueue\"} 0.016000000"
+        ));
         assert!(text.contains("csd_pool_blocks_found_total 1"));
         assert!(text.contains("csd_pool_next_payout_seconds 1800"));
     }

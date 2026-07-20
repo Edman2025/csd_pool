@@ -8,7 +8,7 @@
      routing::{get, post},
      Json, Router,
  };
-@@ -12,15 +13,20 @@
+@@ -12,15 +13,21 @@
  use std::collections::{HashMap, HashSet};
  
  use crate::chain::index::{get_hidx, HeaderIndex};
@@ -27,10 +27,11 @@
  use libp2p::PeerId;
  use std::sync::atomic::{AtomicUsize, Ordering};
 +use std::sync::RwLock;
++use std::time::{Instant, SystemTime, UNIX_EPOCH};
  
  fn c() -> crate::codec::ConsensusBincode {
      crate::codec::consensus_bincode()
-@@ -35,6 +41,59 @@
+@@ -35,6 +42,60 @@
      pub connected_peers: Arc<AtomicUsize>,
      pub known_peers: Arc<AtomicUsize>,
      pub peer_id: PeerId,
@@ -82,6 +83,7 @@
 +    hash: Option<String>,
 +    status: String,
 +    error: Option<String>,
++    node_observability: serde_json::Value,
 +}
 +
 +#[derive(Deserialize)]
@@ -90,7 +92,7 @@
  }
  
  #[derive(Serialize)]
-@@ -350,6 +409,8 @@
+@@ -350,6 +411,8 @@
      connected_peers: Arc<AtomicUsize>,
      known_peers: Arc<AtomicUsize>,
      peer_id: PeerId,
@@ -99,7 +101,7 @@
  ) -> Router {
      let st = ApiState {
          db,
-@@ -358,6 +419,9 @@
+@@ -358,6 +421,9 @@
          connected_peers,
          known_peers,
          peer_id,
@@ -109,7 +111,7 @@
      };
  
      Router::new()
-@@ -407,9 +471,409 @@
+@@ -407,9 +473,439 @@
          .route("/tx/template/attest", post(tx_template_attest))
          // Optional write endpoint:
          .route("/tx/submit", post(tx_submit))
@@ -325,6 +327,13 @@
 +    Json(request): Json<PoolCandidateReq>,
 +) -> Result<Json<PoolBlockResp>, PoolApiError> {
 +    pool_api_auth(&headers)?;
++    let request_started = Instant::now();
++    let request_received_unix_ms = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_millis()
++        .try_into()
++        .unwrap_or(u64::MAX);
 +    let job = st
 +        .pool_jobs
 +        .read()
@@ -433,18 +442,41 @@
 +    maybe_reorg_to(&st.db, &hash, Some(&st.mempool))
 +        .map_err(|error| pool_api_error(StatusCode::BAD_REQUEST, error))?;
 +    let accepted = get_tip(&st.db).ok().flatten() == Some(hash);
++    let accept_elapsed_us: u64 = request_started
++        .elapsed()
++        .as_micros()
++        .try_into()
++        .unwrap_or(u64::MAX);
++    let mut relay_queued = false;
++    let mut relay_enqueue_elapsed_us = None;
 +    if accepted {
 +        st.mempool.remove_mined_block(&block);
-+        let _ = st.mined_headers.send(crate::net::MinedHeaderEvent {
++        relay_queued = st
++            .mined_headers
++            .send(crate::net::MinedHeaderEvent {
 +            hash,
 +            header: block.header.clone(),
-+        });
++            })
++            .is_ok();
++        relay_enqueue_elapsed_us = Some(
++            request_started
++                .elapsed()
++                .as_micros()
++                .try_into()
++                .unwrap_or(u64::MAX),
++        );
 +    }
 +    Ok(Json(PoolBlockResp {
 +        ok: accepted,
 +        hash: Some(hex::encode(hash)),
 +        status: if accepted { "accepted" } else { "orphaned" }.to_string(),
 +        error: (!accepted).then(|| "block was not selected as canonical tip".to_string()),
++        node_observability: serde_json::json!({
++            "request_received_unix_ms": request_received_unix_ms,
++            "accept_elapsed_us": accept_elapsed_us,
++            "relay_enqueue_elapsed_us": relay_enqueue_elapsed_us,
++            "relay_queued": relay_queued,
++        }),
 +    }))
 +}
 +

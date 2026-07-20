@@ -1161,6 +1161,9 @@ csd_pool_job_notify_age_seconds
 csd_pool_share_validation_seconds_sum
 csd_pool_share_validation_seconds_count
 csd_pool_share_validation_seconds_avg
+csd_pool_candidate_propagation_seconds_sum{phase}
+csd_pool_candidate_propagation_seconds_count{phase}
+csd_pool_candidate_propagation_seconds_max{phase}
 csd_pool_blocks_found_total
 csd_pool_blocks_submitted_total
 csd_pool_blocks_confirmed_total
@@ -1177,6 +1180,15 @@ csd_node_peers{node}
 csd_pool_next_payout_seconds
 csd_pool_updated_timestamp_seconds
 ```
+
+Candidate propagation phases are deliberately observational. The
+`detected_to_submit_start` phase includes accepted-share persistence,
+`node_roundtrip` covers the adapter HTTP call, `candidate_record` covers block
+candidate persistence, and `candidate_total` covers the complete synchronous
+candidate path. Optional adapter phases report request-to-consensus acceptance
+as `node_accept` and request-to-local-broadcast-queue admission as
+`relay_enqueue`. Queue admission does not prove that any remote peer received
+the block.
 
 Go-live verification stores `/metrics` in `http-prometheus-metrics.txt` and
 requires `metrics-surface-safety.log` to prove the Prometheus surface includes

@@ -94,6 +94,34 @@ impl SharedPoolState {
         state.updated_ts = now_ts();
     }
 
+    pub fn record_candidate_propagation(
+        &self,
+        detected_to_submit_start: Duration,
+        node_roundtrip: Duration,
+        candidate_record: Duration,
+        total: Duration,
+        node_accept: Option<Duration>,
+        relay_enqueue: Option<Duration>,
+    ) {
+        let mut state = self.inner.write().expect("pool state lock");
+        state.candidate_propagation_count += 1;
+        state
+            .candidate_detected_to_submit
+            .record(detected_to_submit_start);
+        state.candidate_node_roundtrip.record(node_roundtrip);
+        state.candidate_record.record(candidate_record);
+        state.candidate_total.record(total);
+        if let Some(node_accept) = node_accept {
+            state.candidate_node_accept_count += 1;
+            state.candidate_node_accept.record(node_accept);
+        }
+        if let Some(relay_enqueue) = relay_enqueue {
+            state.candidate_relay_enqueue_count += 1;
+            state.candidate_relay_enqueue.record(relay_enqueue);
+        }
+        state.updated_ts = now_ts();
+    }
+
     pub fn record_job_notify(&self, reason: &str) {
         let mut state = self.inner.write().expect("pool state lock");
         state.job_notify_count += 1;
@@ -128,6 +156,20 @@ impl Drop for ConnectionGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct TimingStats {
+    sum: f64,
+    max: f64,
+}
+
+impl TimingStats {
+    fn record(&mut self, elapsed: Duration) {
+        let seconds = elapsed.as_secs_f64();
+        self.sum += seconds;
+        self.max = self.max.max(seconds);
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct PoolState {
     workers: BTreeMap<String, WorkerSnapshot>,
@@ -138,6 +180,15 @@ struct PoolState {
     stratum_connections: u64,
     share_validation_count: u64,
     share_validation_seconds_sum: f64,
+    candidate_propagation_count: u64,
+    candidate_detected_to_submit: TimingStats,
+    candidate_node_roundtrip: TimingStats,
+    candidate_record: TimingStats,
+    candidate_total: TimingStats,
+    candidate_node_accept_count: u64,
+    candidate_node_accept: TimingStats,
+    candidate_relay_enqueue_count: u64,
+    candidate_relay_enqueue: TimingStats,
     job_notify_count: u64,
     job_tip_change_count: u64,
     job_heartbeat_count: u64,
@@ -163,6 +214,21 @@ impl PoolState {
                 stratum_connections: self.stratum_connections,
                 share_validation_count: self.share_validation_count,
                 share_validation_seconds_sum: self.share_validation_seconds_sum,
+                candidate_propagation_count: self.candidate_propagation_count,
+                candidate_detected_to_submit_seconds_sum: self.candidate_detected_to_submit.sum,
+                candidate_detected_to_submit_seconds_max: self.candidate_detected_to_submit.max,
+                candidate_node_roundtrip_seconds_sum: self.candidate_node_roundtrip.sum,
+                candidate_node_roundtrip_seconds_max: self.candidate_node_roundtrip.max,
+                candidate_record_seconds_sum: self.candidate_record.sum,
+                candidate_record_seconds_max: self.candidate_record.max,
+                candidate_total_seconds_sum: self.candidate_total.sum,
+                candidate_total_seconds_max: self.candidate_total.max,
+                candidate_node_accept_count: self.candidate_node_accept_count,
+                candidate_node_accept_seconds_sum: self.candidate_node_accept.sum,
+                candidate_node_accept_seconds_max: self.candidate_node_accept.max,
+                candidate_relay_enqueue_count: self.candidate_relay_enqueue_count,
+                candidate_relay_enqueue_seconds_sum: self.candidate_relay_enqueue.sum,
+                candidate_relay_enqueue_seconds_max: self.candidate_relay_enqueue.max,
                 job_notify_count: self.job_notify_count,
                 job_tip_change_count: self.job_tip_change_count,
                 job_heartbeat_count: self.job_heartbeat_count,
@@ -216,6 +282,21 @@ pub struct TotalsSnapshot {
     pub stratum_connections: u64,
     pub share_validation_count: u64,
     pub share_validation_seconds_sum: f64,
+    pub candidate_propagation_count: u64,
+    pub candidate_detected_to_submit_seconds_sum: f64,
+    pub candidate_detected_to_submit_seconds_max: f64,
+    pub candidate_node_roundtrip_seconds_sum: f64,
+    pub candidate_node_roundtrip_seconds_max: f64,
+    pub candidate_record_seconds_sum: f64,
+    pub candidate_record_seconds_max: f64,
+    pub candidate_total_seconds_sum: f64,
+    pub candidate_total_seconds_max: f64,
+    pub candidate_node_accept_count: u64,
+    pub candidate_node_accept_seconds_sum: f64,
+    pub candidate_node_accept_seconds_max: f64,
+    pub candidate_relay_enqueue_count: u64,
+    pub candidate_relay_enqueue_seconds_sum: f64,
+    pub candidate_relay_enqueue_seconds_max: f64,
     pub job_notify_count: u64,
     pub job_tip_change_count: u64,
     pub job_heartbeat_count: u64,
@@ -313,6 +394,42 @@ mod tests {
         let totals = state.snapshot().totals;
         assert_eq!(totals.share_validation_count, 2);
         assert!((totals.share_validation_seconds_sum - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn records_candidate_propagation_timing() {
+        let state = SharedPoolState::new();
+        state.record_candidate_propagation(
+            Duration::from_millis(2),
+            Duration::from_millis(20),
+            Duration::from_millis(3),
+            Duration::from_millis(25),
+            Some(Duration::from_millis(15)),
+            Some(Duration::from_millis(16)),
+        );
+        state.record_candidate_propagation(
+            Duration::from_millis(4),
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            Duration::from_millis(39),
+            None,
+            None,
+        );
+
+        let totals = state.snapshot().totals;
+        assert_eq!(totals.candidate_propagation_count, 2);
+        assert!((totals.candidate_detected_to_submit_seconds_sum - 0.006).abs() < f64::EPSILON);
+        assert_eq!(totals.candidate_detected_to_submit_seconds_max, 0.004);
+        assert!((totals.candidate_node_roundtrip_seconds_sum - 0.05).abs() < f64::EPSILON);
+        assert_eq!(totals.candidate_node_roundtrip_seconds_max, 0.03);
+        assert!((totals.candidate_record_seconds_sum - 0.008).abs() < f64::EPSILON);
+        assert_eq!(totals.candidate_record_seconds_max, 0.005);
+        assert!((totals.candidate_total_seconds_sum - 0.064).abs() < f64::EPSILON);
+        assert_eq!(totals.candidate_total_seconds_max, 0.039);
+        assert_eq!(totals.candidate_node_accept_count, 1);
+        assert_eq!(totals.candidate_node_accept_seconds_sum, 0.015);
+        assert_eq!(totals.candidate_relay_enqueue_count, 1);
+        assert_eq!(totals.candidate_relay_enqueue_seconds_sum, 0.016);
     }
 
     #[test]

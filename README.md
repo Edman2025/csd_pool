@@ -693,6 +693,14 @@ When enabled, the bridge posts a structured candidate payload to
 extranonce2, ntime, and nonce. The official-node adapter validates and commits
 the candidate through the chain's native consensus and reorg paths.
 
+The bridge persists behavior-neutral candidate timing data in the block
+submission response. `pool_observability` records candidate detection,
+detected-to-submit-start, and node HTTP round-trip timing. A compatible node
+adapter also returns `node_observability` with consensus acceptance and local
+broadcast-queue admission timing. These fields do not alter candidate ordering
+or node selection, and local queue admission is not proof of remote peer
+receipt.
+
 Before switching miners to live mode, verify the CSD node/template adapter
 contract:
 

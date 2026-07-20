@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="${1:-${CSD_SOURCE_DIR:-}}"
 EXPECTED_COMMIT="d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c"
-EXPECTED_PATCH_SHA256="6f3a42738202b21a04fd5f069552ea742baa122638757f399e70eedf215fced7"
+EXPECTED_PATCH_SHA256="264dae8654edb876c8abab07d3dc5fb01e1d0ef463d4e6ea28a29f6ef960fd44"
 EXPECTED_P2P_PATCH_SHA256="cb56d3625876cff5fc2f8ad4833405631b47f073d89217e9b93647f99a394bb3"
 PATCH_FILE="$SCRIPT_DIR/compute-substrate-pool-adapter.patch"
 P2P_PATCH_FILE="$SCRIPT_DIR/compute-substrate-p2p-backoff.patch"
@@ -60,6 +60,8 @@ search_source '/api/rpc/mining/template' "$SOURCE_DIR/src/api/mod.rs" || \
   fail "mining template endpoint missing after patch"
 search_source '/api/rpc/block/submit' "$SOURCE_DIR/src/api/mod.rs" || \
   fail "block submit endpoint missing after patch"
+search_source 'node_observability' "$SOURCE_DIR/src/api/mod.rs" || \
+  fail "candidate propagation observability missing after patch"
 search_source 'choose_pool_block_time' "$SOURCE_DIR/src/api/mod.rs" || \
   fail "non-blocking pool template time is missing after patch"
 search_source 'ADDR_BACKOFF_RETENTION_SECS' "$SOURCE_DIR/src/net/node.rs" || \

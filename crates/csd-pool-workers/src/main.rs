@@ -1200,16 +1200,20 @@ fn find_static_accepted_submit(
             "known accepted static probe requires extranonce2_size=4, got {extranonce2_size}"
         ));
     }
-    if notify.job_id != "static-1" {
-        return Err(format!(
-            "known accepted static probe requires static-1 job, got {}",
-            notify.job_id
-        ));
-    }
-    let extranonce1_value = u32::from_str_radix(extranonce1_hex, 16)
-        .map_err(|_| format!("invalid extranonce1_hex: {extranonce1_hex}"))?;
-    let extranonce1_le = extranonce1_value.to_le_bytes();
     let job = csd_pool_node::easy_static_job(notify.job_id.clone());
+    if notify != &job.notify {
+        return Err(
+            "known accepted share probe requires the exact static/easy template shape".to_owned(),
+        );
+    }
+    let extranonce1_bytes = hex::decode(extranonce1_hex)
+        .map_err(|_| format!("invalid extranonce1_hex: {extranonce1_hex}"))?;
+    let extranonce1_le: [u8; 4] = extranonce1_bytes.try_into().map_err(|bytes: Vec<u8>| {
+        format!(
+            "known accepted static probe requires 4-byte extranonce1, got {}",
+            bytes.len()
+        )
+    })?;
     let extranonce2_hex = "01020304".to_owned();
     let extranonce2_le = [1, 2, 3, 4];
     let ntime = u32::from_str_radix(&notify.ntime_hex, 16)
@@ -4760,6 +4764,33 @@ mod tests {
     #[test]
     fn candidate_search_reports_exhausted_range() {
         assert!(search_candidate_nonce([0u8; 84], [0u8; 32], 0, 1, 2).is_none());
+    }
+
+    #[test]
+    fn accepted_share_probe_preserves_extranonce1_wire_byte_order() {
+        let job = csd_pool_node::easy_static_job("mock-job-dynamic");
+        let (extranonce2_hex, nonce_hex) =
+            find_static_accepted_submit(&job.notify, "01000000", 4, 8.0).unwrap();
+        let extranonce2_le: [u8; 4] = hex::decode(extranonce2_hex).unwrap().try_into().unwrap();
+        let solution = SubmitSolution {
+            extranonce2_le,
+            ntime: u32::from_str_radix(&job.notify.ntime_hex, 16).unwrap(),
+            nonce: u32::from_str_radix(&nonce_hex, 16).unwrap(),
+        };
+
+        assert!(verify_share_with_difficulty(&job.template, [1, 0, 0, 0], &solution, 8.0).is_ok());
+    }
+
+    #[test]
+    fn accepted_share_probe_rejects_non_easy_template_shape() {
+        let mut notify = csd_pool_node::easy_static_job("mock-job-dynamic").notify;
+        notify.coinb1_hex = "00".to_owned();
+
+        assert!(
+            find_static_accepted_submit(&notify, "01000000", 4, 8.0)
+                .unwrap_err()
+                .contains("exact static/easy template shape")
+        );
     }
 
     #[test]
