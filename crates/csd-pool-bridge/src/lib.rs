@@ -599,6 +599,11 @@ pub fn block_submitter_from_env() -> Result<Option<Arc<dyn BlockSubmitter>>> {
             "parallel candidate submit requires distinct primary and secondary node URLs".into(),
         ));
     }
+    let secondary_candidate_budget = parallel_candidate_submit_budget(
+        std::env::var("CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_BUDGET")
+            .ok()
+            .as_deref(),
+    )?;
     let primary = Arc::new(CsdCandidateNodeEndpoint::new(
         submit_node_name_from_env(),
         CsdNodeClient::from_env(node_url),
@@ -614,7 +619,24 @@ pub fn block_submitter_from_env() -> Result<Option<Arc<dyn BlockSubmitter>>> {
         Duration::from_millis(env_u64("CSD_POOL_SECONDARY_SUBMIT_TIMEOUT_MS", 750)),
         Duration::from_millis(env_u64("CSD_POOL_PARALLEL_NODE_HEALTH_REFRESH_MS", 1_000)),
         Duration::from_millis(env_u64("CSD_POOL_PARALLEL_NODE_HEALTH_MAX_AGE_MS", 3_000)),
+        secondary_candidate_budget,
     ))))
+}
+
+fn parallel_candidate_submit_budget(value: Option<&str>) -> Result<u64> {
+    let raw = value.unwrap_or("1").trim();
+    let budget = raw.parse::<u64>().map_err(|_| {
+        BridgeError::InvalidConfig(
+            "CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_BUDGET must be the integer 1".into(),
+        )
+    })?;
+    if budget != 1 {
+        return Err(BridgeError::InvalidConfig(
+            "CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_BUDGET must be 1 for the production candidate canary"
+                .into(),
+        ));
+    }
+    Ok(budget)
 }
 
 fn require_template_submit_affinity(template_node_url: &str, submit_node_url: &str) -> Result<()> {
@@ -1244,6 +1266,8 @@ struct ParallelNodeBlockSubmitter {
     health_refresh: Duration,
     health_max_age: Duration,
     health_snapshot: Arc<RwLock<Option<ParallelHealthSnapshot>>>,
+    secondary_candidate_budget_configured: u64,
+    secondary_candidate_budget: Arc<AtomicU64>,
 }
 
 impl ParallelNodeBlockSubmitter {
@@ -1254,6 +1278,7 @@ impl ParallelNodeBlockSubmitter {
         secondary_timeout: Duration,
         health_refresh: Duration,
         health_max_age: Duration,
+        secondary_candidate_budget: u64,
     ) -> Self {
         let submitter = Self {
             primary,
@@ -1265,6 +1290,8 @@ impl ParallelNodeBlockSubmitter {
             health_max_age: health_max_age
                 .clamp(Duration::from_millis(250), Duration::from_secs(30)),
             health_snapshot: Arc::new(RwLock::new(None)),
+            secondary_candidate_budget_configured: secondary_candidate_budget,
+            secondary_candidate_budget: Arc::new(AtomicU64::new(secondary_candidate_budget)),
         };
         submitter.start_health_watch();
         submitter
@@ -1302,6 +1329,28 @@ impl ParallelNodeBlockSubmitter {
             .expect("parallel health snapshot lock poisoned")
             .clone()
     }
+
+    fn claim_secondary_candidate_budget(&self) -> SecondaryCandidateBudgetClaim {
+        match self.secondary_candidate_budget.compare_exchange(
+            1,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(previous) => SecondaryCandidateBudgetClaim {
+                configured: self.secondary_candidate_budget_configured,
+                before: previous,
+                claimed: true,
+                remaining: 0,
+            },
+            Err(current) => SecondaryCandidateBudgetClaim {
+                configured: self.secondary_candidate_budget_configured,
+                before: current,
+                claimed: false,
+                remaining: current,
+            },
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1310,9 +1359,13 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
         &self,
         candidate: &BlockCandidateSubmitRequest,
     ) -> Result<SubmitBlockResponse> {
+        let secondary_budget = self.claim_secondary_candidate_budget();
         let health = self.current_health();
-        let eligibility =
-            secondary_submit_eligibility(health.as_ref(), self.health_max_age, candidate);
+        let eligibility = if secondary_budget.claimed {
+            secondary_submit_eligibility(health.as_ref(), self.health_max_age, candidate)
+        } else {
+            Err("candidate_budget_exhausted")
+        };
         let primary_submit = submit_to_node(
             self.primary.as_ref(),
             candidate,
@@ -1373,6 +1426,12 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
                 "status": status,
                 "authority_ok": primary_ok,
                 "secondary_ok": secondary_ok,
+                "secondary_candidate_budget": {
+                    "configured": secondary_budget.configured,
+                    "before": secondary_budget.before,
+                    "claimed": secondary_budget.claimed,
+                    "remaining": secondary_budget.remaining,
+                },
                 "health_age_ms": health.as_ref().map(ParallelHealthSnapshot::age_ms),
                 "primary_health": primary_health_json(&primary_health),
                 "secondary_health": primary_health_json(&secondary_health),
@@ -1392,12 +1451,22 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
             primary_outcome = primary_audit.outcome,
             secondary_outcome = secondary_audit.outcome,
             secondary_skip_reason = secondary_audit.skip_reason.unwrap_or("none"),
+            secondary_budget_claimed = secondary_budget.claimed,
+            secondary_budget_remaining = secondary_budget.remaining,
             primary_elapsed_us = primary_audit.elapsed_us,
             secondary_elapsed_us = secondary_audit.elapsed_us,
             "parallel candidate submission completed"
         );
         Ok(response)
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SecondaryCandidateBudgetClaim {
+    configured: u64,
+    before: u64,
+    claimed: bool,
+    remaining: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2928,6 +2997,7 @@ mod tests {
             timeout_duration,
             Duration::from_secs(10),
             Duration::from_secs(30),
+            1,
         );
         submitter.refresh_health_once().await;
         submitter
@@ -3654,8 +3724,68 @@ mod tests {
             response.extra["parallel_submit"]["secondary_submit"]["outcome"],
             "accepted"
         );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
+            true
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_candidate_budget"]["remaining"],
+            0
+        );
         assert_eq!(primary.submit_calls.load(Ordering::SeqCst), 1);
         assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_submit_one_shot_budget_allows_only_one_concurrent_secondary_call() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::DelayedResponse(Duration::from_millis(25), true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::DelayedResponse(Duration::from_millis(25), true),
+        ));
+        let submitter =
+            parallel_submitter(primary.clone(), secondary.clone(), Duration::from_secs(1)).await;
+        let mut first = mock_candidate();
+        first.job_id = "candidate-1".to_owned();
+        first.hash_hex = "11".repeat(32);
+        let mut second = mock_candidate();
+        second.job_id = "candidate-2".to_owned();
+        second.hash_hex = "22".repeat(32);
+
+        let (first_response, second_response) = tokio::join!(
+            submitter.submit_candidate(&first),
+            submitter.submit_candidate(&second)
+        );
+        let responses = [first_response.unwrap(), second_response.unwrap()];
+
+        assert_eq!(primary.submit_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| {
+                    response.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"]
+                        == true
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| {
+                    response.extra["parallel_submit"]["secondary_submit"]["skip_reason"]
+                        == "candidate_budget_exhausted"
+                })
+                .count(),
+            1
+        );
+        assert!(responses.iter().all(|response| {
+            response.extra["parallel_submit"]["secondary_candidate_budget"]["remaining"] == 0
+        }));
     }
 
     #[tokio::test]
@@ -3769,6 +3899,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_submit_consumes_one_shot_budget_when_health_gate_skips_secondary() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(
+            MockCandidateNodeEndpoint::healthy("node-b", MockSubmitBehavior::Response(true))
+                .with_tip("different-tip"),
+        );
+        let submitter =
+            parallel_submitter(primary, secondary.clone(), Duration::from_secs(1)).await;
+
+        let first = submitter.submit_candidate(&mock_candidate()).await.unwrap();
+        assert_eq!(
+            first.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "chain_state_mismatch"
+        );
+        assert_eq!(
+            first.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
+            true
+        );
+
+        let second = submitter.submit_candidate(&mock_candidate()).await.unwrap();
+        assert_eq!(
+            second.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "candidate_budget_exhausted"
+        );
+        assert_eq!(
+            second.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
+            false
+        );
+        assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn parallel_submit_replays_over_two_real_http_node_clients() {
         let (primary_url, primary_calls) = spawn_replay_node().await;
         let (secondary_url, secondary_calls) = spawn_replay_node().await;
@@ -3785,6 +3950,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(10),
             Duration::from_secs(30),
+            1,
         );
         submitter.refresh_health_once().await;
 
@@ -3798,6 +3964,15 @@ mod tests {
             response.extra["parallel_submit"]["primary_health"]["tip"],
             format!("0x{}", "00".repeat(32))
         );
+    }
+
+    #[test]
+    fn parallel_candidate_submit_budget_is_fixed_to_one() {
+        assert_eq!(parallel_candidate_submit_budget(None).unwrap(), 1);
+        assert_eq!(parallel_candidate_submit_budget(Some("1")).unwrap(), 1);
+        assert!(parallel_candidate_submit_budget(Some("0")).is_err());
+        assert!(parallel_candidate_submit_budget(Some("2")).is_err());
+        assert!(parallel_candidate_submit_budget(Some("invalid")).is_err());
     }
 
     #[test]

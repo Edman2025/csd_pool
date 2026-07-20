@@ -9,6 +9,9 @@ The candidate submitter can fan a solved block out to node-a and node-b when
 
 - node-a remains authoritative for the pool's accepted or rejected result;
 - node-b is best-effort and has a shorter timeout;
+- a process-local atomic one-shot budget permits node-b for at most the first
+  candidate entering the submit path; the budget is consumed even if the
+  health gate skips node-b;
 - a background health watch keeps bounded-age snapshots for both nodes;
 - node-a and node-b submissions start together only when the cached snapshots
   show the same height, tip, and chainwork, and that tip matches the candidate
@@ -31,6 +34,7 @@ first-seen or network propagation acknowledgement.
 
 ```dotenv
 CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED=false
+CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_BUDGET=1
 CSD_POOL_PRIMARY_SUBMIT_NODE_NAME=node-a
 CSD_POOL_SECONDARY_SUBMIT_NODE_NAME=node-b
 CSD_POOL_SECONDARY_SUBMIT_NODE_URL=http://127.0.0.1:8791
@@ -42,7 +46,8 @@ CSD_POOL_PARALLEL_NODE_HEALTH_MAX_AGE_MS=3000
 
 The feature flag defaults to disabled. The primary and secondary URLs must be
 distinct. In live mode, the primary submit URL must still match the template
-node because mining jobs are node-local.
+node because mining jobs are node-local. This canary release rejects any
+parallel-submit budget other than exactly `1`.
 
 ## Result Semantics
 
@@ -62,7 +67,8 @@ node because mining jobs are node-local.
 Before any production enablement:
 
 1. Unit fault injection must cover both accepted, node-a accepted/node-b
-   failed, node-a failed/node-b accepted, both timeout, and chain mismatch.
+   failed, node-a failed/node-b accepted, both timeout, chain mismatch, and
+   two concurrent candidates competing for the one-shot budget.
 2. Workspace tests, strict clippy, release check, formatting, and diff checks
    must pass.
 3. An isolated daemon and independent database must replay candidate submits
@@ -71,7 +77,9 @@ Before any production enablement:
    outcomes and that primary-only behavior is byte-for-byte unchanged while
    the feature flag is disabled.
 5. A later production canary must be limited to a single real candidate and
-   must not share a window with miner expansion.
+   must not share a window with miner expansion. Its audit record must show
+   `secondary_candidate_budget.claimed=true` and `remaining=0`; every later
+   candidate must show `candidate_budget_exhausted` and remain node-a only.
 
 No wallet, signer, payout, miner, PRL, BTX, or DIL behavior is part of this
 change.
@@ -82,19 +90,23 @@ The code-only candidate passed:
 
 - `cargo fmt --all -- --check`;
 - `git diff --check`;
-- `cargo test --workspace`: 188 tests passed;
+- `cargo test --workspace`: 191 tests passed;
 - `cargo clippy --workspace --all-targets -- -D warnings`;
 - `ops/bin/csd-pool-release-check.sh`: pass 1793, fail 0;
 - an in-process two-node HTTP replay using the real `CsdNodeClient`;
 - fault injection for both accepted, authority accepted/secondary failed,
-  authority failed/secondary accepted, both timed out, and chain mismatch.
+  authority failed/secondary accepted, both timed out, and chain mismatch;
+- a concurrent two-candidate regression proving node-a receives both
+  candidates while node-b receives exactly one;
+- a conservative skip regression proving a chain-state mismatch still
+  consumes the budget and the next candidate remains node-a only.
 
 No production feature flag was enabled by these checks.
 
 ## Linux Isolated Canary
 
-The fixed source archive was built offline on Linux with Rust 1.97.1. The
-candidate daemon SHA256 was
+The pre-one-shot source archive was built offline on Linux with Rust 1.97.1.
+Its now-superseded candidate daemon SHA256 was
 `9478f2fc0b44cd20c958d764344a15c0c9adf8a34689dbe7b2def84f2d6ac2fa`.
 
 At `2026-07-21 05:35:38 CST`, an isolated daemon used loopback Stratum/API
@@ -118,8 +130,10 @@ primary/secondary health and submit audit objects. The canary daemon had
 four loopback ports were closed. The production pool daemon, node-a, node-b,
 and signer retained their original PID and `NRestarts=0`.
 
-This is an isolated functional PASS, not production authorization. It does not
-prove a lower orphan rate on the public network.
+This was an isolated functional PASS for the fanout behavior, not production
+authorization. The one-shot revision requires a new Linux artifact and
+isolated replay before it can replace this superseded binary. Neither result
+proves a lower orphan rate on the public network.
 
 ## Residual Miner Liveness Evidence
 
