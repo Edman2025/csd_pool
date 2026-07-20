@@ -36,8 +36,22 @@ async fn run() -> Result<(), DaemonError> {
     let api_listen: SocketAddr = csd_pool_api::api_listen().parse()?;
     let repository = csd_pool_api::repository_from_env().await?;
     let stratum_listen = csd_pool_bridge::stratum_listen();
+    let release_name =
+        std::env::var("CSD_POOL_RELEASE_NAME").unwrap_or_else(|_| "unknown".to_owned());
+    let release_revision =
+        std::env::var("CSD_POOL_RELEASE_REVISION").unwrap_or_else(|_| "unknown".to_owned());
+    let release_timestamp =
+        std::env::var("CSD_POOL_RELEASE_TIMESTAMP_UTC").unwrap_or_else(|_| "unknown".to_owned());
 
-    info!(%api_listen, %stratum_listen, "starting csd pool daemon");
+    info!(
+        %api_listen,
+        %stratum_listen,
+        version = env!("CARGO_PKG_VERSION"),
+        %release_name,
+        %release_revision,
+        %release_timestamp,
+        "starting csd pool daemon"
+    );
 
     tokio::select! {
         result = csd_pool_api::run_api_server_with_repository(api_listen, pool_state.clone(), repository) => {

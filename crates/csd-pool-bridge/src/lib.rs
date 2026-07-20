@@ -10,7 +10,9 @@ use csd_pool_consensus::{
     SubmitSolution, VerifiedShare, WorkTemplate, coinbase_bytes, compose_extranonce,
     difficulty_for_target, parse_le_u32_hex_bytes, parse_u32_hex, verify_share_with_difficulty,
 };
-use csd_pool_db::{JobRecord, MiningRepository, PgRepository, ShareEventRecord, ShareRecord};
+use csd_pool_db::{
+    JobRecord, MiningRepository, PgRepository, SessionRecord, ShareEventRecord, ShareRecord,
+};
 use csd_pool_node::{
     BlockCandidateSubmitRequest, CsdNodeClient, LiveTemplateProvider, PoolJob,
     StaticTemplateProvider, SubmitBlockResponse, TemplateProvider,
@@ -27,6 +29,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -359,6 +362,12 @@ pub fn vardiff_config_from_env() -> Result<VardiffConfig> {
         min_difficulty: env_f64("CSD_POOL_MIN_DIFFICULTY", 8.0),
         max_difficulty: env_f64("CSD_POOL_MAX_DIFFICULTY", 512.0),
         target_share_secs: env_u64("CSD_POOL_TARGET_SHARE_SECS", 20),
+        ewma_alpha: env_f64("CSD_POOL_VARDIFF_EWMA_ALPHA", 0.25),
+        raise_ratio: env_f64("CSD_POOL_VARDIFF_RAISE_RATIO", 0.70),
+        lower_ratio: env_f64("CSD_POOL_VARDIFF_LOWER_RATIO", 1.40),
+        min_adjust_secs: env_u64("CSD_POOL_VARDIFF_MIN_ADJUST_SECS", 120),
+        max_adjust_factor: env_f64("CSD_POOL_VARDIFF_MAX_ADJUST_FACTOR", 2.0),
+        transition_grace_secs: env_u64("CSD_POOL_VARDIFF_TRANSITION_GRACE_SECS", 120),
     }
     .normalized())
 }
@@ -396,6 +405,14 @@ pub async fn mining_repository_from_env() -> Result<Option<Arc<dyn MiningReposit
 
     let repo = PgRepository::connect(&database_url).await?;
     csd_pool_db::run_migrations(repo.pool()).await?;
+    let instance = server_instance();
+    let stale_sessions = repo.close_stale_sessions(&instance).await?;
+    if stale_sessions > 0 {
+        info!(
+            server_instance = instance,
+            stale_sessions, "closed stale stratum sessions from previous process"
+        );
+    }
     Ok(Some(Arc::new(repo)))
 }
 
@@ -510,6 +527,7 @@ async fn handle_client(
 ) -> Result<()> {
     let _connection_guard = pool_state.connection_guard();
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    let session_uuid = Uuid::new_v4().to_string();
     let extranonce1_le = (session_id as u32).to_le_bytes();
     // Stratum carries extranonce1 as the raw four-byte value encoded as hex.
     // The official CSD v0.2.3 miner decodes those bytes and interprets them as
@@ -517,16 +535,19 @@ async fn handle_client(
     // session 1 this is "01000000", not the integer formatting "00000001").
     let extranonce1 = hex::encode(extranonce1_le);
     let mut authorized_worker: Option<String> = None;
+    let mut user_agent: Option<String> = None;
+    let mut session_persisted = false;
     let mut _address_permit: Option<AddressSessionPermit> = None;
     let mut seen_shares = HashSet::new();
     let mut vardiff = VardiffState::new(vardiff_config);
 
-    info!(%peer, session_id, "client connected");
+    info!(%peer, session_id, %session_uuid, "client connected");
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
 
-    loop {
+    let result: Result<()> = async {
+        loop {
         line.clear();
         let n = if authorized_worker.is_some() {
             tokio::select! {
@@ -546,26 +567,29 @@ async fn handle_client(
             reader.read_line(&mut line).await?
         };
         if n == 0 {
-            info!(%peer, session_id, "client disconnected");
+            info!(%peer, session_id, %session_uuid, "client disconnected");
             return Ok(());
         }
 
         let request: Request = match serde_json::from_str(line.trim()) {
             Ok(req) => req,
             Err(err) => {
-                warn!(%peer, session_id, %err, "malformed json frame");
+                warn!(%peer, session_id, %session_uuid, %err, "malformed json frame");
                 if abuse.record_malformed_frame(peer.ip()) {
-                    warn!(%peer, session_id, "closing session after malformed frame ban");
+                    warn!(%peer, session_id, %session_uuid, "closing session after malformed frame ban");
                     return Ok(());
                 }
                 continue;
             }
         };
 
-        debug!(%peer, session_id, method = request.method, "request");
+        debug!(%peer, session_id, %session_uuid, method = request.method, "request");
         let mut pending_difficulty: Option<f64> = None;
         let response = match request.method.as_str() {
-            "mining.subscribe" => subscribe_response(request.id, &extranonce1),
+            "mining.subscribe" => {
+                user_agent = parse_subscribe_user_agent(&request.params);
+                subscribe_response(request.id, &extranonce1)
+            }
             "mining.authorize" => {
                 let worker = parse_authorize_worker(&request.params);
                 match worker {
@@ -576,6 +600,44 @@ async fn handle_client(
                             match abuse.try_open_address_session(&worker) {
                                 Ok(permit) => {
                                     pool_state.record_authorized_worker(&worker);
+                                    if !session_persisted {
+                                        if let Some(repository) = repository.as_deref() {
+                                            let record = SessionRecord {
+                                                id: session_uuid.clone(),
+                                                miner: worker.clone(),
+                                                worker_name: parse_authorize_worker_name(
+                                                    &request.params,
+                                                ),
+                                                remote_addr: peer.ip().to_string(),
+                                                remote_port: peer.port(),
+                                                user_agent: user_agent.clone(),
+                                                extranonce1: extranonce1.clone(),
+                                                server_session_id: session_id,
+                                                server_release: server_release(),
+                                                server_instance: server_instance(),
+                                                assigned_difficulty: vardiff.current_difficulty(),
+                                            };
+                                            match repository.open_session(&record).await {
+                                                Ok(()) => session_persisted = true,
+                                                Err(err) => warn!(
+                                                    %peer,
+                                                    session_id,
+                                                    %session_uuid,
+                                                    %err,
+                                                    "failed to persist stratum session; mining continues"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                    info!(
+                                        %peer,
+                                        session_id,
+                                        %session_uuid,
+                                        worker,
+                                        user_agent = user_agent.as_deref().unwrap_or("unknown"),
+                                        release = server_release(),
+                                        "client authorized"
+                                    );
                                     authorized_worker = Some(worker);
                                     _address_permit = Some(permit);
                                     response_ok(request.id.unwrap_or(0))
@@ -598,6 +660,20 @@ async fn handle_client(
                     }
                 }
             }
+            "mining.suggest_difficulty" => {
+                match parse_suggested_difficulty(&request.params) {
+                    Some(suggested) => {
+                        pending_difficulty =
+                            vardiff.apply_suggested_difficulty(suggested, Instant::now());
+                        response_ok(request.id.unwrap_or(0))
+                    }
+                    None => response_error(
+                        request.id.unwrap_or(0),
+                        20,
+                        "invalid suggested difficulty",
+                    ),
+                }
+            }
             "mining.submit" => {
                 if authorized_worker.is_none() {
                     response_error(request.id.unwrap_or(0), 24, "unauthorized")
@@ -612,6 +688,7 @@ async fn handle_client(
                                 persist_share_event(
                                     repository.as_deref(),
                                     &share_event_from_submit(
+                                        session_persisted.then_some(session_uuid.as_str()),
                                         worker_address,
                                         &submit,
                                         "rejected",
@@ -625,6 +702,7 @@ async fn handle_client(
                                 persist_share_event(
                                     repository.as_deref(),
                                     &share_event_from_submit(
+                                        session_persisted.then_some(session_uuid.as_str()),
                                         worker_address,
                                         &submit,
                                         "stale",
@@ -638,6 +716,7 @@ async fn handle_client(
                                 persist_share_event(
                                     repository.as_deref(),
                                     &share_event_from_submit(
+                                        session_persisted.then_some(session_uuid.as_str()),
                                         worker_address,
                                         &submit,
                                         "rejected",
@@ -648,22 +727,24 @@ async fn handle_client(
                                 response_error(request.id.unwrap_or(0), 22, "duplicate share")
                             } else {
                                 let validation_started = Instant::now();
-                                let validation_result = verify_submit(
+                                let validation_result = verify_submit_for_vardiff(
                                     &current_job.template,
                                     extranonce1_le,
                                     &submit,
-                                    vardiff.current_difficulty(),
+                                    &vardiff,
+                                    validation_started,
                                 );
                                 pool_state.record_share_validation(validation_started.elapsed());
                                 match validation_result {
-                                    Ok(share) => {
+                                    Ok((share, accepted_difficulty)) => {
                                         let persisted = persist_accepted_share(
                                             repository.as_deref(),
                                             &current_job,
                                             worker_address,
                                             &submit,
                                             &share,
-                                            vardiff.current_difficulty(),
+                                            accepted_difficulty,
+                                            session_persisted.then_some(session_uuid.as_str()),
                                         )
                                         .await?;
                                         if persisted {
@@ -677,13 +758,13 @@ async fn handle_client(
                                                     &submit,
                                                     &share,
                                                     extranonce1_le,
-                                                    vardiff.current_difficulty(),
+                                                    accepted_difficulty,
                                                 )
                                                 .await?;
                                             }
                                             pool_state.record_share_accepted(
                                                 worker_address,
-                                                vardiff.current_difficulty(),
+                                                accepted_difficulty,
                                                 share.is_block_candidate,
                                             );
                                             pending_difficulty =
@@ -691,9 +772,11 @@ async fn handle_client(
                                             debug!(
                                                 %peer,
                                                 session_id,
+                                                %session_uuid,
                                                 worker = submit.worker_name,
                                                 job_id = submit.job_id,
                                                 hash = hex::encode(share.hash),
+                                                difficulty = accepted_difficulty,
                                                 candidate = share.is_block_candidate,
                                                 "share accepted"
                                             );
@@ -703,6 +786,8 @@ async fn handle_client(
                                             persist_share_event(
                                                 repository.as_deref(),
                                                 &share_event_from_submit(
+                                                    session_persisted
+                                                        .then_some(session_uuid.as_str()),
                                                     worker_address,
                                                     &submit,
                                                     "rejected",
@@ -724,6 +809,8 @@ async fn handle_client(
                                         persist_share_event(
                                             repository.as_deref(),
                                             &share_event_from_submit(
+                                                session_persisted
+                                                    .then_some(session_uuid.as_str()),
                                                 worker_address,
                                                 &submit,
                                                 "rejected",
@@ -731,7 +818,7 @@ async fn handle_client(
                                             ),
                                         )
                                         .await?;
-                                        debug!(%peer, session_id, %err, "low difficulty share rejected");
+                                        debug!(%peer, session_id, %session_uuid, %err, "low difficulty share rejected");
                                         response_error(
                                             request.id.unwrap_or(0),
                                             23,
@@ -747,6 +834,8 @@ async fn handle_client(
                             persist_share_event(
                                 repository.as_deref(),
                                 &ShareEventRecord {
+                                    session_id: session_persisted
+                                        .then_some(session_uuid.clone()),
                                     miner: worker_address.to_owned(),
                                     worker_name: "default".to_owned(),
                                     job_id: None,
@@ -768,7 +857,7 @@ async fn handle_client(
             .await?;
 
         if abuse.is_banned(peer.ip()) {
-            warn!(%peer, session_id, "closing banned stratum session");
+            warn!(%peer, session_id, %session_uuid, "closing banned stratum session");
             return Ok(());
         }
 
@@ -786,8 +875,48 @@ async fn handle_client(
             write_half
                 .write_all(serialize_line(&set_difficulty(difficulty))?.as_bytes())
                 .await?;
+            if session_persisted {
+                if let Some(repository) = repository.as_deref() {
+                    if let Err(err) = repository
+                        .update_session_difficulty(&session_uuid, difficulty)
+                        .await
+                    {
+                        warn!(
+                            %peer,
+                            session_id,
+                            %session_uuid,
+                            %err,
+                            "failed to persist session difficulty; mining continues"
+                        );
+                    }
+                }
+            }
+            debug!(
+                %peer,
+                session_id,
+                %session_uuid,
+                difficulty,
+                "session difficulty updated"
+            );
+        }
         }
     }
+    .await;
+
+    if session_persisted {
+        if let Some(repository) = repository.as_deref() {
+            if let Err(err) = repository.close_session(&session_uuid).await {
+                warn!(
+                    %peer,
+                    session_id,
+                    %session_uuid,
+                    %err,
+                    "failed to close persisted stratum session"
+                );
+            }
+        }
+    }
+    result
 }
 
 #[async_trait::async_trait]
@@ -978,6 +1107,7 @@ async fn persist_accepted_share(
     submit: &SubmitParams,
     share: &VerifiedShare,
     difficulty: f64,
+    session_id: Option<&str>,
 ) -> Result<bool> {
     let Some(repository) = repository else {
         return Ok(true);
@@ -987,7 +1117,9 @@ async fn persist_accepted_share(
         .upsert_job(&job_record_from_pool_job(job))
         .await?;
     repository
-        .insert_share(&share_record_from_submit(miner, submit, share, difficulty))
+        .insert_share(&share_record_from_submit(
+            session_id, miner, submit, share, difficulty,
+        ))
         .await
         .map_err(BridgeError::from)
 }
@@ -1005,12 +1137,14 @@ async fn persist_share_event(
 }
 
 fn share_event_from_submit(
+    session_id: Option<&str>,
     miner: &str,
     submit: &SubmitParams,
     kind: &str,
     reason: &str,
 ) -> ShareEventRecord {
     ShareEventRecord {
+        session_id: session_id.map(str::to_owned),
         miner: miner.to_owned(),
         worker_name: worker_name_from_submit(miner, &submit.worker_name),
         job_id: Some(submit.job_id.clone()),
@@ -1036,12 +1170,14 @@ fn job_record_from_pool_job(job: &PoolJob) -> JobRecord {
 }
 
 fn share_record_from_submit(
+    session_id: Option<&str>,
     miner: &str,
     submit: &SubmitParams,
     share: &VerifiedShare,
     difficulty: f64,
 ) -> ShareRecord {
     ShareRecord {
+        session_id: session_id.map(str::to_owned),
         miner: miner.to_owned(),
         worker_name: worker_name_from_submit(miner, &submit.worker_name),
         job_id: submit.job_id.clone(),
@@ -1098,6 +1234,48 @@ fn parse_authorize_worker(params: &Value) -> Option<String> {
     Some(address.to_owned())
 }
 
+fn parse_authorize_worker_name(params: &Value) -> String {
+    params
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .and_then(|username| username.split_once('.').map(|(_, worker)| worker))
+        .filter(|worker| valid_worker_name(worker))
+        .unwrap_or("default")
+        .to_owned()
+}
+
+fn parse_subscribe_user_agent(params: &Value) -> Option<String> {
+    params
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(256).collect())
+}
+
+fn server_release() -> String {
+    let name = std::env::var("CSD_POOL_RELEASE_NAME")
+        .unwrap_or_else(|_| env!("CARGO_PKG_NAME").to_owned());
+    let revision =
+        std::env::var("CSD_POOL_RELEASE_REVISION").unwrap_or_else(|_| "unknown".to_owned());
+    format!("{name}@{revision}")
+}
+
+fn server_instance() -> String {
+    std::env::var("CSD_POOL_INSTANCE_ID").unwrap_or_else(|_| "default".to_owned())
+}
+
+fn parse_suggested_difficulty(params: &Value) -> Option<f64> {
+    let value = params.as_array()?.first()?;
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
 fn valid_addr20(addr: &str) -> bool {
     addr.len() == 40 && addr.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -1138,6 +1316,27 @@ fn verify_submit(
     verify_share_with_difficulty(template, extranonce1_le, &solution, difficulty)
 }
 
+fn verify_submit_for_vardiff(
+    template: &WorkTemplate,
+    extranonce1_le: [u8; 4],
+    submit: &SubmitParams,
+    vardiff: &VardiffState,
+    now: Instant,
+) -> std::result::Result<(VerifiedShare, f64), csd_pool_consensus::ConsensusError> {
+    let current_difficulty = vardiff.current_difficulty();
+    match verify_submit(template, extranonce1_le, submit, current_difficulty) {
+        Ok(share) => Ok((share, current_difficulty)),
+        Err(current_error) => {
+            let Some(previous_difficulty) = vardiff.previous_difficulty_in_grace(now) else {
+                return Err(current_error);
+            };
+            verify_submit(template, extranonce1_le, submit, previous_difficulty)
+                .map(|share| (share, previous_difficulty))
+                .map_err(|_| current_error)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ShareKey {
     job_id: String,
@@ -1163,6 +1362,12 @@ pub struct VardiffConfig {
     pub min_difficulty: f64,
     pub max_difficulty: f64,
     pub target_share_secs: u64,
+    pub ewma_alpha: f64,
+    pub raise_ratio: f64,
+    pub lower_ratio: f64,
+    pub min_adjust_secs: u64,
+    pub max_adjust_factor: f64,
+    pub transition_grace_secs: u64,
 }
 
 impl Default for VardiffConfig {
@@ -1178,6 +1383,12 @@ impl From<csd_pool_config::StratumSection> for VardiffConfig {
             min_difficulty: value.min_difficulty,
             max_difficulty: value.max_difficulty,
             target_share_secs: value.target_share_secs,
+            ewma_alpha: value.vardiff_ewma_alpha,
+            raise_ratio: value.vardiff_raise_ratio,
+            lower_ratio: value.vardiff_lower_ratio,
+            min_adjust_secs: value.vardiff_min_adjust_secs,
+            max_adjust_factor: value.vardiff_max_adjust_factor,
+            transition_grace_secs: value.vardiff_transition_grace_secs,
         }
         .normalized()
     }
@@ -1200,6 +1411,27 @@ impl VardiffConfig {
         if self.target_share_secs == 0 {
             self.target_share_secs = 20;
         }
+        if !self.ewma_alpha.is_finite() || !(0.0..=1.0).contains(&self.ewma_alpha) {
+            self.ewma_alpha = 0.25;
+        }
+        if self.ewma_alpha == 0.0 {
+            self.ewma_alpha = 0.25;
+        }
+        if !self.raise_ratio.is_finite() || !(0.0..1.0).contains(&self.raise_ratio) {
+            self.raise_ratio = 0.70;
+        }
+        if !self.lower_ratio.is_finite() || self.lower_ratio <= 1.0 {
+            self.lower_ratio = 1.40;
+        }
+        if self.min_adjust_secs == 0 {
+            self.min_adjust_secs = 120;
+        }
+        if !self.max_adjust_factor.is_finite() || self.max_adjust_factor < 1.0 {
+            self.max_adjust_factor = 2.0;
+        }
+        if self.transition_grace_secs == 0 {
+            self.transition_grace_secs = 120;
+        }
         self
     }
 }
@@ -1208,7 +1440,11 @@ impl VardiffConfig {
 pub struct VardiffState {
     config: VardiffConfig,
     current_difficulty: f64,
+    previous_difficulty: Option<f64>,
+    transition_until: Option<Instant>,
     last_share_at: Option<Instant>,
+    last_adjust_at: Option<Instant>,
+    ewma_share_secs: Option<f64>,
 }
 
 impl VardiffState {
@@ -1217,7 +1453,11 @@ impl VardiffState {
         Self {
             current_difficulty: config.initial_difficulty,
             config,
+            previous_difficulty: None,
+            transition_until: None,
             last_share_at: None,
+            last_adjust_at: None,
+            ewma_share_secs: None,
         }
     }
 
@@ -1225,27 +1465,100 @@ impl VardiffState {
         self.current_difficulty
     }
 
+    pub fn previous_difficulty_in_grace(&self, now: Instant) -> Option<f64> {
+        self.transition_until
+            .filter(|until| now <= *until)
+            .and(self.previous_difficulty)
+            .filter(|previous| *previous < self.current_difficulty)
+    }
+
     pub fn record_accepted_share(&mut self, now: Instant) -> Option<f64> {
-        let last_share_at = self.last_share_at.replace(now)?;
+        let Some(last_share_at) = self.last_share_at.replace(now) else {
+            self.last_adjust_at = Some(now);
+            return None;
+        };
         let elapsed_secs = now
             .checked_duration_since(last_share_at)
             .unwrap_or_default()
-            .as_secs_f64();
+            .as_secs_f64()
+            .clamp(0.05, self.config.target_share_secs as f64 * 4.0);
         let target = self.config.target_share_secs as f64;
-        let next = if elapsed_secs < target / 2.0 {
-            self.current_difficulty * 2.0
-        } else if elapsed_secs > target * 2.0 {
-            self.current_difficulty / 2.0
-        } else {
-            self.current_difficulty
-        }
-        .clamp(self.config.min_difficulty, self.config.max_difficulty);
+        let ewma = self
+            .ewma_share_secs
+            .map(|previous| {
+                self.config.ewma_alpha * elapsed_secs + (1.0 - self.config.ewma_alpha) * previous
+            })
+            .unwrap_or(elapsed_secs);
+        self.ewma_share_secs = Some(ewma);
 
-        if (next - self.current_difficulty).abs() < f64::EPSILON {
+        let last_adjust_at = self.last_adjust_at.get_or_insert(now);
+        if now
+            .checked_duration_since(*last_adjust_at)
+            .unwrap_or_default()
+            < Duration::from_secs(self.config.min_adjust_secs)
+        {
             return None;
         }
+
+        let desired_factor = if ewma < target * self.config.raise_ratio {
+            (target / ewma).clamp(1.0, self.config.max_adjust_factor)
+        } else if ewma > target * self.config.lower_ratio {
+            (target / ewma).clamp(1.0 / self.config.max_adjust_factor, 1.0)
+        } else {
+            return None;
+        };
+        let next = (self.current_difficulty * desired_factor)
+            .clamp(self.config.min_difficulty, self.config.max_difficulty);
+
+        if relative_difference(next, self.current_difficulty) < 0.01 {
+            return None;
+        }
+        self.apply_difficulty(next, now)
+    }
+
+    pub fn apply_suggested_difficulty(
+        &mut self,
+        suggested_difficulty: f64,
+        now: Instant,
+    ) -> Option<f64> {
+        if !suggested_difficulty.is_finite() || suggested_difficulty <= 0.0 {
+            return None;
+        }
+        if self.last_adjust_at.is_some_and(|last_adjust_at| {
+            now.checked_duration_since(last_adjust_at)
+                .unwrap_or_default()
+                < Duration::from_secs(self.config.min_adjust_secs)
+        }) {
+            return None;
+        }
+        let single_step_min = self.current_difficulty / self.config.max_adjust_factor;
+        let single_step_max = self.current_difficulty * self.config.max_adjust_factor;
+        let next = suggested_difficulty
+            .clamp(self.config.min_difficulty, self.config.max_difficulty)
+            .clamp(single_step_min, single_step_max)
+            .clamp(self.config.min_difficulty, self.config.max_difficulty);
+        if relative_difference(next, self.current_difficulty) < 0.01 {
+            return None;
+        }
+        self.ewma_share_secs = None;
+        self.last_adjust_at = Some(now);
+        self.apply_difficulty(next, now)
+    }
+
+    fn apply_difficulty(&mut self, next: f64, now: Instant) -> Option<f64> {
+        self.previous_difficulty = Some(self.current_difficulty);
         self.current_difficulty = next;
+        self.transition_until = Some(now + Duration::from_secs(self.config.transition_grace_secs));
+        self.last_adjust_at = Some(now);
         Some(next)
+    }
+}
+
+fn relative_difference(left: f64, right: f64) -> f64 {
+    if right == 0.0 {
+        left.abs()
+    } else {
+        ((left - right) / right).abs()
     }
 }
 
@@ -1825,6 +2138,7 @@ mod tests {
         };
         let share = verify_submit(&job.template, [1, 0, 0, 0], &submit, 1.0).unwrap();
         let record = share_record_from_submit(
+            None,
             "0123456789abcdef0123456789abcdef01234567",
             &submit,
             &share,
@@ -1919,7 +2233,7 @@ mod tests {
             ntime_hex: "665544cc".to_owned(),
             nonce_hex: "00000001".to_owned(),
         };
-        let event = share_event_from_submit(miner, &submit, "rejected", "low_difficulty");
+        let event = share_event_from_submit(None, miner, &submit, "rejected", "low_difficulty");
         assert_eq!(event.miner, miner);
         assert_eq!(event.worker_name, "rig-a");
         assert_eq!(event.job_id.as_deref(), Some("job-1"));
@@ -2062,71 +2376,196 @@ mod tests {
     }
 
     #[test]
-    fn vardiff_increases_when_shares_arrive_too_fast() {
+    fn vardiff_ewma_and_hysteresis_prevent_jitter() {
         let mut vardiff = VardiffState::new(VardiffConfig {
             initial_difficulty: 8.0,
             min_difficulty: 8.0,
             max_difficulty: 64.0,
             target_share_secs: 20,
+            ..VardiffConfig::default()
         });
         let start = Instant::now();
 
         assert_eq!(vardiff.record_accepted_share(start), None);
-        assert_eq!(
-            vardiff.record_accepted_share(start + Duration::from_secs(5)),
-            Some(16.0)
-        );
-        assert_eq!(
-            vardiff.record_accepted_share(start + Duration::from_secs(9)),
-            Some(32.0)
-        );
+        for seconds in (15..=150).step_by(15) {
+            assert_eq!(
+                vardiff.record_accepted_share(start + Duration::from_secs(seconds)),
+                None
+            );
+        }
+        assert_eq!(vardiff.current_difficulty(), 8.0);
     }
 
     #[test]
-    fn vardiff_decreases_when_shares_arrive_too_slow() {
+    fn vardiff_rate_limits_and_caps_fast_adjustments() {
+        let mut vardiff = VardiffState::new(VardiffConfig {
+            initial_difficulty: 8.0,
+            min_difficulty: 8.0,
+            max_difficulty: 64.0,
+            target_share_secs: 20,
+            ..VardiffConfig::default()
+        });
+        let start = Instant::now();
+
+        assert_eq!(vardiff.record_accepted_share(start), None);
+        for seconds in (5..120).step_by(5) {
+            assert_eq!(
+                vardiff.record_accepted_share(start + Duration::from_secs(seconds)),
+                None
+            );
+        }
+        assert_eq!(
+            vardiff.record_accepted_share(start + Duration::from_secs(120)),
+            Some(16.0)
+        );
+        assert_eq!(
+            vardiff.record_accepted_share(start + Duration::from_secs(125)),
+            None
+        );
+        assert_eq!(vardiff.current_difficulty(), 16.0);
+    }
+
+    #[test]
+    fn vardiff_rate_limits_and_caps_slow_adjustments() {
         let mut vardiff = VardiffState::new(VardiffConfig {
             initial_difficulty: 32.0,
             min_difficulty: 8.0,
             max_difficulty: 64.0,
             target_share_secs: 20,
+            ..VardiffConfig::default()
         });
         let start = Instant::now();
 
         assert_eq!(vardiff.record_accepted_share(start), None);
         assert_eq!(
-            vardiff.record_accepted_share(start + Duration::from_secs(45)),
+            vardiff.record_accepted_share(start + Duration::from_secs(50)),
+            None
+        );
+        assert_eq!(
+            vardiff.record_accepted_share(start + Duration::from_secs(100)),
+            None
+        );
+        assert_eq!(
+            vardiff.record_accepted_share(start + Duration::from_secs(150)),
             Some(16.0)
         );
         assert_eq!(
-            vardiff.record_accepted_share(start + Duration::from_secs(90)),
+            vardiff.record_accepted_share(start + Duration::from_secs(300)),
             Some(8.0)
-        );
-        assert_eq!(
-            vardiff.record_accepted_share(start + Duration::from_secs(135)),
-            None
         );
     }
 
     #[test]
-    fn vardiff_clamps_initial_and_adjusted_values() {
+    fn vardiff_clamps_suggestions_and_grants_old_difficulty_grace() {
         let mut vardiff = VardiffState::new(VardiffConfig {
             initial_difficulty: 1.0,
             min_difficulty: 8.0,
             max_difficulty: 16.0,
             target_share_secs: 20,
+            ..VardiffConfig::default()
         });
         let start = Instant::now();
 
         assert_eq!(vardiff.current_difficulty(), 8.0);
-        vardiff.record_accepted_share(start);
         assert_eq!(
-            vardiff.record_accepted_share(start + Duration::from_secs(1)),
+            vardiff.apply_suggested_difficulty(1_000.0, start),
             Some(16.0)
         );
+        assert_eq!(vardiff.previous_difficulty_in_grace(start), Some(8.0));
+        assert_eq!(vardiff.apply_suggested_difficulty(f64::NAN, start), None);
+        assert_eq!(vardiff.current_difficulty(), 16.0);
         assert_eq!(
-            vardiff.record_accepted_share(start + Duration::from_secs(2)),
+            vardiff.previous_difficulty_in_grace(start + Duration::from_secs(121)),
+            None
+        );
+    }
+
+    #[test]
+    fn vardiff_rate_limits_repeated_suggestions() {
+        let mut vardiff = VardiffState::new(VardiffConfig {
+            initial_difficulty: 8.0,
+            min_difficulty: 8.0,
+            max_difficulty: 64.0,
+            target_share_secs: 20,
+            ..VardiffConfig::default()
+        });
+        let start = Instant::now();
+
+        assert_eq!(vardiff.apply_suggested_difficulty(64.0, start), Some(16.0));
+        assert_eq!(
+            vardiff.apply_suggested_difficulty(64.0, start + Duration::from_secs(1)),
             None
         );
         assert_eq!(vardiff.current_difficulty(), 16.0);
+        assert_eq!(
+            vardiff.apply_suggested_difficulty(64.0, start + Duration::from_secs(120)),
+            Some(32.0)
+        );
+    }
+
+    #[test]
+    fn parses_numeric_and_string_suggested_difficulty() {
+        assert_eq!(
+            parse_suggested_difficulty(&serde_json::json!([16])),
+            Some(16.0)
+        );
+        assert_eq!(
+            parse_suggested_difficulty(&serde_json::json!(["8.5"])),
+            Some(8.5)
+        );
+        assert_eq!(parse_suggested_difficulty(&serde_json::json!([0])), None);
+    }
+
+    #[test]
+    fn vardiff_transition_accepts_old_difficulty_only_during_grace() {
+        let job = csd_pool_node::easy_static_job("grace-job");
+        let extranonce1_le = [1, 0, 0, 0];
+        let mut submit = SubmitParams {
+            worker_name: "0123456789abcdef0123456789abcdef01234567.rig-a".to_owned(),
+            job_id: job.template.job_id.clone(),
+            extranonce2_hex: "01020304".to_owned(),
+            ntime_hex: job.notify.ntime_hex.clone(),
+            nonce_hex: "00000000".to_owned(),
+        };
+        let mut found = false;
+        for nonce in 0..100_000_u32 {
+            submit.nonce_hex = format!("{nonce:08x}");
+            if verify_submit(&job.template, extranonce1_le, &submit, 8.0).is_ok()
+                && verify_submit(&job.template, extranonce1_le, &submit, 16.0).is_err()
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "expected a share between difficulty 8 and 16");
+
+        let start = Instant::now();
+        let mut vardiff = VardiffState::new(VardiffConfig {
+            initial_difficulty: 8.0,
+            min_difficulty: 8.0,
+            max_difficulty: 64.0,
+            target_share_secs: 20,
+            ..VardiffConfig::default()
+        });
+        assert_eq!(vardiff.apply_suggested_difficulty(16.0, start), Some(16.0));
+        let (_, accepted_difficulty) = verify_submit_for_vardiff(
+            &job.template,
+            extranonce1_le,
+            &submit,
+            &vardiff,
+            start + Duration::from_secs(15),
+        )
+        .unwrap();
+        assert_eq!(accepted_difficulty, 8.0);
+        assert!(
+            verify_submit_for_vardiff(
+                &job.template,
+                extranonce1_le,
+                &submit,
+                &vardiff,
+                start + Duration::from_secs(121),
+            )
+            .is_err()
+        );
     }
 }

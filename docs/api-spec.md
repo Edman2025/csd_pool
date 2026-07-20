@@ -49,6 +49,7 @@ For operators, the page can store a bearer token in browser `localStorage`
 under `csd_pool_operator_token` and use it to read:
 
 - `/api/operator/health`
+- `/api/operator/sessions`
 - `/api/operator/alerts?status=active&limit=20`
 
 ## 3. `GET /getting-started`
@@ -476,6 +477,14 @@ Returns the latest stored CSD node and signer health samples:
   ]
 }
 ```
+
+`GET /api/operator/sessions?limit=100`
+
+Returns the daemon release, active-session total, client user-agent/version
+groups, and recent session lifecycle. Accepted, rejected, and stale counts are
+joined through the persisted session UUID. Remote addresses remain
+operator-only; the source port is included so sessions sharing one NAT address
+can still be matched to daemon and TCP evidence.
 
 `GET /api/operator/alerts?status=active`
 

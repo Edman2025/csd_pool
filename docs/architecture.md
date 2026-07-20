@@ -975,7 +975,13 @@ sessions(
   id uuid primary key,
   worker_id bigint not null references workers(id),
   remote_addr inet,
+  remote_port integer,
   user_agent text,
+  server_session_id bigint,
+  server_release text not null,
+  server_instance text not null,
+  assigned_difficulty numeric not null,
+  difficulty_updated_at timestamptz not null,
   started_at timestamptz not null,
   ended_at timestamptz
 )
@@ -1110,9 +1116,11 @@ url_env = "CSD_POOL_SIGNER_URL"
 
 Current implementation note: the bridge supports one `[stratum]` section and
 keeps vardiff state in each TCP session. It sends the initial difficulty on
-authorization, then sends `mining.set_difficulty` after accepted shares when the
-observed interval is faster than half or slower than twice the target share
-interval. The consensus adapter converts assigned difficulty into
+authorization, then uses an EWMA with explicit 0.70/1.40 hysteresis, a
+120-second minimum adjustment interval, and a 2x single-step bound. The previous
+lower difficulty remains valid for 120 seconds after an increase, and
+`mining.suggest_difficulty` is safely clamped. The consensus adapter converts
+assigned difficulty into
 `base_share_target / ceil(difficulty)` and validates the submit hash against
 that effective target before persisting the share. Multi-port difficulty tiers
 and Redis-backed shared vardiff state remain production scaling follow-ups.

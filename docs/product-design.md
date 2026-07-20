@@ -309,11 +309,14 @@ Requirements:
 
 Current implementation uses `[stratum].initial_difficulty`,
 `[stratum].min_difficulty`, `[stratum].max_difficulty`, and
-`[stratum].target_share_secs`. Accepted shares faster than half the target
-double the assigned difficulty; accepted shares slower than twice the target
-halve it. The assigned difficulty is enforced during share validation by
-dividing the base share target by the assigned difficulty. Multi-instance shared
-vardiff state remains a Redis-backed follow-up.
+`[stratum].target_share_secs`, plus configurable EWMA, hysteresis, minimum
+adjustment interval, maximum adjustment factor, and transition grace settings.
+The default initial/minimum difficulty of 8 gives an expected share interval of
+about 11.5 seconds at 3.0 GH/s and 24.7 seconds at 1.39 GH/s, covering the
+mature V100 and T4 fleet without an immediate retarget. The assigned difficulty
+is enforced during share validation by dividing the base share target by the
+assigned difficulty. Multi-instance shared vardiff state remains a Redis-backed
+follow-up.
 
 ## 5. Reward Design
 

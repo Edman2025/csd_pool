@@ -295,22 +295,31 @@ Expose aggregate counts publicly. Keep per-IP detail operator-only.
 Default behavior:
 
 - target share interval: 20 seconds
-- retarget after accepted share intervals
+- EWMA smoothing with alpha 0.25
+- raise difficulty below 70% of the target interval
+- lower difficulty above 140% of the target interval
+- at least 120 seconds between automatic adjustments
+- at most a 2x increase or decrease per adjustment
+- accept the previous lower difficulty for 120 seconds after an increase
 - min difficulty per port
 - max difficulty per port
 - difficulty changes apply on next job or immediate `set_difficulty`
 
-Simple adjustment:
+Adjustment:
 
 ```text
-if observed_interval < target_interval / 2:
-  new_diff = current_diff * 2
-if observed_interval > target_interval * 2:
-  new_diff = current_diff / 2
-new_diff = clamp(new_diff, min_difficulty, max_difficulty)
+ewma = alpha * observed_interval + (1 - alpha) * previous_ewma
+if elapsed_since_adjustment >= 120 seconds:
+  if ewma < target_interval * 0.70:
+    factor = clamp(target_interval / ewma, 1.0, 2.0)
+  if ewma > target_interval * 1.40:
+    factor = clamp(target_interval / ewma, 0.5, 1.0)
+  new_diff = clamp(current_diff * factor, min_difficulty, max_difficulty)
 ```
 
-Clamp to port min/max and damp sudden changes.
+`mining.suggest_difficulty` is accepted as an advisory extension. Suggestions
+are clamped to the configured min/max, the same single-step 2x bound, and the
+same 120-second minimum adjustment interval.
 
 ## 10. Compatibility Tests
 

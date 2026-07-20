@@ -11,7 +11,8 @@ use csd_pool_accounting::{PayoutRecipient, PayoutSelection, select_payouts};
 use csd_pool_db::{
     AlertEvent, ControlRepository, DashboardBlock, DashboardHistorySample, DashboardPayment,
     DashboardPoolStats, DashboardRepository, MonitoringRepository, NodeSampleRecord,
-    PayoutAuditEvent, PayoutBatchRecord, PayoutRepository, PgRepository,
+    PayoutAuditEvent, PayoutBatchRecord, PayoutRepository, PgRepository, RecentSession,
+    SessionVersionSummary,
 };
 use csd_pool_node::CsdNodeClient;
 use csd_pool_state::{SharedPoolState, TotalsSnapshot, WorkerSnapshot};
@@ -45,6 +46,16 @@ pub struct ApiSettings {
     pub stratum_listen: String,
     pub api_listen: String,
     pub signer_listen: String,
+    pub initial_difficulty: f64,
+    pub min_difficulty: f64,
+    pub max_difficulty: f64,
+    pub target_share_secs: u64,
+    pub vardiff_ewma_alpha: f64,
+    pub vardiff_raise_ratio: f64,
+    pub vardiff_lower_ratio: f64,
+    pub vardiff_min_adjust_secs: u64,
+    pub vardiff_max_adjust_factor: f64,
+    pub vardiff_transition_grace_secs: u64,
     pub minimum_payout_base_units: Option<u128>,
     pub manual_payout_approval_base_units: Option<u128>,
     pub max_payout_batch_base_units: Option<u128>,
@@ -63,6 +74,16 @@ impl Default for ApiSettings {
             stratum_listen: "127.0.0.1:3333".to_owned(),
             api_listen: "127.0.0.1:8080".to_owned(),
             signer_listen: "127.0.0.1:8890".to_owned(),
+            initial_difficulty: 8.0,
+            min_difficulty: 8.0,
+            max_difficulty: 512.0,
+            target_share_secs: 20,
+            vardiff_ewma_alpha: 0.25,
+            vardiff_raise_ratio: 0.70,
+            vardiff_lower_ratio: 1.40,
+            vardiff_min_adjust_secs: 120,
+            vardiff_max_adjust_factor: 2.0,
+            vardiff_transition_grace_secs: 120,
             minimum_payout_base_units: Some(100_000_000),
             manual_payout_approval_base_units: Some(25_000_000_000),
             max_payout_batch_base_units: Some(100_000_000_000),
@@ -96,6 +117,16 @@ impl ApiSettings {
             stratum_listen: config.stratum.listen,
             api_listen: config.api.listen,
             signer_listen: config.signer.listen,
+            initial_difficulty: config.stratum.initial_difficulty,
+            min_difficulty: config.stratum.min_difficulty,
+            max_difficulty: config.stratum.max_difficulty,
+            target_share_secs: config.stratum.target_share_secs,
+            vardiff_ewma_alpha: config.stratum.vardiff_ewma_alpha,
+            vardiff_raise_ratio: config.stratum.vardiff_raise_ratio,
+            vardiff_lower_ratio: config.stratum.vardiff_lower_ratio,
+            vardiff_min_adjust_secs: config.stratum.vardiff_min_adjust_secs,
+            vardiff_max_adjust_factor: config.stratum.vardiff_max_adjust_factor,
+            vardiff_transition_grace_secs: config.stratum.vardiff_transition_grace_secs,
             minimum_payout_base_units,
             manual_payout_approval_base_units,
             max_payout_batch_base_units,
@@ -209,6 +240,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/payments", get(payments))
         .route("/api/operator/payouts/status", get(operator_payout_status))
         .route("/api/operator/health", get(operator_health))
+        .route("/api/operator/sessions", get(operator_sessions))
         .route("/api/operator/alerts", get(operator_alerts))
         .route(
             "/api/operator/alerts/{fingerprint}/resolve",
@@ -586,6 +618,28 @@ async fn operator_health(
     let samples = repository.latest_node_samples(100).await?;
     let ok = samples.iter().all(|sample| sample.ok);
     Ok(Json(OperatorHealthResponse { ok, samples }))
+}
+
+async fn operator_sessions(
+    headers: HeaderMap,
+    Query(query): Query<OperatorSessionsQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<OperatorSessionsResponse>, ApiError> {
+    authorize_operator(&headers)?;
+    let repository = state
+        .repository
+        .as_ref()
+        .ok_or(ApiError::RepositoryRequired)?;
+    let versions = repository.session_version_summaries().await?;
+    let sessions = repository
+        .recent_stratum_sessions(query.limit.unwrap_or(100).clamp(1, 500))
+        .await?;
+    Ok(Json(OperatorSessionsResponse {
+        release: release_info(),
+        active_sessions: versions.iter().map(|version| version.active_sessions).sum(),
+        versions,
+        sessions,
+    }))
 }
 
 async fn operator_alerts(
@@ -1063,6 +1117,16 @@ impl AppState {
             stratum_listen: self.settings.stratum_listen.clone(),
             api_listen: self.settings.api_listen.clone(),
             signer_listen: self.settings.signer_listen.clone(),
+            initial_difficulty: self.settings.initial_difficulty,
+            min_difficulty: self.settings.min_difficulty,
+            max_difficulty: self.settings.max_difficulty,
+            target_share_secs: self.settings.target_share_secs,
+            vardiff_ewma_alpha: self.settings.vardiff_ewma_alpha,
+            vardiff_raise_ratio: self.settings.vardiff_raise_ratio,
+            vardiff_lower_ratio: self.settings.vardiff_lower_ratio,
+            vardiff_min_adjust_secs: self.settings.vardiff_min_adjust_secs,
+            vardiff_max_adjust_factor: self.settings.vardiff_max_adjust_factor,
+            vardiff_transition_grace_secs: self.settings.vardiff_transition_grace_secs,
             minimum_payout_base_units: self
                 .settings
                 .minimum_payout_base_units
@@ -2975,6 +3039,11 @@ struct OperatorAlertsQuery {
 }
 
 #[derive(Deserialize)]
+struct OperatorSessionsQuery {
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
 struct OperatorPayoutAuditQuery {
     batch_id: Option<String>,
     limit: Option<i64>,
@@ -2985,6 +3054,14 @@ struct HealthResponse {
     ok: bool,
     service: &'static str,
     release: ReleaseInfo,
+}
+
+#[derive(Serialize)]
+struct OperatorSessionsResponse {
+    release: ReleaseInfo,
+    active_sessions: u64,
+    versions: Vec<SessionVersionSummary>,
+    sessions: Vec<RecentSession>,
 }
 
 #[derive(Clone, Serialize)]
@@ -3024,6 +3101,16 @@ struct RuntimeConfigResponse {
     stratum_listen: String,
     api_listen: String,
     signer_listen: String,
+    initial_difficulty: f64,
+    min_difficulty: f64,
+    max_difficulty: f64,
+    target_share_secs: u64,
+    vardiff_ewma_alpha: f64,
+    vardiff_raise_ratio: f64,
+    vardiff_lower_ratio: f64,
+    vardiff_min_adjust_secs: u64,
+    vardiff_max_adjust_factor: f64,
+    vardiff_transition_grace_secs: u64,
     minimum_payout_base_units: Option<String>,
     manual_payout_approval_base_units: Option<String>,
     max_payout_batch_base_units: Option<String>,

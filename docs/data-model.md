@@ -44,8 +44,14 @@ create table sessions (
   id uuid primary key,
   worker_id bigint not null references workers(id),
   remote_addr inet,
+  remote_port integer,
   user_agent text,
   extranonce1 text not null,
+  server_session_id bigint,
+  server_release text not null default 'unknown',
+  server_instance text not null default 'default',
+  assigned_difficulty numeric not null default 8,
+  difficulty_updated_at timestamptz not null default now(),
   started_at timestamptz not null default now(),
   ended_at timestamptz
 );

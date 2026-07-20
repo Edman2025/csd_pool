@@ -57,6 +57,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "classify_rejected_block_candidates",
         sql: include_str!("../../../migrations/0008_classify_rejected_block_candidates.sql"),
     },
+    Migration {
+        version: 9,
+        name: "stratum_session_observability",
+        sql: include_str!("../../../migrations/0009_stratum_session_observability.sql"),
+    },
 ];
 
 pub fn all_migrations() -> &'static [Migration] {
@@ -169,6 +174,7 @@ pub struct JobRecord {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShareRecord {
+    pub session_id: Option<String>,
     pub miner: String,
     pub worker_name: String,
     pub job_id: String,
@@ -182,11 +188,136 @@ pub struct ShareRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShareEventRecord {
+    pub session_id: Option<String>,
     pub miner: String,
     pub worker_name: String,
     pub job_id: Option<String>,
     pub kind: String,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionRecord {
+    pub id: String,
+    pub miner: String,
+    pub worker_name: String,
+    pub remote_addr: String,
+    pub remote_port: u16,
+    pub user_agent: Option<String>,
+    pub extranonce1: String,
+    pub server_session_id: u64,
+    pub server_release: String,
+    pub server_instance: String,
+    pub assigned_difficulty: f64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SessionVersionSummary {
+    pub user_agent: String,
+    pub server_release: String,
+    pub server_instance: String,
+    pub active_sessions: u64,
+    pub sessions_1h: u64,
+    pub accepted_shares_1h: u64,
+    pub rejected_shares_1h: u64,
+    pub stale_shares_1h: u64,
+    pub latest_share_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RecentSession {
+    pub id: String,
+    pub worker: String,
+    pub remote_addr: Option<String>,
+    pub remote_port: Option<u16>,
+    pub user_agent: Option<String>,
+    pub server_session_id: Option<u64>,
+    pub server_release: String,
+    pub server_instance: String,
+    pub assigned_difficulty: f64,
+    pub difficulty_updated_at: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub accepted_shares: u64,
+    pub rejected_shares: u64,
+    pub stale_shares: u64,
+    pub latest_share_at: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SessionVersionSummaryRow {
+    user_agent: String,
+    server_release: String,
+    server_instance: String,
+    active_sessions: i64,
+    sessions_1h: i64,
+    accepted_shares_1h: i64,
+    rejected_shares_1h: i64,
+    stale_shares_1h: i64,
+    latest_share_at: Option<String>,
+}
+
+impl TryFrom<SessionVersionSummaryRow> for SessionVersionSummary {
+    type Error = RepositoryError;
+
+    fn try_from(row: SessionVersionSummaryRow) -> Result<Self> {
+        Ok(Self {
+            user_agent: row.user_agent,
+            server_release: row.server_release,
+            server_instance: row.server_instance,
+            active_sessions: u64::try_from(row.active_sessions)?,
+            sessions_1h: u64::try_from(row.sessions_1h)?,
+            accepted_shares_1h: u64::try_from(row.accepted_shares_1h)?,
+            rejected_shares_1h: u64::try_from(row.rejected_shares_1h)?,
+            stale_shares_1h: u64::try_from(row.stale_shares_1h)?,
+            latest_share_at: row.latest_share_at,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct RecentSessionRow {
+    id: String,
+    worker: String,
+    remote_addr: Option<String>,
+    remote_port: Option<i32>,
+    user_agent: Option<String>,
+    server_session_id: Option<i64>,
+    server_release: String,
+    server_instance: String,
+    assigned_difficulty: String,
+    difficulty_updated_at: String,
+    started_at: String,
+    ended_at: Option<String>,
+    accepted_shares: i64,
+    rejected_shares: i64,
+    stale_shares: i64,
+    latest_share_at: Option<String>,
+}
+
+impl TryFrom<RecentSessionRow> for RecentSession {
+    type Error = RepositoryError;
+
+    fn try_from(row: RecentSessionRow) -> Result<Self> {
+        Ok(Self {
+            id: row.id,
+            worker: row.worker,
+            remote_addr: row.remote_addr,
+            remote_port: row.remote_port.map(u16::try_from).transpose()?,
+            user_agent: row.user_agent,
+            server_session_id: row.server_session_id.map(u64::try_from).transpose()?,
+            server_release: row.server_release,
+            server_instance: row.server_instance,
+            assigned_difficulty: row.assigned_difficulty.parse().unwrap_or_default(),
+            difficulty_updated_at: row.difficulty_updated_at,
+            started_at: row.started_at,
+            ended_at: row.ended_at,
+            accepted_shares: u64::try_from(row.accepted_shares)?,
+            rejected_shares: u64::try_from(row.rejected_shares)?,
+            stale_shares: u64::try_from(row.stale_shares)?,
+            latest_share_at: row.latest_share_at,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -436,6 +567,10 @@ pub trait AsyncPoolRepository {
 
 #[async_trait]
 pub trait MiningRepository: Send + Sync {
+    async fn open_session(&self, session: &SessionRecord) -> Result<()>;
+    async fn close_session(&self, session_id: &str) -> Result<()>;
+    async fn close_stale_sessions(&self, server_instance: &str) -> Result<u64>;
+    async fn update_session_difficulty(&self, session_id: &str, difficulty: f64) -> Result<()>;
     async fn upsert_job(&self, job: &JobRecord) -> Result<()>;
     async fn insert_share(&self, share: &ShareRecord) -> Result<bool>;
     async fn insert_share_event(&self, event: &ShareEventRecord) -> Result<()>;
@@ -588,6 +723,86 @@ impl PgRepository {
 
     pub fn pool(&self) -> &sqlx::PgPool {
         &self.pool
+    }
+
+    pub async fn session_version_summaries(&self) -> Result<Vec<SessionVersionSummary>> {
+        let rows = sqlx::query_as::<_, SessionVersionSummaryRow>(
+            "with share_1h as (
+               select session_id, count(*)::bigint accepted, max(created_at)::text latest_share_at
+               from shares
+               where session_id is not null and created_at >= now() - interval '1 hour'
+               group by session_id
+             ),
+             event_1h as (
+               select session_id,
+                 count(*) filter(where kind = 'rejected')::bigint rejected,
+                 count(*) filter(where kind = 'stale')::bigint stale
+               from share_events
+               where session_id is not null and created_at >= now() - interval '1 hour'
+               group by session_id
+             )
+             select
+               coalesce(s.user_agent, 'unknown') user_agent,
+               s.server_release,
+               s.server_instance,
+               count(*) filter(where s.ended_at is null)::bigint active_sessions,
+               count(*) filter(where s.started_at >= now() - interval '1 hour')::bigint sessions_1h,
+               coalesce(sum(sh.accepted), 0)::bigint accepted_shares_1h,
+               coalesce(sum(ev.rejected), 0)::bigint rejected_shares_1h,
+               coalesce(sum(ev.stale), 0)::bigint stale_shares_1h,
+               max(sh.latest_share_at) latest_share_at
+             from sessions s
+             left join share_1h sh on sh.session_id = s.id
+             left join event_1h ev on ev.session_id = s.id
+             where s.ended_at is null or s.started_at >= now() - interval '1 hour'
+             group by coalesce(s.user_agent, 'unknown'), s.server_release, s.server_instance
+             order by active_sessions desc, user_agent",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn recent_stratum_sessions(&self, limit: i64) -> Result<Vec<RecentSession>> {
+        let rows = sqlx::query_as::<_, RecentSessionRow>(
+            "select
+               s.id::text id,
+               w.name worker,
+               host(s.remote_addr) remote_addr,
+               s.remote_port,
+               s.user_agent,
+               s.server_session_id,
+               s.server_release,
+               s.server_instance,
+               s.assigned_difficulty::text assigned_difficulty,
+               s.difficulty_updated_at::text difficulty_updated_at,
+               s.started_at::text started_at,
+               s.ended_at::text ended_at,
+               coalesce(sh.accepted, 0)::bigint accepted_shares,
+               coalesce(ev.rejected, 0)::bigint rejected_shares,
+               coalesce(ev.stale, 0)::bigint stale_shares,
+               sh.latest_share_at
+             from sessions s
+             join workers w on w.id = s.worker_id
+             left join lateral (
+               select count(*)::bigint accepted, max(created_at)::text latest_share_at
+               from shares
+               where session_id = s.id
+             ) sh on true
+             left join lateral (
+               select
+                 count(*) filter(where kind = 'rejected')::bigint rejected,
+                 count(*) filter(where kind = 'stale')::bigint stale
+               from share_events
+               where session_id = s.id
+             ) ev on true
+             order by s.started_at desc
+             limit $1",
+        )
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 
     async fn miner_id_in_tx(
@@ -928,6 +1143,71 @@ impl AsyncPoolRepository for PgRepository {
 
 #[async_trait]
 impl MiningRepository for PgRepository {
+    async fn open_session(&self, session: &SessionRecord) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let miner_id = Self::miner_id_in_tx(&mut tx, &session.miner).await?;
+        let worker_id = Self::worker_id_in_tx(&mut tx, miner_id, &session.worker_name).await?;
+        sqlx::query(
+            "insert into sessions(
+               id, worker_id, remote_addr, remote_port, user_agent, extranonce1,
+               server_session_id, server_release, server_instance, assigned_difficulty
+             )
+             values ($1::uuid, $2, $3::inet, $4, $5, $6, $7, $8, $9, $10::numeric)
+             on conflict(id) do nothing",
+        )
+        .bind(&session.id)
+        .bind(worker_id)
+        .bind(&session.remote_addr)
+        .bind(i32::from(session.remote_port))
+        .bind(&session.user_agent)
+        .bind(&session.extranonce1)
+        .bind(i64::try_from(session.server_session_id)?)
+        .bind(&session.server_release)
+        .bind(&session.server_instance)
+        .bind(session.assigned_difficulty.to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn close_session(&self, session_id: &str) -> Result<()> {
+        sqlx::query(
+            "update sessions
+             set ended_at = coalesce(ended_at, now())
+             where id = $1::uuid",
+        )
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn close_stale_sessions(&self, server_instance: &str) -> Result<u64> {
+        Ok(sqlx::query(
+            "update sessions
+             set ended_at = now()
+             where server_instance = $1 and ended_at is null",
+        )
+        .bind(server_instance)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    async fn update_session_difficulty(&self, session_id: &str, difficulty: f64) -> Result<()> {
+        sqlx::query(
+            "update sessions
+             set assigned_difficulty = $2::numeric, difficulty_updated_at = now()
+             where id = $1::uuid",
+        )
+        .bind(session_id)
+        .bind(difficulty.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn upsert_job(&self, job: &JobRecord) -> Result<()> {
         sqlx::query(
             "insert into jobs(
@@ -970,12 +1250,14 @@ impl MiningRepository for PgRepository {
         let worker_id = Self::worker_id_in_tx(&mut tx, miner_id, &share.worker_name).await?;
         let inserted = sqlx::query(
             "insert into shares(
-               worker_id, job_id, difficulty, hash, extranonce2, ntime, nonce, is_block_candidate
+               worker_id, session_id, job_id, difficulty, hash,
+               extranonce2, ntime, nonce, is_block_candidate
              )
-             values ($1, $2, $3::numeric, $4, $5, $6, $7, $8)
+             values ($1, $2::uuid, $3, $4::numeric, $5, $6, $7, $8, $9)
              on conflict(job_id, worker_id, extranonce2, ntime, nonce) do nothing",
         )
         .bind(worker_id)
+        .bind(&share.session_id)
         .bind(&share.job_id)
         .bind(share.difficulty.to_string())
         .bind(share.hash.to_vec())
@@ -996,11 +1278,14 @@ impl MiningRepository for PgRepository {
         let miner_id = Self::miner_id_in_tx(&mut tx, &event.miner).await?;
         let worker_id = Self::worker_id_in_tx(&mut tx, miner_id, &event.worker_name).await?;
         sqlx::query(
-            "insert into share_events(miner_id, worker_id, job_id, kind, reason)
-             values ($1, $2, $3, $4, $5)",
+            "insert into share_events(
+               miner_id, worker_id, session_id, job_id, kind, reason
+             )
+             values ($1, $2, $3::uuid, $4, $5, $6)",
         )
         .bind(miner_id)
         .bind(worker_id)
+        .bind(&event.session_id)
         .bind(&event.job_id)
         .bind(&event.kind)
         .bind(&event.reason)
@@ -2885,6 +3170,7 @@ struct InMemoryData {
     alerts: BTreeMap<String, AlertEvent>,
     settings: BTreeMap<String, String>,
     jobs: BTreeMap<String, JobRecord>,
+    sessions: BTreeMap<String, (SessionRecord, bool)>,
     shares: Vec<ShareRecord>,
     share_events: Vec<ShareEventRecord>,
     block_candidates: BTreeMap<String, BlockCandidateRecord>,
@@ -3597,6 +3883,55 @@ impl PayoutRepository for InMemoryRepository {
 
 #[async_trait]
 impl MiningRepository for InMemoryRepository {
+    async fn open_session(&self, session: &SessionRecord) -> Result<()> {
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned)?;
+        inner
+            .sessions
+            .entry(session.id.clone())
+            .or_insert_with(|| (session.clone(), true));
+        Ok(())
+    }
+
+    async fn close_session(&self, session_id: &str) -> Result<()> {
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned)?;
+        if let Some((_session, active)) = inner.sessions.get_mut(session_id) {
+            *active = false;
+        }
+        Ok(())
+    }
+
+    async fn close_stale_sessions(&self, server_instance: &str) -> Result<u64> {
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned)?;
+        let mut closed = 0_u64;
+        for (session, active) in inner.sessions.values_mut() {
+            if *active && session.server_instance == server_instance {
+                *active = false;
+                closed += 1;
+            }
+        }
+        Ok(closed)
+    }
+
+    async fn update_session_difficulty(&self, session_id: &str, difficulty: f64) -> Result<()> {
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned)?;
+        if let Some((session, _active)) = inner.sessions.get_mut(session_id) {
+            session.assigned_difficulty = difficulty;
+        }
+        Ok(())
+    }
+
     async fn upsert_job(&self, job: &JobRecord) -> Result<()> {
         let mut inner = self
             .inner
@@ -3832,6 +4167,14 @@ impl RewardRepository for InMemoryRepository {
 }
 
 impl InMemoryRepository {
+    pub fn list_sessions(&self) -> Result<Vec<(SessionRecord, bool)>> {
+        let inner = self
+            .inner
+            .read()
+            .map_err(|_| RepositoryError::LockPoisoned)?;
+        Ok(inner.sessions.values().cloned().collect())
+    }
+
     pub fn list_jobs(&self) -> Result<Vec<JobRecord>> {
         let inner = self
             .inner
@@ -3967,6 +4310,172 @@ mod tests {
     }
 
     #[test]
+    fn session_observability_migration_links_share_events_and_versions() {
+        let sql = migration_by_version(9).unwrap().sql.to_lowercase();
+        assert!(sql.contains("server_session_id"));
+        assert!(sql.contains("server_release"));
+        assert!(sql.contains("server_instance"));
+        assert!(sql.contains("remote_port"));
+        assert!(sql.contains("assigned_difficulty"));
+        assert!(sql.contains("difficulty_updated_at"));
+        assert!(sql.contains("share_events"));
+        assert!(sql.contains("session_id uuid references sessions(id)"));
+        assert!(sql.contains("sessions_active_started_idx"));
+        assert!(sql.contains("sessions_instance_active_idx"));
+        assert!(sql.contains("share_events_session_created_idx"));
+        assert!(sql.contains("shares_session_created_idx"));
+    }
+
+    #[tokio::test]
+    async fn in_memory_repository_tracks_session_lifecycle() {
+        let repo = InMemoryRepository::new();
+        let session = SessionRecord {
+            id: "019ebba5-5bf0-72e0-9b3d-bdd6475186cb".to_owned(),
+            miner: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            worker_name: "rig-a".to_owned(),
+            remote_addr: "203.0.113.10".to_owned(),
+            remote_port: 43_210,
+            user_agent: Some("csd-pool-miner/v0.2.3".to_owned()),
+            extranonce1: "01000000".to_owned(),
+            server_session_id: 42,
+            server_release: "csd-pool@revision".to_owned(),
+            server_instance: "test".to_owned(),
+            assigned_difficulty: 8.0,
+        };
+        repo.open_session(&session).await.unwrap();
+        repo.update_session_difficulty(&session.id, 16.0)
+            .await
+            .unwrap();
+        let mut expected = session.clone();
+        expected.assigned_difficulty = 16.0;
+        assert_eq!(
+            repo.list_sessions().unwrap(),
+            vec![(expected.clone(), true)]
+        );
+        repo.close_session(&session.id).await.unwrap();
+        assert_eq!(
+            repo.list_sessions().unwrap(),
+            vec![(expected.clone(), false)]
+        );
+        let mut stale = expected;
+        stale.id = "019ebba5-5bf0-72e0-9b3d-bdd6475186cc".to_owned();
+        repo.open_session(&stale).await.unwrap();
+        assert_eq!(repo.close_stale_sessions("other").await.unwrap(), 0);
+        assert_eq!(repo.close_stale_sessions("test").await.unwrap(), 1);
+        assert!(
+            repo.list_sessions()
+                .unwrap()
+                .iter()
+                .all(|(_session, active)| !active)
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_session_observability_round_trip_when_configured() {
+        let Ok(database_url) = std::env::var("CSD_POOL_TEST_DATABASE_URL") else {
+            return;
+        };
+        let repo = PgRepository::connect(&database_url).await.unwrap();
+        run_migrations(repo.pool()).await.unwrap();
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            & 0xffff_ffff_ffff;
+        let session_id = format!("00000000-0000-4000-8000-{suffix:012x}");
+        let miner = "0123456789abcdef0123456789abcdef01234567";
+        let session = SessionRecord {
+            id: session_id.clone(),
+            miner: miner.to_owned(),
+            worker_name: "integration-rig".to_owned(),
+            remote_addr: "203.0.113.10".to_owned(),
+            remote_port: 43_210,
+            user_agent: Some("csd-pool-miner/integration".to_owned()),
+            extranonce1: "01000000".to_owned(),
+            server_session_id: 42,
+            server_release: "csd-pool@integration".to_owned(),
+            server_instance: "integration".to_owned(),
+            assigned_difficulty: 8.0,
+        };
+        repo.open_session(&session).await.unwrap();
+        repo.update_session_difficulty(&session_id, 16.0)
+            .await
+            .unwrap();
+        let job = JobRecord {
+            job_id: format!("session-integration-{suffix:012x}"),
+            prev_hash_be_hex: "00".repeat(32),
+            version_hex: "20000000".to_owned(),
+            nbits_hex: "1d00ffff".to_owned(),
+            ntime_hex: "665544cc".to_owned(),
+            network_target: [0xff; 32],
+            share_target: [0xff; 32],
+            coinb1_hex: "aa".to_owned(),
+            coinb2_hex: "bb".to_owned(),
+            merkle_branches_hex: vec![],
+            clean_jobs: true,
+        };
+        repo.upsert_job(&job).await.unwrap();
+        assert!(
+            repo.insert_share(&ShareRecord {
+                session_id: Some(session_id.clone()),
+                miner: miner.to_owned(),
+                worker_name: session.worker_name.clone(),
+                job_id: job.job_id.clone(),
+                difficulty: 8.0,
+                hash: [1; 32],
+                extranonce2_hex: "01020304".to_owned(),
+                ntime_hex: "665544cc".to_owned(),
+                nonce_hex: "00000001".to_owned(),
+                is_block_candidate: false,
+            })
+            .await
+            .unwrap()
+        );
+        repo.insert_share_event(&ShareEventRecord {
+            session_id: Some(session_id.clone()),
+            miner: miner.to_owned(),
+            worker_name: session.worker_name.clone(),
+            job_id: Some(job.job_id),
+            kind: "rejected".to_owned(),
+            reason: "low_difficulty".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        let versions = repo.session_version_summaries().await.unwrap();
+        let version = versions
+            .iter()
+            .find(|version| version.user_agent == "csd-pool-miner/integration")
+            .unwrap();
+        assert_eq!(version.active_sessions, 1);
+        assert_eq!(version.server_instance, "integration");
+        assert_eq!(version.accepted_shares_1h, 1);
+        assert_eq!(version.rejected_shares_1h, 1);
+        let recent = repo.recent_stratum_sessions(20).await.unwrap();
+        let observed = recent
+            .iter()
+            .find(|observed| observed.id == session_id)
+            .unwrap();
+        assert_eq!(observed.remote_port, Some(43_210));
+        assert_eq!(observed.server_session_id, Some(42));
+        assert_eq!(observed.server_instance, "integration");
+        assert_eq!(observed.assigned_difficulty, 16.0);
+        assert_eq!(observed.accepted_shares, 1);
+        assert_eq!(observed.rejected_shares, 1);
+
+        repo.close_session(&session_id).await.unwrap();
+        let recent = repo.recent_stratum_sessions(20).await.unwrap();
+        assert!(
+            recent
+                .iter()
+                .find(|observed| observed.id == session_id)
+                .unwrap()
+                .ended_at
+                .is_some()
+        );
+    }
+
+    #[test]
     fn converts_postgres_ledger_rows_to_domain_entries() {
         let entry = LedgerEntry::try_from(LedgerEntryRow {
             miner: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
@@ -4061,6 +4570,7 @@ mod tests {
         assert_eq!(latest_job.age_seconds, 0);
 
         let share = ShareRecord {
+            session_id: None,
             miner: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             worker_name: "rig-a".to_owned(),
             job_id: job.job_id.clone(),
@@ -4077,6 +4587,7 @@ mod tests {
         assert_eq!(repo.list_shares().unwrap(), vec![share.clone()]);
 
         repo.insert_share_event(&ShareEventRecord {
+            session_id: None,
             miner: share.miner.clone(),
             worker_name: share.worker_name.clone(),
             job_id: Some(share.job_id.clone()),

@@ -73,7 +73,16 @@ unchanged throughout the candidate rollout.
 
 ## Production disposition
 
-Node-b remains on the candidate as a longer-running canary. Node-a remains on
-the original binary. Restarting node-a would also interrupt the bound pool
-daemon while the node replays state, so promotion requires a controlled
-maintenance window and the 90-second health/rollback gate.
+Node-a was promoted in the controlled maintenance window at
+`2026-07-20 10:17:14 CST`. Both node-a and node-b now run
+`/data/csd-pool/node/bin/csd-p2p-backoff-v2-f1ff858f`, SHA256
+`f1ff858fa544104f26eb441441c63bcb62477c4e6471abaebe9f3dd796c89930`.
+
+The final read-only check at `10:48 CST` found both nodes at height `57837`
+with identical tip and chainwork, zero warning-level records after settling,
+and `NRestarts=0`. Node-a remains the template and submit backend; node-b
+remains the independent watch/canary node.
+
+Node replay delayed the bound pool daemon during the promotion window. Future
+node maintenance must therefore use the 90-second node health gate and must
+not start the daemon until the template endpoint is ready.

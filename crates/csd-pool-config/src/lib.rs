@@ -130,6 +130,18 @@ pub struct StratumSection {
     pub min_difficulty: f64,
     pub max_difficulty: f64,
     pub target_share_secs: u64,
+    #[serde(default = "default_vardiff_ewma_alpha")]
+    pub vardiff_ewma_alpha: f64,
+    #[serde(default = "default_vardiff_raise_ratio")]
+    pub vardiff_raise_ratio: f64,
+    #[serde(default = "default_vardiff_lower_ratio")]
+    pub vardiff_lower_ratio: f64,
+    #[serde(default = "default_vardiff_min_adjust_secs")]
+    pub vardiff_min_adjust_secs: u64,
+    #[serde(default = "default_vardiff_max_adjust_factor")]
+    pub vardiff_max_adjust_factor: f64,
+    #[serde(default = "default_vardiff_transition_grace_secs")]
+    pub vardiff_transition_grace_secs: u64,
 }
 
 impl Default for StratumSection {
@@ -140,8 +152,38 @@ impl Default for StratumSection {
             min_difficulty: 8.0,
             max_difficulty: 512.0,
             target_share_secs: 20,
+            vardiff_ewma_alpha: default_vardiff_ewma_alpha(),
+            vardiff_raise_ratio: default_vardiff_raise_ratio(),
+            vardiff_lower_ratio: default_vardiff_lower_ratio(),
+            vardiff_min_adjust_secs: default_vardiff_min_adjust_secs(),
+            vardiff_max_adjust_factor: default_vardiff_max_adjust_factor(),
+            vardiff_transition_grace_secs: default_vardiff_transition_grace_secs(),
         }
     }
+}
+
+fn default_vardiff_ewma_alpha() -> f64 {
+    0.25
+}
+
+fn default_vardiff_raise_ratio() -> f64 {
+    0.70
+}
+
+fn default_vardiff_lower_ratio() -> f64 {
+    1.40
+}
+
+fn default_vardiff_min_adjust_secs() -> u64 {
+    120
+}
+
+fn default_vardiff_max_adjust_factor() -> f64 {
+    2.0
+}
+
+fn default_vardiff_transition_grace_secs() -> u64 {
+    120
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
