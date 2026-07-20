@@ -1127,6 +1127,13 @@ against the effective target before persisting the share. Multi-port difficulty
 tiers and Redis-backed shared vardiff state remain production scaling
 follow-ups.
 
+The bridge also emits a configurable same-tip heartbeat job every 120 seconds.
+It refreshes timestamp/template data, assigns a new job ID, and sends
+`clean_jobs=false`. A bounded in-memory registry retains same-tip jobs for late
+submissions; only a changed previous hash clears that registry. PostgreSQL
+records each publication as `tip_change` or `heartbeat`, while Prometheus
+exports reason counters and the age of the latest publication.
+
 Secrets must come from environment files or a secret manager, not committed
 config files.
 The API adds baseline browser security headers on every response:
@@ -1148,6 +1155,9 @@ csd_pool_stratum_connections
 csd_pool_shares_total{result="accepted"}
 csd_pool_shares_total{result="rejected"}
 csd_pool_shares_total{result="stale"}
+csd_pool_job_notify_total{reason="tip_change"}
+csd_pool_job_notify_total{reason="heartbeat"}
+csd_pool_job_notify_age_seconds
 csd_pool_share_validation_seconds_sum
 csd_pool_share_validation_seconds_count
 csd_pool_share_validation_seconds_avg

@@ -94,6 +94,18 @@ impl SharedPoolState {
         state.updated_ts = now_ts();
     }
 
+    pub fn record_job_notify(&self, reason: &str) {
+        let mut state = self.inner.write().expect("pool state lock");
+        state.job_notify_count += 1;
+        match reason {
+            "heartbeat" => state.job_heartbeat_count += 1,
+            "tip_change" => state.job_tip_change_count += 1,
+            _ => {}
+        }
+        state.last_job_notify_ts = Some(now_ts());
+        state.updated_ts = now_ts();
+    }
+
     pub fn snapshot(&self) -> PoolSnapshot {
         self.inner.read().expect("pool state lock").snapshot()
     }
@@ -126,6 +138,10 @@ struct PoolState {
     stratum_connections: u64,
     share_validation_count: u64,
     share_validation_seconds_sum: f64,
+    job_notify_count: u64,
+    job_tip_change_count: u64,
+    job_heartbeat_count: u64,
+    last_job_notify_ts: Option<u64>,
     share_difficulty_sum: f64,
     round_share_difficulty_sum: f64,
     recent_accepted_shares: VecDeque<(u64, f64)>,
@@ -147,6 +163,10 @@ impl PoolState {
                 stratum_connections: self.stratum_connections,
                 share_validation_count: self.share_validation_count,
                 share_validation_seconds_sum: self.share_validation_seconds_sum,
+                job_notify_count: self.job_notify_count,
+                job_tip_change_count: self.job_tip_change_count,
+                job_heartbeat_count: self.job_heartbeat_count,
+                last_job_notify_ts: self.last_job_notify_ts,
                 share_difficulty_sum: self.share_difficulty_sum,
                 round_share_difficulty_sum: self.round_share_difficulty_sum,
                 pool_hashrate_hs: rolling_hashrate(&self.recent_accepted_shares),
@@ -196,6 +216,10 @@ pub struct TotalsSnapshot {
     pub stratum_connections: u64,
     pub share_validation_count: u64,
     pub share_validation_seconds_sum: f64,
+    pub job_notify_count: u64,
+    pub job_tip_change_count: u64,
+    pub job_heartbeat_count: u64,
+    pub last_job_notify_ts: Option<u64>,
     pub share_difficulty_sum: f64,
     pub round_share_difficulty_sum: f64,
     pub pool_hashrate_hs: f64,
@@ -289,6 +313,19 @@ mod tests {
         let totals = state.snapshot().totals;
         assert_eq!(totals.share_validation_count, 2);
         assert!((totals.share_validation_seconds_sum - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn records_job_notify_reasons() {
+        let state = SharedPoolState::new();
+        state.record_job_notify("tip_change");
+        state.record_job_notify("heartbeat");
+
+        let totals = state.snapshot().totals;
+        assert_eq!(totals.job_notify_count, 2);
+        assert_eq!(totals.job_tip_change_count, 1);
+        assert_eq!(totals.job_heartbeat_count, 1);
+        assert!(totals.last_job_notify_ts.is_some());
     }
 
     #[test]

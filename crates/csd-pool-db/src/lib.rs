@@ -62,6 +62,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "stratum_session_observability",
         sql: include_str!("../../../migrations/0009_stratum_session_observability.sql"),
     },
+    Migration {
+        version: 10,
+        name: "job_heartbeat_observability",
+        sql: include_str!("../../../migrations/0010_job_heartbeat_observability.sql"),
+    },
 ];
 
 pub fn all_migrations() -> &'static [Migration] {
@@ -170,6 +175,7 @@ pub struct JobRecord {
     pub coinb2_hex: String,
     pub merkle_branches_hex: Vec<String>,
     pub clean_jobs: bool,
+    pub job_reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1213,9 +1219,9 @@ impl MiningRepository for PgRepository {
             "insert into jobs(
                id, prev_hash, version_hex, nbits_hex, ntime_hex,
                network_target, share_target, coinb1_hex, coinb2_hex,
-               merkle_branches_json, clean_jobs
+               merkle_branches_json, clean_jobs, job_reason
              )
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12)
              on conflict(id) do update set
                prev_hash = excluded.prev_hash,
                version_hex = excluded.version_hex,
@@ -1226,7 +1232,8 @@ impl MiningRepository for PgRepository {
                coinb1_hex = excluded.coinb1_hex,
                coinb2_hex = excluded.coinb2_hex,
                merkle_branches_json = excluded.merkle_branches_json,
-               clean_jobs = excluded.clean_jobs",
+               clean_jobs = excluded.clean_jobs,
+               job_reason = excluded.job_reason",
         )
         .bind(&job.job_id)
         .bind(&job.prev_hash_be_hex)
@@ -1239,6 +1246,7 @@ impl MiningRepository for PgRepository {
         .bind(&job.coinb2_hex)
         .bind(serde_json::to_string(&job.merkle_branches_hex)?)
         .bind(job.clean_jobs)
+        .bind(&job.job_reason)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -4326,6 +4334,15 @@ mod tests {
         assert!(sql.contains("shares_session_created_idx"));
     }
 
+    #[test]
+    fn job_heartbeat_migration_records_reason() {
+        let sql = migration_by_version(10).unwrap().sql.to_lowercase();
+        assert!(sql.contains("job_reason"));
+        assert!(sql.contains("'tip_change'"));
+        assert!(sql.contains("'heartbeat'"));
+        assert!(sql.contains("jobs_reason_created_idx"));
+    }
+
     #[tokio::test]
     async fn in_memory_repository_tracks_session_lifecycle() {
         let repo = InMemoryRepository::new();
@@ -4413,6 +4430,7 @@ mod tests {
             coinb2_hex: "bb".to_owned(),
             merkle_branches_hex: vec![],
             clean_jobs: true,
+            job_reason: "tip_change".to_owned(),
         };
         repo.upsert_job(&job).await.unwrap();
         assert!(
@@ -4561,6 +4579,7 @@ mod tests {
             coinb2_hex: "bb".to_owned(),
             merkle_branches_hex: vec![],
             clean_jobs: true,
+            job_reason: "tip_change".to_owned(),
         };
         repo.upsert_job(&job).await.unwrap();
         repo.upsert_job(&job).await.unwrap();

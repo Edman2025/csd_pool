@@ -1234,6 +1234,30 @@ impl AppState {
         body.push_str(&format!(
             "csd_pool_share_validation_seconds_avg {validation_avg:.9}\n"
         ));
+        body.push_str(
+            "# HELP csd_pool_job_notify_total Mining job publications grouped by reason.\n",
+        );
+        body.push_str("# TYPE csd_pool_job_notify_total counter\n");
+        body.push_str(&format!(
+            "csd_pool_job_notify_total{{reason=\"tip_change\"}} {}\n",
+            snapshot.totals.job_tip_change_count
+        ));
+        body.push_str(&format!(
+            "csd_pool_job_notify_total{{reason=\"heartbeat\"}} {}\n",
+            snapshot.totals.job_heartbeat_count
+        ));
+        body.push_str(
+            "# HELP csd_pool_job_notify_age_seconds Age of the latest job publication by this process.\n",
+        );
+        body.push_str("# TYPE csd_pool_job_notify_age_seconds gauge\n");
+        let notify_age_secs = snapshot
+            .totals
+            .last_job_notify_ts
+            .map(|timestamp| now_ts().saturating_sub(timestamp))
+            .unwrap_or_default();
+        body.push_str(&format!(
+            "csd_pool_job_notify_age_seconds {notify_age_secs}\n"
+        ));
         body.push_str("# HELP csd_pool_blocks_found_total Block candidates found by the pool.\n");
         body.push_str("# TYPE csd_pool_blocks_found_total counter\n");
         body.push_str(&format!("csd_pool_blocks_found_total {total_blocks}\n"));
@@ -3620,6 +3644,8 @@ mod tests {
             8.0,
             false,
         );
+        state.pool_state.record_job_notify("tip_change");
+        state.pool_state.record_job_notify("heartbeat");
         let text = state.prometheus_metrics(
             Some(&DashboardPoolStats {
                 total_blocks: 7,
@@ -3653,6 +3679,9 @@ mod tests {
         assert!(text.contains("csd_pool_payout_amount_base_units_total 123000000"));
         assert!(text.contains("csd_pool_fee_revenue_base_units 25000000"));
         assert!(text.contains("csd_pool_round_share_difficulty 8.000000"));
+        assert!(text.contains("csd_pool_job_notify_total{reason=\"tip_change\"} 1"));
+        assert!(text.contains("csd_pool_job_notify_total{reason=\"heartbeat\"} 1"));
+        assert!(text.contains("csd_pool_job_notify_age_seconds "));
     }
 
     #[test]

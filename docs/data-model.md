@@ -72,6 +72,8 @@ create table jobs (
   coinb2_hex text not null,
   merkle_branches_json jsonb not null,
   clean_jobs boolean not null,
+  job_reason text not null default 'tip_change'
+    check (job_reason in ('tip_change', 'heartbeat')),
   created_at timestamptz not null default now(),
   retired_at timestamptz
 );

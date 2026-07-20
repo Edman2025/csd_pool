@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use csd_pool_consensus::{
@@ -27,7 +27,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -101,7 +101,7 @@ pub async fn run_stratum_server_with_provider_and_abuse(
     abuse: Arc<AbuseManager>,
     vardiff: VardiffConfig,
 ) -> Result<()> {
-    let jobs = SharedJobWatch::start(provider, repository.clone()).await?;
+    let jobs = SharedJobWatch::start(provider, repository.clone(), pool_state.clone()).await?;
     let listener = TcpListener::bind(listen).await?;
     info!(listen, "csd stratum bridge listening");
 
@@ -116,6 +116,7 @@ pub async fn run_stratum_server_with_provider_and_abuse(
         };
         let pool_state = pool_state.clone();
         let job_rx = jobs.subscribe();
+        let retained_jobs = jobs.retained_jobs();
         let repository = repository.clone();
         let block_submitter = block_submitter.clone();
         let abuse = abuse.clone();
@@ -126,6 +127,7 @@ pub async fn run_stratum_server_with_provider_and_abuse(
                 peer,
                 pool_state,
                 job_rx,
+                retained_jobs,
                 repository,
                 block_submitter,
                 abuse,
@@ -142,17 +144,104 @@ pub async fn run_stratum_server_with_provider_and_abuse(
 
 struct SharedJobWatch {
     sender: watch::Sender<Arc<PoolJob>>,
+    retained_jobs: RetainedJobs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JobReason {
+    TipChange,
+    Heartbeat,
+}
+
+impl JobReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TipChange => "tip_change",
+            Self::Heartbeat => "heartbeat",
+        }
+    }
+
+    fn from_job(job: &PoolJob) -> Self {
+        if job.notify.clean_jobs {
+            Self::TipChange
+        } else {
+            Self::Heartbeat
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RetainedJob {
+    job: Arc<PoolJob>,
+    published_at: TokioInstant,
+}
+
+#[derive(Clone, Default)]
+struct RetainedJobs {
+    inner: Arc<RwLock<HashMap<String, RetainedJob>>>,
+}
+
+impl RetainedJobs {
+    fn with_initial(job: Arc<PoolJob>) -> Self {
+        let jobs = Self::default();
+        jobs.inner.write().expect("retained jobs lock").insert(
+            job.template.job_id.clone(),
+            RetainedJob {
+                job,
+                published_at: TokioInstant::now(),
+            },
+        );
+        jobs
+    }
+
+    fn get(&self, job_id: &str) -> Option<Arc<PoolJob>> {
+        self.inner
+            .read()
+            .expect("retained jobs lock")
+            .get(job_id)
+            .map(|entry| entry.job.clone())
+    }
+
+    fn publish(&self, job: Arc<PoolJob>, reason: JobReason, retention: Duration) {
+        let now = TokioInstant::now();
+        let mut jobs = self.inner.write().expect("retained jobs lock");
+        if reason == JobReason::TipChange {
+            jobs.clear();
+        } else {
+            jobs.retain(|_, entry| {
+                entry.job.template.prev == job.template.prev
+                    && now.saturating_duration_since(entry.published_at) <= retention
+            });
+        }
+        jobs.insert(
+            job.template.job_id.clone(),
+            RetainedJob {
+                job,
+                published_at: now,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.read().expect("retained jobs lock").len()
+    }
 }
 
 impl SharedJobWatch {
     async fn start(
         provider: Arc<dyn TemplateProvider>,
         repository: Option<Arc<dyn MiningRepository>>,
+        pool_state: SharedPoolState,
     ) -> Result<Self> {
         let requested_refresh_secs = env_u64("CSD_POOL_TEMPLATE_REFRESH_SECS", 2);
         let template_mode = std::env::var("CSD_POOL_TEMPLATE_MODE").unwrap_or_default();
         let refresh_secs =
             bounded_template_refresh_secs(requested_refresh_secs, template_mode.as_str());
+        let heartbeat_secs = env_u64("CSD_POOL_JOB_HEARTBEAT_SECS", 120);
+        let retention_secs = env_u64("CSD_POOL_JOB_RETENTION_SECS", 900)
+            .max(heartbeat_secs.saturating_mul(2))
+            .max(300);
         if refresh_secs != requested_refresh_secs.max(1) {
             warn!(
                 requested_refresh_secs,
@@ -161,34 +250,72 @@ impl SharedJobWatch {
         }
         info!(
             refresh_secs,
+            heartbeat_secs,
+            retention_secs,
             template_mode = template_mode.as_str(),
             "configured mining template refresh"
         );
-        Self::start_with_refresh(provider, repository, Duration::from_secs(refresh_secs)).await
+        Self::start_with_policy(
+            provider,
+            repository,
+            pool_state,
+            Duration::from_secs(refresh_secs),
+            (heartbeat_secs > 0).then(|| Duration::from_secs(heartbeat_secs)),
+            Duration::from_secs(retention_secs),
+        )
+        .await
     }
 
+    #[cfg(test)]
     async fn start_with_refresh(
         provider: Arc<dyn TemplateProvider>,
         repository: Option<Arc<dyn MiningRepository>>,
         refresh: Duration,
     ) -> Result<Self> {
-        let initial = Arc::new(provider.current_job().await?);
+        Self::start_with_policy(
+            provider,
+            repository,
+            SharedPoolState::new(),
+            refresh,
+            Some(refresh),
+            refresh.saturating_mul(8),
+        )
+        .await
+    }
+
+    async fn start_with_policy(
+        provider: Arc<dyn TemplateProvider>,
+        repository: Option<Arc<dyn MiningRepository>>,
+        pool_state: SharedPoolState,
+        refresh: Duration,
+        heartbeat: Option<Duration>,
+        retention: Duration,
+    ) -> Result<Self> {
+        let mut initial_job = provider.current_job().await?;
+        initial_job.notify.clean_jobs = true;
+        let initial = Arc::new(initial_job);
         if let Some(repository) = repository.as_deref() {
             repository
-                .upsert_job(&job_record_from_pool_job(&initial))
+                .upsert_job(&job_record_from_pool_job(&initial, JobReason::TipChange))
                 .await?;
         }
+        pool_state.record_job_notify(JobReason::TipChange.as_str());
+        let retained_jobs = RetainedJobs::with_initial(initial.clone());
         let (sender, _) = watch::channel(initial);
         let refresh_sender = sender.clone();
+        let refresh_retained_jobs = retained_jobs.clone();
         tokio::spawn(async move {
             let mut ticker = interval(refresh);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             ticker.tick().await;
+            let mut last_publish_at = TokioInstant::now();
             loop {
                 ticker.tick().await;
                 let current = refresh_sender.borrow().clone();
+                let heartbeat_due =
+                    heartbeat.is_some_and(|heartbeat| last_publish_at.elapsed() >= heartbeat);
                 let observed_tip = match provider.current_tip().await {
-                    Ok(Some(tip)) if tip == current.template.prev => continue,
+                    Ok(Some(tip)) if tip == current.template.prev && !heartbeat_due => continue,
                     Ok(tip) => tip,
                     Err(err) => {
                         warn!(%err, "mining tip refresh failed; retaining current job");
@@ -196,8 +323,8 @@ impl SharedJobWatch {
                     }
                 };
                 let refresh_started = Instant::now();
-                let next = match provider.current_job().await {
-                    Ok(job) => Arc::new(job),
+                let mut next = match provider.current_job().await {
+                    Ok(job) => job,
                     Err(err) => {
                         warn!(%err, "mining template refresh failed; retaining current job");
                         continue;
@@ -225,31 +352,52 @@ impl SharedJobWatch {
                         continue;
                     }
                 }
-                if next.template.job_id == refresh_sender.borrow().template.job_id {
+                let reason = if next.template.prev != current.template.prev {
+                    JobReason::TipChange
+                } else {
+                    JobReason::Heartbeat
+                };
+                next.notify.clean_jobs = reason == JobReason::TipChange;
+                if next.template.job_id == current.template.job_id {
                     continue;
                 }
+                let next = Arc::new(next);
                 if let Some(repository) = repository.as_deref() {
                     if let Err(err) = repository
-                        .upsert_job(&job_record_from_pool_job(&next))
+                        .upsert_job(&job_record_from_pool_job(&next, reason))
                         .await
                     {
                         warn!(%err, job_id = next.template.job_id, "refusing unpersisted mining job");
                         continue;
                     }
                 }
+                let job_age_secs = last_publish_at.elapsed().as_secs_f64();
+                refresh_retained_jobs.publish(next.clone(), reason, retention);
+                pool_state.record_job_notify(reason.as_str());
                 info!(
                     job_id = next.template.job_id,
+                    job_reason = reason.as_str(),
+                    job_age_secs,
+                    clean_jobs = next.notify.clean_jobs,
                     refresh_ms = refresh_started.elapsed().as_millis(),
                     "broadcasting refreshed mining job"
                 );
                 refresh_sender.send_replace(next);
+                last_publish_at = TokioInstant::now();
             }
         });
-        Ok(Self { sender })
+        Ok(Self {
+            sender,
+            retained_jobs,
+        })
     }
 
     fn subscribe(&self) -> watch::Receiver<Arc<PoolJob>> {
         self.sender.subscribe()
+    }
+
+    fn retained_jobs(&self) -> RetainedJobs {
+        self.retained_jobs.clone()
     }
 }
 
@@ -519,6 +667,7 @@ async fn handle_client(
     peer: SocketAddr,
     pool_state: SharedPoolState,
     mut job_rx: watch::Receiver<Arc<PoolJob>>,
+    retained_jobs: RetainedJobs,
     repository: Option<Arc<dyn MiningRepository>>,
     block_submitter: Option<Arc<dyn BlockSubmitter>>,
     abuse: Arc<AbuseManager>,
@@ -540,6 +689,8 @@ async fn handle_client(
     let mut _address_permit: Option<AddressSessionPermit> = None;
     let mut seen_shares = HashSet::new();
     let mut vardiff = VardiffState::new(vardiff_config);
+    let mut difficulty_suggestion_seen = false;
+    let mut accepted_share_seen = false;
 
     info!(%peer, session_id, %session_uuid, "client connected");
     let (read_half, mut write_half) = stream.into_split();
@@ -663,8 +814,19 @@ async fn handle_client(
             "mining.suggest_difficulty" => {
                 match parse_suggested_difficulty(&request.params) {
                     Some(suggested) => {
-                        pending_difficulty =
-                            vardiff.apply_suggested_difficulty(suggested, Instant::now());
+                        if !difficulty_suggestion_seen && !accepted_share_seen {
+                            difficulty_suggestion_seen = true;
+                            pending_difficulty =
+                                vardiff.apply_suggested_difficulty(suggested, Instant::now());
+                            debug!(
+                                %peer,
+                                session_id,
+                                %session_uuid,
+                                suggested,
+                                applied = pending_difficulty.unwrap_or(vardiff.current_difficulty()),
+                                "processed initial session difficulty suggestion"
+                            );
+                        }
                         response_ok(request.id.unwrap_or(0))
                     }
                     None => response_error(
@@ -681,7 +843,7 @@ async fn handle_client(
                     let worker_address = authorized_worker.as_deref().unwrap_or_default();
                     match SubmitParams::parse(&request.params) {
                         Ok(submit) => {
-                            let current_job = job_rx.borrow().clone();
+                            let submitted_job = retained_jobs.get(&submit.job_id);
                             if !authorized_submit_worker(worker_address, &submit.worker_name) {
                                 pool_state.record_share_rejected(worker_address);
                                 abuse.record_invalid_share(peer.ip());
@@ -697,7 +859,7 @@ async fn handle_client(
                                 )
                                 .await?;
                                 response_error(request.id.unwrap_or(0), 20, "invalid worker")
-                            } else if submit.job_id != current_job.template.job_id {
+                            } else if submitted_job.is_none() {
                                 pool_state.record_share_stale(worker_address);
                                 persist_share_event(
                                     repository.as_deref(),
@@ -726,9 +888,11 @@ async fn handle_client(
                                 .await?;
                                 response_error(request.id.unwrap_or(0), 22, "duplicate share")
                             } else {
+                                let submitted_job =
+                                    submitted_job.expect("retained job checked above");
                                 let validation_started = Instant::now();
                                 let validation_result = verify_submit_for_vardiff(
-                                    &current_job.template,
+                                    &submitted_job.template,
                                     extranonce1_le,
                                     &submit,
                                     &vardiff,
@@ -739,7 +903,7 @@ async fn handle_client(
                                     Ok((share, accepted_difficulty)) => {
                                         let persisted = persist_accepted_share(
                                             repository.as_deref(),
-                                            &current_job,
+                                            &submitted_job,
                                             worker_address,
                                             &submit,
                                             &share,
@@ -748,11 +912,12 @@ async fn handle_client(
                                         )
                                         .await?;
                                         if persisted {
+                                            accepted_share_seen = true;
                                             if share.is_block_candidate {
                                                 submit_block_candidate(
                                                     block_submitter.as_deref(),
                                                     repository.as_deref(),
-                                                    &current_job,
+                                                    &submitted_job,
                                                     &pool_state,
                                                     worker_address,
                                                     &submit,
@@ -874,6 +1039,11 @@ async fn handle_client(
         } else if let Some(difficulty) = pending_difficulty {
             write_half
                 .write_all(serialize_line(&set_difficulty(difficulty))?.as_bytes())
+                .await?;
+            let mut difficulty_job = (*job_rx.borrow().clone()).clone();
+            difficulty_job.notify.clean_jobs = false;
+            write_half
+                .write_all(serialize_line(&notify(&difficulty_job.notify))?.as_bytes())
                 .await?;
             if session_persisted {
                 if let Some(repository) = repository.as_deref() {
@@ -1114,7 +1284,7 @@ async fn persist_accepted_share(
     };
 
     repository
-        .upsert_job(&job_record_from_pool_job(job))
+        .upsert_job(&job_record_from_pool_job(job, JobReason::from_job(job)))
         .await?;
     repository
         .insert_share(&share_record_from_submit(
@@ -1153,7 +1323,7 @@ fn share_event_from_submit(
     }
 }
 
-fn job_record_from_pool_job(job: &PoolJob) -> JobRecord {
+fn job_record_from_pool_job(job: &PoolJob, reason: JobReason) -> JobRecord {
     JobRecord {
         job_id: job.notify.job_id.clone(),
         prev_hash_be_hex: job.notify.prev_hash_be_hex.clone(),
@@ -1166,6 +1336,7 @@ fn job_record_from_pool_job(job: &PoolJob) -> JobRecord {
         coinb2_hex: job.notify.coinb2_hex.clone(),
         merkle_branches_hex: job.notify.merkle_branches_hex.clone(),
         clean_jobs: job.notify.clean_jobs,
+        job_reason: reason.as_str().to_owned(),
     }
 }
 
@@ -1847,6 +2018,25 @@ mod tests {
         }
     }
 
+    struct SameTipHeartbeatProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TemplateProvider for SameTipHeartbeatProvider {
+        async fn current_job(&self) -> csd_pool_node::Result<PoolJob> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut job = csd_pool_node::easy_static_job(format!("heartbeat-{call}"));
+            job.notify.ntime_hex = format!("{:08x}", 0x6655_4400_u32 + call as u32);
+            job.template.time = 0x6655_4400_u64 + call as u64;
+            Ok(job)
+        }
+
+        async fn current_tip(&self) -> csd_pool_node::Result<Option<[u8; 32]>> {
+            Ok(Some([0; 32]))
+        }
+    }
+
     struct LaggingTemplateProvider {
         calls: AtomicUsize,
     }
@@ -1919,10 +2109,16 @@ mod tests {
             calls: AtomicUsize::new(0),
             tip_changed: AtomicBool::new(false),
         });
-        let jobs =
-            SharedJobWatch::start_with_refresh(provider.clone(), None, Duration::from_millis(10))
-                .await
-                .unwrap();
+        let jobs = SharedJobWatch::start_with_policy(
+            provider.clone(),
+            None,
+            SharedPoolState::new(),
+            Duration::from_millis(10),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(8),
+        )
+        .await
+        .unwrap();
         let mut receiver = jobs.subscribe();
 
         tokio::time::sleep(Duration::from_millis(35)).await;
@@ -1934,7 +2130,273 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(receiver.borrow().template.job_id, "job-refreshed");
+        assert!(receiver.borrow().notify.clean_jobs);
+        assert!(jobs.retained_jobs().get("job-initial").is_none());
+        assert!(jobs.retained_jobs().get("job-refreshed").is_some());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn same_tip_heartbeat_refreshes_without_cleaning_and_retains_old_jobs() {
+        let provider = Arc::new(SameTipHeartbeatProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let state = SharedPoolState::new();
+        let jobs = SharedJobWatch::start_with_policy(
+            provider.clone(),
+            None,
+            state.clone(),
+            Duration::from_secs(2),
+            Some(Duration::from_secs(120)),
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        let mut receiver = jobs.subscribe();
+        let initial_id = receiver.borrow().template.job_id.clone();
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(119)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(receiver.borrow().template.job_id, initial_id);
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let heartbeat_job = receiver.borrow().clone();
+        assert_ne!(heartbeat_job.template.job_id, initial_id);
+        assert_eq!(heartbeat_job.template.prev, [0; 32]);
+        assert!(!heartbeat_job.notify.clean_jobs);
+        assert!(jobs.retained_jobs().get(&initial_id).is_some());
+        assert_eq!(jobs.retained_jobs().len(), 2);
+
+        let totals = state.snapshot().totals;
+        assert_eq!(totals.job_tip_change_count, 1);
+        assert_eq!(totals.job_heartbeat_count, 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_same_tip_gap_keeps_legacy_and_v2_sessions_live_and_accepts_old_job() {
+        type TestReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
+        type TestWriter = tokio::net::tcp::OwnedWriteHalf;
+
+        async fn read_frame(reader: &mut TestReader) -> serde_json::Value {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("frame read");
+            serde_json::from_str(line.trim()).expect("valid json frame")
+        }
+
+        async fn connect_client(
+            listener: &TcpListener,
+            jobs: &SharedJobWatch,
+            pool_state: &SharedPoolState,
+            repository: Arc<csd_pool_db::InMemoryRepository>,
+            user_agent: &str,
+            worker_name: &str,
+        ) -> (
+            TestReader,
+            TestWriter,
+            tokio::task::JoinHandle<Result<()>>,
+            [u8; 4],
+        ) {
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server_stream, peer) = listener.accept().await.unwrap();
+            let abuse = Arc::new(AbuseManager::default());
+            let permit = abuse.try_open(peer.ip()).unwrap();
+            let repository: Arc<dyn MiningRepository> = repository;
+            let session = tokio::spawn(handle_client(
+                server_stream,
+                peer,
+                pool_state.clone(),
+                jobs.subscribe(),
+                jobs.retained_jobs(),
+                Some(repository),
+                None,
+                abuse,
+                VardiffConfig {
+                    initial_difficulty: 1.0,
+                    min_difficulty: 1.0,
+                    max_difficulty: 1.0,
+                    ..VardiffConfig::default()
+                },
+                permit,
+            ));
+
+            let (read_half, mut write_half) = client.into_split();
+            let mut reader = BufReader::new(read_half);
+            write_half
+                .write_all(
+                    format!(
+                        "{{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"{user_agent}\"]}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let subscribe = read_frame(&mut reader).await;
+            let extranonce1_hex = subscribe["result"][1].as_str().unwrap();
+            let extranonce1 = parse_le_u32_hex_bytes("extranonce1", extranonce1_hex).unwrap();
+
+            write_half
+                .write_all(
+                    format!(
+                        "{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"0123456789abcdef0123456789abcdef01234567.{worker_name}\",\"x\"]}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let authorize = read_frame(&mut reader).await;
+            assert_eq!(authorize["result"], true);
+            let difficulty = read_frame(&mut reader).await;
+            assert_eq!(difficulty["method"], "mining.set_difficulty");
+            let notify = read_frame(&mut reader).await;
+            assert_eq!(notify["method"], "mining.notify");
+
+            (reader, write_half, session, extranonce1)
+        }
+
+        async fn read_heartbeat(reader: &mut TestReader, previous_job_id: &str) -> String {
+            let frame = read_frame(reader).await;
+            assert_eq!(frame["method"], "mining.notify");
+            assert_eq!(frame["params"][8], false);
+            let job_id = frame["params"][0].as_str().unwrap().to_owned();
+            assert_ne!(job_id, previous_job_id);
+            job_id
+        }
+
+        async fn submit_old_job(
+            reader: &mut TestReader,
+            writer: &mut TestWriter,
+            request_id: u64,
+            worker_name: &str,
+            job: &PoolJob,
+            extranonce1: [u8; 4],
+        ) {
+            let submit = SubmitParams {
+                worker_name: format!("0123456789abcdef0123456789abcdef01234567.{worker_name}"),
+                job_id: job.template.job_id.clone(),
+                extranonce2_hex: "01020304".to_owned(),
+                ntime_hex: job.notify.ntime_hex.clone(),
+                nonce_hex: "00000000".to_owned(),
+            };
+            verify_submit(&job.template, extranonce1, &submit, 1.0).unwrap();
+            writer
+                .write_all(
+                    format!(
+                        "{{\"id\":{request_id},\"method\":\"mining.submit\",\"params\":[\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]}}\n",
+                        submit.worker_name,
+                        submit.job_id,
+                        submit.extranonce2_hex,
+                        submit.ntime_hex,
+                        submit.nonce_hex
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            loop {
+                let response = read_frame(reader).await;
+                if response["id"].as_u64() == Some(request_id) {
+                    assert_eq!(response["result"], true);
+                    break;
+                }
+            }
+        }
+
+        let provider = Arc::new(SameTipHeartbeatProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let repository = Arc::new(csd_pool_db::InMemoryRepository::new());
+        let pool_state = SharedPoolState::new();
+        let jobs = SharedJobWatch::start_with_policy(
+            provider,
+            Some(repository.clone()),
+            pool_state.clone(),
+            Duration::from_secs(2),
+            Some(Duration::from_secs(120)),
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        let initial_job = jobs.sender.borrow().clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let (mut legacy_reader, mut legacy_writer, legacy_session, legacy_xn1) = connect_client(
+            &listener,
+            &jobs,
+            &pool_state,
+            repository.clone(),
+            "csd-gpu-miner/0.2.3-r72",
+            "legacy-r72",
+        )
+        .await;
+        let (mut v2_reader, mut v2_writer, v2_session, v2_xn1) = connect_client(
+            &listener,
+            &jobs,
+            &pool_state,
+            repository.clone(),
+            "csd-gpu-miner/0.2.3-liveness-v2",
+            "liveness-v2",
+        )
+        .await;
+
+        tokio::task::yield_now().await;
+        let mut legacy_job_id = initial_job.template.job_id.clone();
+        let mut v2_job_id = initial_job.template.job_id.clone();
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(120)).await;
+            tokio::task::yield_now().await;
+            legacy_job_id = read_heartbeat(&mut legacy_reader, &legacy_job_id).await;
+            v2_job_id = read_heartbeat(&mut v2_reader, &v2_job_id).await;
+        }
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            jobs.retained_jobs()
+                .get(&initial_job.template.job_id)
+                .is_some()
+        );
+        submit_old_job(
+            &mut legacy_reader,
+            &mut legacy_writer,
+            91,
+            "legacy-r72",
+            &initial_job,
+            legacy_xn1,
+        )
+        .await;
+        submit_old_job(
+            &mut v2_reader,
+            &mut v2_writer,
+            92,
+            "liveness-v2",
+            &initial_job,
+            v2_xn1,
+        )
+        .await;
+
+        assert_eq!(pool_state.snapshot().totals.stratum_connections, 2);
+        let sessions = repository.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().all(|(_, active)| *active));
+        let shares = repository.list_shares().unwrap();
+        assert_eq!(shares.len(), 2);
+        assert!(
+            shares
+                .iter()
+                .all(|share| share.job_id == initial_job.template.job_id)
+        );
+
+        legacy_session.abort();
+        v2_session.abort();
     }
 
     #[tokio::test]
@@ -1975,6 +2437,7 @@ mod tests {
             peer,
             SharedPoolState::new(),
             jobs.subscribe(),
+            jobs.retained_jobs(),
             None,
             None,
             abuse,
@@ -2008,6 +2471,175 @@ mod tests {
         }
 
         assert_eq!(observed_jobs, ["job-initial", "job-refreshed"]);
+        session.abort();
+    }
+
+    #[tokio::test]
+    async fn first_difficulty_suggestion_sends_non_clean_notify_and_repeats_are_ignored() {
+        let jobs = SharedJobWatch::start_with_policy(
+            Arc::new(StaticTemplateProvider::easy_job("suggest-job")),
+            Some(Arc::new(csd_pool_db::InMemoryRepository::new())),
+            SharedPoolState::new(),
+            Duration::from_secs(60),
+            None,
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_stream, peer) = listener.accept().await.unwrap();
+        let abuse = Arc::new(AbuseManager::default());
+        let permit = abuse.try_open(peer.ip()).unwrap();
+        let session = tokio::spawn(handle_client(
+            server_stream,
+            peer,
+            SharedPoolState::new(),
+            jobs.subscribe(),
+            jobs.retained_jobs(),
+            None,
+            None,
+            abuse,
+            VardiffConfig {
+                initial_difficulty: 8.0,
+                min_difficulty: 8.0,
+                max_difficulty: 64.0,
+                ..VardiffConfig::default()
+            },
+            permit,
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+        write_half
+            .write_all(
+                b"{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"0123456789abcdef0123456789abcdef01234567.suggest-test\",\"x\"]}\n",
+            )
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+        }
+
+        write_half
+            .write_all(b"{\"id\":2,\"method\":\"mining.suggest_difficulty\",\"params\":[16]}\n")
+            .await
+            .unwrap();
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            frames.push(serde_json::from_str::<serde_json::Value>(line.trim()).unwrap());
+        }
+        assert_eq!(frames[0]["result"], true);
+        assert_eq!(frames[1]["method"], "mining.set_difficulty");
+        assert_eq!(frames[1]["params"][0], 16.0);
+        assert_eq!(frames[2]["method"], "mining.notify");
+        assert_eq!(frames[2]["params"][8], false);
+
+        write_half
+            .write_all(b"{\"id\":3,\"method\":\"mining.suggest_difficulty\",\"params\":[32]}\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let repeat: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(repeat["result"], true);
+        let mut unexpected = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut unexpected))
+                .await
+                .is_err(),
+            "a repeated suggestion must not send another difficulty update"
+        );
+        session.abort();
+    }
+
+    #[tokio::test]
+    async fn difficulty_suggestion_after_first_accepted_share_is_acknowledged_but_ignored() {
+        let job = csd_pool_node::easy_static_job("late-suggest-job");
+        let jobs = SharedJobWatch::start_with_policy(
+            Arc::new(StaticTemplateProvider::new(job.clone())),
+            Some(Arc::new(csd_pool_db::InMemoryRepository::new())),
+            SharedPoolState::new(),
+            Duration::from_secs(60),
+            None,
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_stream, peer) = listener.accept().await.unwrap();
+        let abuse = Arc::new(AbuseManager::default());
+        let permit = abuse.try_open(peer.ip()).unwrap();
+        let session = tokio::spawn(handle_client(
+            server_stream,
+            peer,
+            SharedPoolState::new(),
+            jobs.subscribe(),
+            jobs.retained_jobs(),
+            None,
+            None,
+            abuse,
+            VardiffConfig {
+                initial_difficulty: 1.0,
+                min_difficulty: 1.0,
+                max_difficulty: 64.0,
+                ..VardiffConfig::default()
+            },
+            permit,
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+        write_half
+            .write_all(
+                b"{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"0123456789abcdef0123456789abcdef01234567.late-suggest\",\"x\"]}\n",
+            )
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+        }
+
+        write_half
+            .write_all(
+                format!(
+                    "{{\"id\":2,\"method\":\"mining.submit\",\"params\":[\"0123456789abcdef0123456789abcdef01234567.late-suggest\",\"{}\",\"01020304\",\"{}\",\"00000000\"]}}\n",
+                    job.template.job_id, job.notify.ntime_hex
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let accepted: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(accepted["result"], true);
+
+        write_half
+            .write_all(b"{\"id\":3,\"method\":\"mining.suggest_difficulty\",\"params\":[16]}\n")
+            .await
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let suggestion: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(suggestion["result"], true);
+
+        let mut unexpected = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut unexpected))
+                .await
+                .is_err(),
+            "a late suggestion must not send a difficulty update or notify"
+        );
         session.abort();
     }
 
@@ -2133,7 +2765,7 @@ mod tests {
     #[test]
     fn maps_pool_job_to_job_record() {
         let job = csd_pool_node::easy_static_job("static-1");
-        let record = job_record_from_pool_job(&job);
+        let record = job_record_from_pool_job(&job, JobReason::TipChange);
         assert_eq!(record.job_id, "static-1");
         assert_eq!(record.prev_hash_be_hex, "00".repeat(32));
         assert_eq!(record.version_hex, "20000000");

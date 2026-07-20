@@ -322,7 +322,20 @@ are clamped to the configured min/max, the same single-step 2x bound, and the
 same 120-second minimum adjustment interval. The resulting difficulty is
 rounded to the nearest integer before `mining.set_difficulty`, target
 calculation, and accounting so the pool matches the official miner's target
-derivation.
+derivation. A session applies at most its first valid suggestion, and only
+before its first accepted share; late or repeated suggestions are acknowledged
+without changing difficulty. Subsequent changes come from VarDiff. Every
+applied difficulty change is followed by a same-job `mining.notify` with
+`clean_jobs=false`, allowing clients that activate difficulty on the next
+notify to switch without discarding valid work.
+
+When the chain tip is unchanged, the bridge publishes a fresh template and job
+ID every 120 seconds by default. These heartbeat notifications use
+`clean_jobs=false`. Jobs with the same previous hash remain submit-valid for a
+bounded 900-second retention window; a real previous-hash change publishes
+`clean_jobs=true` and immediately invalidates the old-tip set. This keeps
+legacy 300-second job-liveness watchdogs active without preempting a valid GPU
+nonce sweep.
 
 ## 10. Compatibility Tests
 
@@ -342,3 +355,6 @@ Every server implementation must pass:
 - submit verify test
 - stale share test
 - duplicate share test
+- 400-600 second same-tip heartbeat test with one legacy and one current miner
+- old same-tip job submit during the retention window
+- tip-change invalidation of every retained old-tip job
