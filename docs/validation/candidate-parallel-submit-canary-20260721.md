@@ -135,6 +135,47 @@ authorization. The one-shot revision requires a new Linux artifact and
 isolated replay before it can replace this superseded binary. Neither result
 proves a lower orphan rate on the public network.
 
+## Atomic One-Shot Revision
+
+The production gray-release latch was added in source commit
+`0a173bee94c878b9ea98316e20690c5610feab48`, tree
+`eb516d8bf87edc8e83aa3436cff1b545065d4776`. The fixed source archive SHA256 is
+`6f849cc74c41a9987ad1cc70e935c749088bb0b7d189f9324029d70c3d666cd9`.
+It was built locked and offline on Linux with Rust 1.97.1. The resulting
+daemon SHA256 is
+`651376fce0cdf02137cef7bad4fd8e25e62b39ab4b1707db0b19f79f78c5b84d`.
+
+The isolated daemon used loopback Stratum/API ports `3336/18083`, two
+controllable loopback node adapters, and an independent database. Four
+candidate records at `2026-07-21 06:02:01-06:02:11 CST` produced this exact
+budget-claim sequence:
+
+1. `one-shot-first`: claimed `true`, node-b accepted, remaining `0`;
+2. `one-shot-second`: claimed `false`, node-b skipped with
+   `candidate_budget_exhausted`;
+3. `mismatch-consumes-budget`: claimed `true`, node-b skipped with
+   `chain_state_mismatch`, remaining `0`;
+4. `aligned-after-mismatch`: claimed `false`, node-b skipped with
+   `candidate_budget_exhausted`.
+
+Node-b received exactly one submit request in the first process and none in
+the fresh mismatch process. The combined claim sequence was
+`true,false,true,false`. This proves both that concurrent or later candidates
+cannot reuse a consumed budget and that a safety-gate skip does not pass the
+budget to a later candidate.
+
+Two preliminary harness runs stopped safely before PASS: one reused a
+deterministic candidate hash across process restarts, and one changed the
+static probe template outside its accepted fixture shape. The final run
+allocated distinct session extranonces while preserving the exact template,
+then passed all DB, node audit, response, and cleanup assertions. No production
+component changed during any run; all isolated listeners were closed after
+the final capture.
+
+Durable evidence is stored under
+`/data/csd-pool/parallel-canary/0a173be-one-shot/`. Its evidence archive SHA256
+is `49c2d6d74f46142c7c5a2d58bb876792c51d15381d81823c04b7d3d120c865fa`.
+
 ## Residual Miner Liveness Evidence
 
 The production observability gate also isolated a separate miner issue that is
