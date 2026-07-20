@@ -1151,6 +1151,7 @@ CSD_POOL_BLOCK_SUBMISSION_STUCK_MINUTES=10 \
 CSD_POOL_NO_ACCEPTED_SHARE_MINUTES=10 \
 CSD_POOL_MAX_TEMPLATE_AGE_SECS=120 \
 CSD_POOL_WORKER_OFFLINE_MINUTES=15 \
+CSD_POOL_WORKER_OFFLINE_EXCLUDED_PREFIXES=canary-,probe- \
 CSD_POOL_SHARE_QUALITY_WINDOW_MINUTES=10 \
 CSD_POOL_SHARE_QUALITY_MIN_TOTAL=50 \
 CSD_POOL_MAX_REJECT_RATE=0.05 \
@@ -1173,7 +1174,10 @@ state is older than `CSD_POOL_BLOCK_SUBMISSION_STUCK_MINUTES`, pools with no
 accepted shares for `CSD_POOL_NO_ACCEPTED_SHARE_MINUTES`, mining jobs older than
 `CSD_POOL_MAX_TEMPLATE_AGE_SECS` that no longer match any configured node tip,
 and workers whose
-`last_seen_at` is older than `CSD_POOL_WORKER_OFFLINE_MINUTES`. It also uses persisted rejected/stale share
+`last_seen_at` is older than `CSD_POOL_WORKER_OFFLINE_MINUTES`. Comma-separated
+`CSD_POOL_WORKER_OFFLINE_EXCLUDED_PREFIXES` can exclude explicitly named
+private-probe workers from only the `worker_offline` alert; production worker
+names must not use those prefixes. It also uses persisted rejected/stale share
 events to flag workers above `CSD_POOL_MAX_REJECT_RATE` or
 `CSD_POOL_MAX_STALE_RATE` over the configured share quality window. Operator
 APIs expose `/api/operator/health` and `/api/operator/alerts`, and the built-in

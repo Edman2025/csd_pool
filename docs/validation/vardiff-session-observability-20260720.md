@@ -16,6 +16,9 @@ signer behavior, or payout state.
 - Previous lower difficulty grace after an increase: 120 seconds.
 - `mining.suggest_difficulty` is advisory and receives the same min/max,
   single-step, and 120-second rate-limit clamps.
+- Assigned difficulty is rounded to the nearest integer before it is sent,
+  persisted, or used for share validation. This matches the official miner's
+  target derivation and prevents fractional target disagreement.
 - Accepted shares are persisted at the difficulty they actually satisfied.
 
 Difficulty 8 corresponds to an expected interval of about 11.5 seconds at

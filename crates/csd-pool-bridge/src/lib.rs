@@ -1402,11 +1402,14 @@ impl VardiffConfig {
         if !self.max_difficulty.is_finite() || self.max_difficulty < self.min_difficulty {
             self.max_difficulty = self.min_difficulty;
         }
+        self.min_difficulty = self.min_difficulty.ceil();
+        self.max_difficulty = self.max_difficulty.floor().max(self.min_difficulty);
         if !self.initial_difficulty.is_finite() || self.initial_difficulty <= 0.0 {
             self.initial_difficulty = self.min_difficulty;
         }
         self.initial_difficulty = self
             .initial_difficulty
+            .round()
             .clamp(self.min_difficulty, self.max_difficulty);
         if self.target_share_secs == 0 {
             self.target_share_secs = 20;
@@ -1433,6 +1436,12 @@ impl VardiffConfig {
             self.transition_grace_secs = 120;
         }
         self
+    }
+
+    fn quantize_difficulty(&self, difficulty: f64) -> f64 {
+        difficulty
+            .round()
+            .clamp(self.min_difficulty, self.max_difficulty)
     }
 }
 
@@ -1509,6 +1518,7 @@ impl VardiffState {
         };
         let next = (self.current_difficulty * desired_factor)
             .clamp(self.config.min_difficulty, self.config.max_difficulty);
+        let next = self.config.quantize_difficulty(next);
 
         if relative_difference(next, self.current_difficulty) < 0.01 {
             return None;
@@ -1537,6 +1547,7 @@ impl VardiffState {
             .clamp(self.config.min_difficulty, self.config.max_difficulty)
             .clamp(single_step_min, single_step_max)
             .clamp(self.config.min_difficulty, self.config.max_difficulty);
+        let next = self.config.quantize_difficulty(next);
         if relative_difference(next, self.current_difficulty) < 0.01 {
             return None;
         }
@@ -1546,6 +1557,10 @@ impl VardiffState {
     }
 
     fn apply_difficulty(&mut self, next: f64, now: Instant) -> Option<f64> {
+        let next = self.config.quantize_difficulty(next);
+        if relative_difference(next, self.current_difficulty) < 0.01 {
+            return None;
+        }
         self.previous_difficulty = Some(self.current_difficulty);
         self.current_difficulty = next;
         self.transition_until = Some(now + Duration::from_secs(self.config.transition_grace_secs));
@@ -2478,6 +2493,26 @@ mod tests {
             vardiff.previous_difficulty_in_grace(start + Duration::from_secs(121)),
             None
         );
+    }
+
+    #[test]
+    fn vardiff_quantizes_fractional_difficulty_for_miner_compatibility() {
+        let mut vardiff = VardiffState::new(VardiffConfig {
+            initial_difficulty: 8.4,
+            min_difficulty: 8.0,
+            max_difficulty: 64.0,
+            target_share_secs: 20,
+            ..VardiffConfig::default()
+        });
+        let start = Instant::now();
+
+        assert_eq!(vardiff.current_difficulty(), 8.0);
+        assert_eq!(
+            vardiff.apply_suggested_difficulty(9.444_256_455_205_316, start),
+            Some(9.0)
+        );
+        assert_eq!(vardiff.current_difficulty(), 9.0);
+        assert_eq!(vardiff.previous_difficulty_in_grace(start), Some(8.0));
     }
 
     #[test]

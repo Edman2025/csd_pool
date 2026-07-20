@@ -190,7 +190,7 @@ pub fn target_for_difficulty(base_target: &Hash32, difficulty: f64) -> Hash32 {
     let divisor = if difficulty >= u64::MAX as f64 {
         u64::MAX
     } else {
-        difficulty.ceil() as u64
+        difficulty.round() as u64
     };
     div_target_by_u64(base_target, divisor.max(1))
 }
@@ -337,13 +337,43 @@ mod tests {
     }
 
     #[test]
-    fn target_for_difficulty_ceilings_fractional_values() {
+    fn target_for_difficulty_matches_miner_integer_rounding() {
         let base = [0xff; 32];
         assert_eq!(
             target_for_difficulty(&base, 1.1),
+            target_for_difficulty(&base, 1.0)
+        );
+        assert_eq!(
+            target_for_difficulty(&base, 1.5),
             target_for_difficulty(&base, 2.0)
         );
+        assert_eq!(
+            target_for_difficulty(&base, 9.444_256_455_205_316),
+            target_for_difficulty(&base, 9.0)
+        );
         assert_eq!(target_for_difficulty(&base, 0.0), base);
+    }
+
+    #[test]
+    fn accepts_real_canary_share_at_the_miner_rounded_target() {
+        let base = decode_hash32_hex(
+            "base",
+            "00000000ffff0000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let share = decode_hash32_hex(
+            "share",
+            "0000000019de7373bea28d1c6c05ac88b8f11eb16624ec5b3de4ef74eb93f72f",
+        )
+        .unwrap();
+
+        let target = target_for_difficulty(&base, 9.444_256_455_205_316);
+        assert!(hash_leq_target(&share, &target));
+        assert_eq!(target, target_for_difficulty(&base, 9.0));
+        assert!(!hash_leq_target(
+            &share,
+            &target_for_difficulty(&base, 10.0)
+        ));
     }
 
     #[test]

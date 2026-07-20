@@ -2717,8 +2717,12 @@ async fn check_alerts() -> Result<CheckAlertsRun> {
 
     let offline_minutes = worker_offline_minutes();
     let offline_workers = repo.list_offline_workers(offline_minutes, 1_000).await?;
+    let excluded_worker_prefixes = worker_offline_excluded_prefixes();
     let mut active_worker_fingerprints = HashSet::new();
     for worker in offline_workers {
+        if worker_offline_alert_excluded(&worker.worker_name, &excluded_worker_prefixes) {
+            continue;
+        }
         let fingerprint = worker_offline_fingerprint(&worker.miner, &worker.worker_name);
         active_worker_fingerprints.insert(fingerprint.clone());
         let alert = AlertEvent {
@@ -3280,6 +3284,22 @@ fn worker_offline_minutes() -> i64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(15)
+}
+
+fn worker_offline_excluded_prefixes() -> Vec<String> {
+    std::env::var("CSD_POOL_WORKER_OFFLINE_EXCLUDED_PREFIXES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn worker_offline_alert_excluded(worker_name: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| worker_name.starts_with(prefix))
 }
 
 fn worker_offline_fingerprint(miner: &str, worker_name: &str) -> String {
@@ -5020,6 +5040,18 @@ mod tests {
             worker_offline_fingerprint("0123456789abcdef0123456789abcdef01234567", "rig-a"),
             "worker_offline:0123456789abcdef0123456789abcdef01234567:rig-a"
         );
+    }
+
+    #[test]
+    fn worker_offline_exclusion_only_matches_configured_canary_prefixes() {
+        let prefixes = vec!["canary-".to_owned(), "probe-".to_owned()];
+        assert!(worker_offline_alert_excluded("canary-probe", &prefixes));
+        assert!(worker_offline_alert_excluded("probe-v100", &prefixes));
+        assert!(!worker_offline_alert_excluded(
+            "V100-JN-20260719-01-CSD",
+            &prefixes
+        ));
+        assert!(!worker_offline_alert_excluded("canary", &prefixes));
     }
 
     #[test]

@@ -1119,11 +1119,13 @@ keeps vardiff state in each TCP session. It sends the initial difficulty on
 authorization, then uses an EWMA with explicit 0.70/1.40 hysteresis, a
 120-second minimum adjustment interval, and a 2x single-step bound. The previous
 lower difficulty remains valid for 120 seconds after an increase, and
-`mining.suggest_difficulty` is safely clamped. The consensus adapter converts
-assigned difficulty into
-`base_share_target / ceil(difficulty)` and validates the submit hash against
-that effective target before persisting the share. Multi-port difficulty tiers
-and Redis-backed shared vardiff state remain production scaling follow-ups.
+`mining.suggest_difficulty` is safely clamped. The resulting value is rounded
+to the nearest integer, matching the official miner before target generation
+and persisted share accounting. The consensus adapter converts that assigned
+difficulty into `base_share_target / difficulty` and validates the submit hash
+against the effective target before persisting the share. Multi-port difficulty
+tiers and Redis-backed shared vardiff state remain production scaling
+follow-ups.
 
 Secrets must come from environment files or a secret manager, not committed
 config files.
@@ -1218,6 +1220,9 @@ active when the chain itself has not advanced while still detecting a daemon
 that failed to refresh after a new tip. No-share alerts are based on latest
 `shares.created_at` and `CSD_POOL_NO_ACCEPTED_SHARE_MINUTES`. Worker offline
 alerts are based on `workers.last_seen_at` and `CSD_POOL_WORKER_OFFLINE_MINUTES`.
+Private probe workers can be excluded from this alert alone with the
+comma-separated `CSD_POOL_WORKER_OFFLINE_EXCLUDED_PREFIXES`; configured
+prefixes must be reserved and must not match production workers.
 Share quality alerts use accepted shares plus persisted `share_events` for
 rejected/stale submissions over
 `CSD_POOL_SHARE_QUALITY_WINDOW_MINUTES`. The operator API exposes latest health

@@ -319,7 +319,10 @@ if elapsed_since_adjustment >= 120 seconds:
 
 `mining.suggest_difficulty` is accepted as an advisory extension. Suggestions
 are clamped to the configured min/max, the same single-step 2x bound, and the
-same 120-second minimum adjustment interval.
+same 120-second minimum adjustment interval. The resulting difficulty is
+rounded to the nearest integer before `mining.set_difficulty`, target
+calculation, and accounting so the pool matches the official miner's target
+derivation.
 
 ## 10. Compatibility Tests
 

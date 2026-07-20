@@ -571,7 +571,10 @@ Current implementation status: `template_age`, `block_submission`,
 `CSD_POOL_BLOCK_SUBMISSION_STUCK_MINUTES`; `template_age` uses latest `jobs.created_at` and
 `CSD_POOL_MAX_TEMPLATE_AGE_SECS`; `no_accepted_shares` uses latest
 `shares.created_at` and `CSD_POOL_NO_ACCEPTED_SHARE_MINUTES`; `worker_offline`
-uses `workers.last_seen_at` and `CSD_POOL_WORKER_OFFLINE_MINUTES`. Share quality
+uses `workers.last_seen_at` and `CSD_POOL_WORKER_OFFLINE_MINUTES`. Explicit
+private-probe prefixes may be excluded from this alert with
+`CSD_POOL_WORKER_OFFLINE_EXCLUDED_PREFIXES`; other alert types and production
+workers remain monitored. Share quality
 alerts use accepted shares plus persisted rejected/stale `share_events` over
 `CSD_POOL_SHARE_QUALITY_WINDOW_MINUTES`. Operators can review and resolve active
 alerts from the built-in dashboard or through the operator API. Miner-facing
