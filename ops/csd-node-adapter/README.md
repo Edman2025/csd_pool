@@ -6,6 +6,19 @@ The patch is pinned to commit
 `d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c` and was compiled against that exact
 source revision.
 
+The build applies two independently checksummed patches. The mining adapter
+adds the authenticated template and block-submission contract. The P2P
+backoff patch fixes an upstream retry-state bug that discarded an address's
+failure count as soon as its delay expired, effectively pinning unreachable
+peers to a 30-second retry loop. Failure history now survives expired retry
+deadlines for 24 hours, successful connections clear it, and repeated failures
+progress through `30s`, `120s`, `300s`, `900s`, `1800s`, and `3600s`.
+Only one outbound dial per peer address may remain in flight, preventing the
+15-second peer discovery loop from queuing duplicate TCP attempts behind a
+long timeout. Expected transport failures use compact `dial_failed` records;
+invalid peer identity, malformed addresses, and sync request failures retain
+detailed diagnostics.
+
 ## Build
 
 ```bash
@@ -13,6 +26,10 @@ git clone https://github.com/compute-substrate/compute-substrate.git
 git -C compute-substrate checkout d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c
 ops/csd-node-adapter/apply-and-build.sh "$PWD/compute-substrate"
 ```
+
+The build runs the P2P backoff unit tests before checking or compiling the
+node. Set `CSD_NODE_ADAPTER_SKIP_BUILD=1` only for patch applicability checks,
+never for a release artifact.
 
 Run the resulting official node with a fresh token of at least 32 characters:
 

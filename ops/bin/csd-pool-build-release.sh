@@ -114,6 +114,7 @@ binaries=${BINARIES[*]}
 ci_workflow=.github/workflows/ci.yml
 wallet_signer=ops/wallet-signer/signer.mjs
 node_adapter_patch=ops/csd-node-adapter/compute-substrate-pool-adapter.patch
+node_p2p_backoff_patch=ops/csd-node-adapter/compute-substrate-p2p-backoff.patch
 node_adapter_manifest=ops/csd-node-adapter/MANIFEST.txt
 node_adapter_build=ops/csd-node-adapter/apply-and-build.sh
 node_adapter_run=ops/bin/csd-pool-node-adapter-run.sh

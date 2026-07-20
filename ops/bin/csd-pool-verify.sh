@@ -154,6 +154,7 @@ check_release_archive() {
   require_file "$release_root/ops/wallet-signer/node_modules/@inversealtruism/csd-crypto/package.json"
   require_file "$release_root/ops/wallet-signer/node_modules/@inversealtruism/csd-tx/package.json"
   require_file "$release_root/ops/csd-node-adapter/compute-substrate-pool-adapter.patch"
+  require_file "$release_root/ops/csd-node-adapter/compute-substrate-p2p-backoff.patch"
   require_file "$release_root/ops/csd-node-adapter/MANIFEST.txt"
   require_executable "$release_root/ops/csd-node-adapter/apply-and-build.sh"
   require_executable "$release_root/ops/bin/csd-pool-launch-gaps-self-test.sh"
@@ -168,6 +169,7 @@ check_release_archive() {
   require_text_in_file "$release_root/RELEASE-MANIFEST.txt" "release_check=ops/bin/csd-pool-release-check.sh" "release manifest records release check"
   require_text_in_file "$release_root/RELEASE-MANIFEST.txt" "ci_workflow=.github/workflows/ci.yml" "release manifest records CI workflow"
   require_text_in_file "$release_root/RELEASE-MANIFEST.txt" "wallet_signer=ops/wallet-signer/signer.mjs" "release manifest records wallet signer"
+  require_text_in_file "$release_root/RELEASE-MANIFEST.txt" "node_p2p_backoff_patch=ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" "release manifest records node P2P backoff patch"
   require_text_in_file "$release_root/RELEASE-MANIFEST.txt" "launch_gaps_self_test=ops/bin/csd-pool-launch-gaps-self-test.sh" "release manifest records launch gaps self-test"
   for entry in \
     "verify=ops/bin/csd-pool-verify.sh" \
