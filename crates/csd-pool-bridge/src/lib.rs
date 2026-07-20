@@ -688,7 +688,7 @@ async fn handle_client(
                                             );
                                             pending_difficulty =
                                                 vardiff.record_accepted_share(Instant::now());
-                                            info!(
+                                            debug!(
                                                 %peer,
                                                 session_id,
                                                 worker = submit.worker_name,

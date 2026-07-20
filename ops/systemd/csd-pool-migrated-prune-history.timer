@@ -1,0 +1,11 @@
+[Unit]
+Description=Prune CSD pool operational history daily
+
+[Timer]
+OnCalendar=*-*-* 04:37:00
+RandomizedDelaySec=15min
+Persistent=true
+Unit=csd-pool-migrated-prune-history.service
+
+[Install]
+WantedBy=timers.target

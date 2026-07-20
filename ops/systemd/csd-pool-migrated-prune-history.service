@@ -1,0 +1,25 @@
+[Unit]
+Description=Prune retained CSD pool operational history
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+EnvironmentFile=-/etc/csd-pool-migrated/retention.env
+Environment=CSD_POOL_RETENTION_DATABASE=csd_pool
+Environment=CSD_POOL_SHARE_RETENTION_DAYS=14
+Environment=CSD_POOL_SHARE_EVENT_RETENTION_DAYS=14
+Environment=CSD_POOL_NODE_SAMPLE_RETENTION_DAYS=90
+Environment=CSD_POOL_RESOLVED_ALERT_RETENTION_DAYS=180
+Environment=CSD_POOL_RETENTION_BATCH_SIZE=50000
+ExecStart=/data/csd-pool/release/bin/csd-pool-prune-history
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+TimeoutStartSec=30min
