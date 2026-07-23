@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import sys
 from datetime import datetime, timezone
@@ -41,6 +42,12 @@ EXPECTED_TESTS = {
 }
 EXPECTED_PORTS = {"3333": 413, "3334": 2, "3335": 1}
 EXPECTED_UNITS = {"daemon", "node_a", "node_b", "signer"}
+EXPECTED_DAEMON_UNIT = "csd-pool-migrated-daemon.service"
+EXPECTED_DAEMON_USER = "csd-pool"
+EXPECTED_DAEMON_GROUP = "csd-pool"
+EXPECTED_LATCH_PARENT = Path("/var/lib/csd-pool")
+EXPECTED_LATCH_PARENT_MODE = "1770"
+EXPECTED_SANDBOX_PROBE = "nsenter_mount_namespace_runuser_access_w_ok"
 MAX_CPU_PERCENT = 20.0
 MAX_RSS_KB = 1_048_576
 MAX_FD = 1_000
@@ -107,6 +114,54 @@ def is_sha256(value: Any) -> bool:
 
 def mapping(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def systemd_service_sandbox(unit_text: str) -> tuple[str | None, list[str]]:
+    section = ""
+    protect_system: str | None = None
+    read_write_paths: list[str] = []
+    for raw_line in unit_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line
+            continue
+        if section != "[Service]" or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key == "ProtectSystem":
+            protect_system = value.strip()
+        elif key == "ReadWritePaths":
+            value = value.strip()
+            if not value:
+                read_write_paths.clear()
+            else:
+                read_write_paths.extend(shlex.split(value))
+    return protect_system, read_write_paths
+
+
+def verify_repository_daemon_sandbox(gate: Gate, repo_root: Path) -> None:
+    unit_path = repo_root / "ops/systemd/csd-pool-migrated-daemon.service"
+    valid_file = unit_path.is_file() and not unit_path.is_symlink()
+    gate.require(valid_file, "daemon_sandbox.repository_unit: missing or symlink")
+    if not valid_file:
+        return
+    try:
+        protect_system, read_write_paths = systemd_service_sandbox(
+            unit_path.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        gate.require(False, f"daemon_sandbox.repository_unit: cannot parse: {exc}")
+        return
+    gate.require(
+        protect_system == "strict",
+        "daemon_sandbox.repository_unit: ProtectSystem must remain strict",
+    )
+    gate.require(
+        str(EXPECTED_LATCH_PARENT) in read_write_paths,
+        "daemon_sandbox.repository_unit: latch parent missing from ReadWritePaths",
+    )
 
 
 def integer(value: Any) -> int | None:
@@ -234,6 +289,7 @@ def verify_evidence(repo_root: Path, evidence_path: Path, evidence: dict[str, An
 
     gate.require(evidence.get("schema") == SCHEMA, "schema: unsupported or missing")
     gate.require(evidence.get("scope") == "local_evidence_only", "scope: must be local_evidence_only")
+    verify_repository_daemon_sandbox(gate, repo_root)
 
     boundary = mapping(evidence.get("execution_boundary"))
     for field in (
@@ -321,7 +377,56 @@ def verify_evidence(repo_root: Path, evidence_path: Path, evidence: dict[str, An
     latch_ok = isinstance(latch_path, str) and os.path.isabs(latch_path)
     gate.require(latch_ok, "canary.latch_path: must be absolute")
     if latch_ok:
-        gate.require(Path(latch_path).parent == Path("/var/lib/csd-pool"), "canary.latch_path: parent must be /var/lib/csd-pool")
+        gate.require(Path(latch_path).parent == EXPECTED_LATCH_PARENT, "canary.latch_path: parent must be /var/lib/csd-pool")
+    daemon_sandbox = mapping(canary.get("daemon_sandbox"))
+    gate.require(
+        daemon_sandbox.get("unit") == EXPECTED_DAEMON_UNIT,
+        f"canary.daemon_sandbox.unit: must be {EXPECTED_DAEMON_UNIT}",
+    )
+    gate.require(
+        daemon_sandbox.get("service_user") == EXPECTED_DAEMON_USER,
+        f"canary.daemon_sandbox.service_user: must be {EXPECTED_DAEMON_USER}",
+    )
+    gate.require(
+        daemon_sandbox.get("service_group") == EXPECTED_DAEMON_GROUP,
+        f"canary.daemon_sandbox.service_group: must be {EXPECTED_DAEMON_GROUP}",
+    )
+    gate.require(
+        daemon_sandbox.get("protect_system") == "strict",
+        "canary.daemon_sandbox.protect_system: must be strict",
+    )
+    read_write_paths = daemon_sandbox.get("read_write_paths")
+    gate.require(
+        isinstance(read_write_paths, list)
+        and all(isinstance(path, str) for path in read_write_paths),
+        "canary.daemon_sandbox.read_write_paths: must be a string list",
+    )
+    if isinstance(read_write_paths, list):
+        gate.require(
+            str(EXPECTED_LATCH_PARENT) in read_write_paths,
+            "canary.daemon_sandbox.read_write_paths: latch parent missing",
+        )
+    gate.require(
+        daemon_sandbox.get("latch_parent_uid") == 0,
+        "canary.daemon_sandbox.latch_parent_uid: must be 0",
+    )
+    gate.require(
+        daemon_sandbox.get("latch_parent_group") == EXPECTED_DAEMON_GROUP,
+        f"canary.daemon_sandbox.latch_parent_group: must be {EXPECTED_DAEMON_GROUP}",
+    )
+    gate.require(
+        daemon_sandbox.get("latch_parent_mode") == EXPECTED_LATCH_PARENT_MODE,
+        f"canary.daemon_sandbox.latch_parent_mode: must be {EXPECTED_LATCH_PARENT_MODE}",
+    )
+    gate.require(
+        daemon_sandbox.get("mount_namespace_probe")
+        == EXPECTED_SANDBOX_PROBE,
+        f"canary.daemon_sandbox.mount_namespace_probe: must be {EXPECTED_SANDBOX_PROBE}",
+    )
+    gate.require(
+        daemon_sandbox.get("mount_namespace_write_probe_passed") is True,
+        "canary.daemon_sandbox.mount_namespace_write_probe_passed: must be true",
+    )
     gate.require(canary.get("one_shot") is True, "canary.one_shot: must be true")
     gate.require(canary.get("restart_persistence_test_passed") is True, "canary.restart_persistence_test_passed: must be true")
     gate.require(canary.get("existing_latch_fail_closed") is True, "canary.existing_latch_fail_closed: must be true")

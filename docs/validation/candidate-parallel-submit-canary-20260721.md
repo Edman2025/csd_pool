@@ -100,7 +100,11 @@ Before any production enablement:
    source hashes, test counts, an at-most-five-minute-old strict-UTC A-only
    baseline, JN12/3335 frozen state, A/B convergence and positive peer counts,
    CPU/RSS/FD/tasks/PG limits, previous-release and config SHA, latch
-   preservation, and the rollback verification chain.
+   preservation, and the rollback verification chain. The migrated daemon must
+   retain `ProtectSystem=strict`, explicitly include `/var/lib/csd-pool` in its
+   effective `ReadWritePaths`, and pass the write-access probe from the
+   daemon's mount namespace. A host-namespace `runuser ... test -w` result is
+   insufficient.
 6. Workspace tests, strict clippy, release check, formatting, and diff checks
    must pass. The feature flags remain false after every local gate.
 7. Any future production canary requires a fresh, independent authorization
@@ -122,10 +126,12 @@ The current code-only candidate passed:
   two-peer replay that requires the published consensus header bytes to arrive;
 - official adapter `dial_backoff_tests`: 5/5;
 - pool bridge: 68/68, DB: 26/26, node client: 15/15;
-- stateless canary evidence gate negative matrix: 40/40, including rollback
+- stateless canary evidence gate matrix: 44/44, including the migrated-unit
+  missing-`ReadWritePaths` regression, daemon mount-namespace probe enforcement,
+  rollback
   config content, duplicate-control, unknown-syntax/control-byte rejection,
   permissions, and baseline freshness;
-- `ops/bin/csd-pool-release-check.sh`: pass 1852, fail 0;
+- `ops/bin/csd-pool-release-check.sh`: pass 1861, fail 0;
 - direct and HTTP two-official-adapter replays with node-b empty cache and
   divergent mempool;
 - secondary-only aggregate-to-DB-to-alert integration;

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -17,6 +18,10 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 GATE = ROOT / "ops/bin/csd-pool-stateless-candidate-canary-gate.py"
+GATE_SPEC = importlib.util.spec_from_file_location("stateless_candidate_gate", GATE)
+assert GATE_SPEC is not None and GATE_SPEC.loader is not None
+GATE_MODULE = importlib.util.module_from_spec(GATE_SPEC)
+GATE_SPEC.loader.exec_module(GATE_MODULE)
 
 
 def sha256_file(path: Path) -> str:
@@ -115,6 +120,23 @@ class CanaryGateTests(unittest.TestCase):
             "canary": {
                 "secondary_budget": 1,
                 "latch_path": "/var/lib/csd-pool/stateless-candidate-canary.latch",
+                "daemon_sandbox": {
+                    "unit": "csd-pool-migrated-daemon.service",
+                    "service_user": "csd-pool",
+                    "service_group": "csd-pool",
+                    "protect_system": "strict",
+                    "read_write_paths": [
+                        "/data/csd-pool/state",
+                        "/data/csd-pool/log",
+                        "/data/csd-pool/backup",
+                        "/var/lib/csd-pool",
+                    ],
+                    "latch_parent_uid": 0,
+                    "latch_parent_group": "csd-pool",
+                    "latch_parent_mode": "1770",
+                    "mount_namespace_probe": "nsenter_mount_namespace_runuser_access_w_ok",
+                    "mount_namespace_write_probe_passed": True,
+                },
                 "one_shot": True,
                 "restart_persistence_test_passed": True,
                 "existing_latch_fail_closed": True,
@@ -286,6 +308,57 @@ class CanaryGateTests(unittest.TestCase):
 
     def test_wrong_latch_parent_fails(self) -> None:
         self.assert_rejected(lambda e: e["canary"].update(latch_path="/tmp/canary.latch"), "parent must be /var/lib/csd-pool")
+
+    def test_migrated_daemon_without_latch_read_write_path_fails(self) -> None:
+        self.assert_rejected(
+            lambda e: e["canary"]["daemon_sandbox"].update(
+                read_write_paths=[
+                    "/data/csd-pool/state",
+                    "/data/csd-pool/log",
+                    "/data/csd-pool/backup",
+                ]
+            ),
+            "daemon_sandbox.read_write_paths: latch parent missing",
+        )
+
+    def test_host_namespace_write_probe_cannot_replace_daemon_namespace_probe(self) -> None:
+        self.assert_rejected(
+            lambda e: e["canary"]["daemon_sandbox"].update(
+                mount_namespace_probe="host_runuser_access_w_ok"
+            ),
+            "daemon_sandbox.mount_namespace_probe",
+        )
+
+    def test_daemon_namespace_write_probe_failure_fails(self) -> None:
+        self.assert_rejected(
+            lambda e: e["canary"]["daemon_sandbox"].update(
+                mount_namespace_write_probe_passed=False
+            ),
+            "mount_namespace_write_probe_passed",
+        )
+
+    def test_normal_and_migrated_units_allow_latch_parent(self) -> None:
+        for relative in (
+            "ops/systemd/csd-pool-daemon.service",
+            "ops/systemd/csd-pool-migrated-daemon.service",
+        ):
+            protect_system, read_write_paths = GATE_MODULE.systemd_service_sandbox(
+                (ROOT / relative).read_text(encoding="utf-8")
+            )
+            self.assertEqual(protect_system, "strict")
+            self.assertIn("/var/lib/csd-pool", read_write_paths)
+
+        old_migrated = (
+            "[Service]\n"
+            "ProtectSystem=strict\n"
+            "ReadWritePaths=/data/csd-pool/state /data/csd-pool/log "
+            "/data/csd-pool/backup\n"
+        )
+        protect_system, read_write_paths = GATE_MODULE.systemd_service_sandbox(
+            old_migrated
+        )
+        self.assertEqual(protect_system, "strict")
+        self.assertNotIn("/var/lib/csd-pool", read_write_paths)
 
     def test_budget_above_one_fails(self) -> None:
         self.assert_rejected(lambda e: e["canary"].update(secondary_budget=2), "secondary_budget")

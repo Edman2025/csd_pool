@@ -17,7 +17,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/data/csd-pool/state /data/csd-pool/log /data/csd-pool/backup
+ReadWritePaths=/data/csd-pool/state /data/csd-pool/log /data/csd-pool/backup /var/lib/csd-pool
 LimitNOFILE=1048576
 
 [Install]
