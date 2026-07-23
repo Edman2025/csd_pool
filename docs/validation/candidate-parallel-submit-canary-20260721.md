@@ -1,40 +1,48 @@
 # Candidate Parallel Submit Canary
 
-Status: parent-hash repair is code and isolated validation only. Production
-parallel submit is disabled after the one-shot rollback described below.
+Status: stateless full-candidate fanout is code and isolated validation only.
+Production remains A-only. The legacy job-cache-affine path is blocked by
+`BLOCKED_JOB_CACHE_AFFINITY` and must never be enabled.
 
 ## Scope
 
-The candidate submitter can fan a solved block out to node-a and node-b when
-`CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED=true`.
+The current candidate submitter can fan a solved block out only when
+`CSD_POOL_STATELESS_PARALLEL_CANDIDATE_SUBMIT_ENABLED=true` and the separately
+approved one-shot gate has passed.
 
-- node-a remains authoritative for the pool's accepted or rejected result;
-- node-b is best-effort and has a shorter timeout;
-- a process-local atomic one-shot budget permits node-b for at most the first
-  candidate entering the submit path; the budget is consumed even if the
-  health gate skips node-b;
-- a background health watch keeps bounded-age snapshots for both nodes;
-- node-a and node-b submissions start together only when the cached snapshots
-  show the same height, tip, and chainwork, and that tip matches the candidate
-  header's parent hash;
-- missing health data, health errors, timeouts, or chain-state differences
-  degrade to node-a only;
-- both node attempts are recorded under `submit_response.parallel_submit`,
-  including start/end timestamps, elapsed time, response, error or timeout,
-  and the health snapshots used by the safety gate.
+- templates are fetched only from node-a;
+- node-a receives its cache-affine submit while node-b receives a complete
+  stateless candidate containing the raw template material needed to perform
+  independent consensus validation with an empty job cache;
+- node-b reconstructs, validates, durably stores, applies, and broadcasts the
+  candidate through the official adapter without consulting node-a state;
+- a persistent `O_EXCL` latch limits node-b to exactly one candidate across
+  daemon restarts; the latch file is `0600`, file and parent are synced, and
+  unsafe writable parents or broad existing-latch permissions fail closed;
+- pre-claim health must show the same height, tip, and chainwork on both nodes,
+  node-b must report at least one relay peer, and that tip must match the
+  candidate parent; a mismatch or zero-peer node-b before claim leaves the
+  one-shot available, while drift after a durable claim consumes it and skips
+  node-b;
+- missing or stale health, latch errors, node timeouts, malformed material, or
+  chain-state differences never delay or disable the node-a request;
+- either node's successful consensus-and-relay result makes the aggregate
+  result accepted; secondary-only acceptance is persisted as
+  `submitted_secondary` and creates an operator alert;
+- both node attempts, health snapshots, latch state, timing, local-canonical
+  state, and relay outcome are stored under `submit_response.parallel_submit`.
 
-The bounded node-b call may delay persistence of the combined audit response,
-but it does not delay node-a submission or network propagation. This
-deliberately preserves the existing candidate DB and notification ordering;
-candidate fast-path work is outside this change.
-
-`relay_enqueue` continues to mean local node queue admission. It is not a peer
-first-seen or network propagation acknowledgement.
+The official adapter does not treat local insertion or queue admission as
+network success. Every successful response requires a real gossipsub publish
+acknowledgement. A P2P-first or duplicate local-canonical candidate retries a
+fresh relay acknowledgement rather than trusting cached relay state.
 
 ## Configuration
 
 ```dotenv
 CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED=false
+CSD_POOL_STATELESS_PARALLEL_CANDIDATE_SUBMIT_ENABLED=false
+CSD_POOL_STATELESS_PARALLEL_CANDIDATE_LATCH_PATH=/var/lib/csd-pool/stateless-candidate-canary.latch
 CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_BUDGET=1
 CSD_POOL_PRIMARY_SUBMIT_NODE_NAME=node-a
 CSD_POOL_SECONDARY_SUBMIT_NODE_NAME=node-b
@@ -45,20 +53,31 @@ CSD_POOL_PARALLEL_NODE_HEALTH_REFRESH_MS=1000
 CSD_POOL_PARALLEL_NODE_HEALTH_MAX_AGE_MS=3000
 ```
 
-The feature flag defaults to disabled. The primary and secondary URLs must be
-distinct. In live mode, the primary submit URL must still match the template
-node because mining jobs are node-local. This canary release rejects any
-parallel-submit budget other than exactly `1`.
+Both feature flags default to disabled. The legacy flag is a hard error. The
+primary and secondary URLs must be distinct, the primary submit URL must match
+the template node, the latch path must be absolute, and any budget other than
+exactly `1` is rejected.
 
 ## Result Semantics
 
-- `both_accepted`: both nodes accepted; node-a response remains authoritative.
+- `both_accepted`: both nodes independently accepted and relayed.
 - `authority_accepted_secondary_failed`: node-a accepted and node-b failed,
   rejected, or timed out.
 - `authority_accepted_secondary_skipped`: node-a accepted and node-b was
   skipped by the health safety gate.
-- `secondary_accepted_authority_failed`: node-b accepted, but the pool result
-  remains failed because node-a is authoritative.
+- `secondary_accepted_authority_failed`: node-b independently accepted and
+  relayed while node-a failed; aggregate `ok=true`, DB status is
+  `submitted_secondary`, and an operator alert is mandatory.
+- `secondary_accepted_authority_local_canonical_relay_failed`: node-b relayed
+  while node-a inserted locally but failed to obtain a relay acknowledgement.
+- `authority_accepted_secondary_local_canonical_relay_failed`: node-a relayed
+  while node-b inserted locally but failed to obtain a relay acknowledgement.
+- `both_local_canonical_relay_failed`: both inserted locally but neither
+  obtained a relay acknowledgement; aggregate `ok=false` and DB status is
+  `relay_failed`.
+- any primary or secondary timeout/transport error is outcome-ambiguous and
+  remains `submitted` for reconciliation; it is never prematurely classified
+  as `orphaned`.
 - `both_failed`: neither node accepted.
 - `authority_failed_secondary_skipped`: node-a failed and node-b was not safe
   to use.
@@ -67,42 +86,61 @@ parallel-submit budget other than exactly `1`.
 
 Before any production enablement:
 
-1. Unit fault injection must cover both accepted, node-a accepted/node-b
-   failed, node-a failed/node-b accepted, both timeout, chain mismatch, and
-   two concurrent candidates competing for the one-shot budget.
-2. Workspace tests, strict clippy, release check, formatting, and diff checks
-   must pass.
-3. An isolated daemon and independent database must replay candidate submits
-   against two controllable node adapters.
-4. The canary must verify that the combined audit record contains both node
-   outcomes and that primary-only behavior is byte-for-byte unchanged while
-   the feature flag is disabled.
-5. A later production canary must be limited to a single real candidate and
-   must not share a window with miner expansion. Its audit record must show
-   `secondary_candidate_budget.claimed=true` and `remaining=0`; every later
-   candidate must show `candidate_budget_exhausted` and remain node-a only.
+1. Two official-adapter isolated replays must pass: direct official-handler
+   replay and two-listener HTTP replay. Both use only node-a template material;
+   node-b starts with an empty job cache and a divergent mempool.
+2. Replays must cover malformed material, duplicate/idempotent submission,
+   P2P-first arrival, fresh relay ACK recovery, secondary timeout, A/B health
+   drift, and local-canonical relay failure.
+3. Aggregate and DB integration must prove secondary-only success is accepted,
+   persisted as `submitted_secondary`, reconciled, and alerted.
+4. The one-shot latch must survive daemon reconstruction, reject unsafe parent
+   or file modes, and fail closed on pre-existing latch and persistence error.
+5. `ops/bin/csd-pool-stateless-candidate-canary-gate.py` must verify locked
+   source hashes, test counts, an at-most-five-minute-old strict-UTC A-only
+   baseline, JN12/3335 frozen state, A/B convergence and positive peer counts,
+   CPU/RSS/FD/tasks/PG limits, previous-release and config SHA, latch
+   preservation, and the rollback verification chain.
+6. Workspace tests, strict clippy, release check, formatting, and diff checks
+   must pass. The feature flags remain false after every local gate.
+7. Any future production canary requires a fresh, independent authorization
+   and exactly one real candidate. Local PASS never authorizes production.
 
 No wallet, signer, payout, miner, PRL, BTX, or DIL behavior is part of this
 change.
 
 ## Local Gate Results
 
-The code-only candidate passed:
+The current code-only candidate passed:
 
 - `cargo fmt --all -- --check`;
 - `git diff --check`;
-- `cargo test --workspace`: 191 tests passed;
-- `cargo clippy --workspace --all-targets -- -D warnings`;
-- `ops/bin/csd-pool-release-check.sh`: pass 1793, fail 0;
-- an in-process two-node HTTP replay using the real `CsdNodeClient`;
-- fault injection for both accepted, authority accepted/secondary failed,
-  authority failed/secondary accepted, both timed out, and chain mismatch;
-- a concurrent two-candidate regression proving node-a receives both
-  candidates while node-b receives exactly one;
-- a conservative skip regression proving a chain-state mismatch still
-  consumes the budget and the next candidate remains node-a only.
+- official adapter `pool_candidate_tests`: 12/12, including a P2P-first
+  candidate that remains idempotently accepted after it becomes a canonical
+  ancestor rather than the current tip;
+- official adapter `pool_header_publish_tests`: 6/6, including an in-memory
+  two-peer replay that requires the published consensus header bytes to arrive;
+- official adapter `dial_backoff_tests`: 5/5;
+- pool bridge: 68/68, DB: 26/26, node client: 15/15;
+- stateless canary evidence gate negative matrix: 40/40, including rollback
+  config content, duplicate-control, unknown-syntax/control-byte rejection,
+  permissions, and baseline freshness;
+- `ops/bin/csd-pool-release-check.sh`: pass 1852, fail 0;
+- direct and HTTP two-official-adapter replays with node-b empty cache and
+  divergent mempool;
+- secondary-only aggregate-to-DB-to-alert integration;
+- restart-persistent latch, permission, timeout, health drift, malformed,
+  duplicate, P2P-first, relay recovery, rollback, and resource gates.
 
-No production feature flag was enabled by these checks.
+No production connection, build, deployment, restart, or feature flag was
+performed by these checks.
+
+## Historical Superseded Fanout Evidence
+
+The remaining dated sections document earlier job-cache-affine and
+process-local one-shot experiments. They explain prior incidents but are not
+valid implementation, artifact, replay, rollback, or production-authorization
+evidence for the current stateless path.
 
 ## Linux Isolated Canary
 

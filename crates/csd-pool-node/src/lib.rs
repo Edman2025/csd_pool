@@ -4,7 +4,12 @@ use csd_pool_consensus::{
 };
 use csd_pool_protocol::NotifyParams;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Error)]
 pub enum NodeError {
@@ -19,6 +24,12 @@ pub enum NodeError {
 }
 
 pub type Result<T> = std::result::Result<T, NodeError>;
+
+pub const MAX_CSD_BLOCK_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CSD_BLOCK_TEMPLATE_HEX_LEN: usize = MAX_CSD_BLOCK_BYTES * 2;
+const MAX_STATELESS_TEMPLATE_RESPONSE_BYTES: usize = MAX_CSD_BLOCK_TEMPLATE_HEX_LEN + (512 * 1024);
+const MAX_STATELESS_TEMPLATE_CACHE_ENTRIES: usize = 8;
+const STATELESS_TEMPLATE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct CsdNodeClient {
@@ -104,6 +115,20 @@ impl CsdNodeClient {
         .await
     }
 
+    pub async fn submit_full_candidate(
+        &self,
+        candidate: &StatelessBlockCandidateSubmitRequest<'_>,
+    ) -> Result<SubmitBlockResponse> {
+        let url = format!("{}/api/rpc/block/submit-full", self.base_url);
+        parse_submit_block_response(
+            self.authorize(self.http.post(url))
+                .json(candidate)
+                .send()
+                .await?,
+        )
+        .await
+    }
+
     pub async fn mining_template(&self, pool_address: &str) -> Result<NodeMiningTemplate> {
         let url = format!("{}/api/rpc/mining/template", self.base_url);
         Ok(self
@@ -114,6 +139,43 @@ impl CsdNodeClient {
             .error_for_status()?
             .json()
             .await?)
+    }
+
+    pub async fn mining_template_material(
+        &self,
+        job_id: &str,
+    ) -> Result<StatelessNodeMiningTemplate> {
+        let url = format!("{}/api/rpc/mining/template-material", self.base_url);
+        let mut response = self
+            .authorize(self.http.get(url))
+            .query(&[("job_id", job_id)])
+            .send()
+            .await?
+            .error_for_status()?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_STATELESS_TEMPLATE_RESPONSE_BYTES as u64)
+        {
+            return Err(NodeError::InvalidResponse(
+                "stateless template response exceeds the configured body limit",
+            ));
+        }
+        let mut body = Vec::with_capacity(
+            response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or_default()
+                .min(MAX_STATELESS_TEMPLATE_RESPONSE_BYTES),
+        );
+        while let Some(chunk) = response.chunk().await? {
+            if body.len().saturating_add(chunk.len()) > MAX_STATELESS_TEMPLATE_RESPONSE_BYTES {
+                return Err(NodeError::InvalidResponse(
+                    "stateless template response exceeds the configured body limit",
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(serde_json::from_slice(&body)?)
     }
 
     pub async fn block_status(&self, hash: &str) -> Result<BlockStatusResponse> {
@@ -206,6 +268,7 @@ pub struct NodeHealth {
     pub height: Option<u64>,
     pub tip: Option<String>,
     pub chainwork: Option<String>,
+    #[serde(alias = "peer_count")]
     pub peers: Option<u64>,
     #[serde(flatten)]
     pub extra: serde_json::Value,
@@ -247,6 +310,14 @@ pub struct BlockCandidateSubmitRequest {
     pub nonce_hex: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct StatelessBlockCandidateSubmitRequest<'a> {
+    #[serde(flatten)]
+    pub candidate: &'a BlockCandidateSubmitRequest,
+    #[serde(flatten)]
+    pub candidate_material: &'a CandidateTemplateMaterial,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct BlockStatusResponse {
     #[serde(default)]
@@ -285,7 +356,7 @@ pub struct TransactionStatusResponse {
     pub extra: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct NodeMiningTemplate {
     pub job_id: String,
     pub prev_hash_be_hex: String,
@@ -321,6 +392,90 @@ impl NodeMiningTemplate {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StatelessNodeMiningTemplate {
+    #[serde(flatten)]
+    pub template: NodeMiningTemplate,
+    pub block_template_hex: String,
+    pub block_template_sha256_hex: String,
+    pub block_template_bytes: u64,
+}
+
+impl StatelessNodeMiningTemplate {
+    pub fn into_pool_job(self) -> Result<PoolJob> {
+        let (template, candidate_material) = self.into_parts()?;
+        let job = template.into_pool_job()?;
+        *job.candidate_material
+            .write()
+            .expect("candidate material slot lock poisoned") = Some(Arc::new(candidate_material));
+        Ok(job)
+    }
+
+    fn into_parts(self) -> Result<(NodeMiningTemplate, CandidateTemplateMaterial)> {
+        let candidate_material = candidate_template_material(
+            Some(&self.block_template_hex),
+            Some(&self.block_template_sha256_hex),
+            Some(self.block_template_bytes),
+        )?
+        .ok_or(NodeError::InvalidResponse(
+            "stateless block template material is missing",
+        ))?;
+        Ok((self.template, candidate_material))
+    }
+}
+
+fn candidate_template_material(
+    block_template_hex: Option<&str>,
+    block_template_sha256_hex: Option<&str>,
+    block_template_bytes: Option<u64>,
+) -> Result<Option<CandidateTemplateMaterial>> {
+    let (Some(block_template_hex), Some(expected_sha256), Some(expected_bytes)) = (
+        block_template_hex,
+        block_template_sha256_hex,
+        block_template_bytes,
+    ) else {
+        if block_template_hex.is_none()
+            && block_template_sha256_hex.is_none()
+            && block_template_bytes.is_none()
+        {
+            return Ok(None);
+        }
+        return Err(NodeError::InvalidResponse(
+            "stateless block template fields are incomplete",
+        ));
+    };
+    if block_template_hex.len() > MAX_CSD_BLOCK_TEMPLATE_HEX_LEN
+        || block_template_hex.len() % 2 != 0
+    {
+        return Err(NodeError::InvalidResponse(
+            "block_template_hex exceeds the encoded block limit or has odd length",
+        ));
+    }
+    if expected_bytes > MAX_CSD_BLOCK_BYTES as u64 {
+        return Err(NodeError::InvalidResponse(
+            "block_template_bytes exceeds the consensus block limit",
+        ));
+    }
+    let bytes = hex::decode(block_template_hex)
+        .map_err(|_| NodeError::InvalidResponse("block_template_hex is invalid hex"))?;
+    if u64::try_from(bytes.len()).ok() != Some(expected_bytes) {
+        return Err(NodeError::InvalidResponse(
+            "block_template_bytes does not match decoded template length",
+        ));
+    }
+    let actual_sha256 = hex::encode(Sha256::digest(&bytes));
+    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+        return Err(NodeError::InvalidResponse(
+            "block_template_sha256_hex does not match template bytes",
+        ));
+    }
+    Ok(Some(CandidateTemplateMaterial {
+        block_template_hex: block_template_hex.to_ascii_lowercase(),
+        block_template_sha256_hex: actual_sha256,
+        block_template_bytes: expected_bytes,
+    }))
+}
+
 fn default_clean_jobs() -> bool {
     true
 }
@@ -329,6 +484,17 @@ fn default_clean_jobs() -> bool {
 pub struct PoolJob {
     pub notify: NotifyParams,
     pub template: WorkTemplate,
+    pub candidate_material: CandidateMaterialSlot,
+}
+
+pub type CandidateMaterialSlot = Arc<RwLock<Option<Arc<CandidateTemplateMaterial>>>>;
+type MaterialFetchTask = (String, tokio::task::JoinHandle<()>);
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CandidateTemplateMaterial {
+    pub block_template_hex: String,
+    pub block_template_sha256_hex: String,
+    pub block_template_bytes: u64,
 }
 
 #[async_trait]
@@ -349,6 +515,96 @@ pub struct StaticTemplateProvider {
 pub struct LiveTemplateProvider {
     node: CsdNodeClient,
     pool_address: String,
+    stateless_full: bool,
+    material_cache: Arc<Mutex<TemplateMaterialCache>>,
+    material_fetch: Arc<Mutex<Option<MaterialFetchTask>>>,
+    material_fetch_limit: Arc<Semaphore>,
+}
+
+#[derive(Debug)]
+struct TemplateMaterialCacheEntry {
+    template: NodeMiningTemplate,
+    slot: CandidateMaterialSlot,
+    fetch_started: bool,
+}
+
+#[derive(Debug, Default)]
+struct TemplateMaterialCache {
+    entries: HashMap<String, TemplateMaterialCacheEntry>,
+    order: VecDeque<String>,
+}
+
+impl TemplateMaterialCache {
+    fn slot_for(&mut self, template: &NodeMiningTemplate) -> (CandidateMaterialSlot, bool) {
+        if let Some(entry) = self.entries.get_mut(&template.job_id) {
+            if entry.template == *template {
+                let should_fetch = !entry.fetch_started
+                    && entry
+                        .slot
+                        .read()
+                        .expect("candidate material slot lock poisoned")
+                        .is_none();
+                entry.fetch_started = true;
+                return (entry.slot.clone(), should_fetch);
+            }
+            if let Some(replaced) = self.entries.remove(&template.job_id) {
+                *replaced
+                    .slot
+                    .write()
+                    .expect("candidate material slot lock poisoned") = None;
+            }
+            self.order.retain(|job_id| job_id != &template.job_id);
+        }
+
+        let slot = Arc::new(RwLock::new(None));
+        self.entries.insert(
+            template.job_id.clone(),
+            TemplateMaterialCacheEntry {
+                template: template.clone(),
+                slot: slot.clone(),
+                fetch_started: true,
+            },
+        );
+        self.order.push_back(template.job_id.clone());
+        while self.order.len() > MAX_STATELESS_TEMPLATE_CACHE_ENTRIES {
+            if let Some(oldest) = self.order.pop_front()
+                && let Some(evicted) = self.entries.remove(&oldest)
+            {
+                *evicted
+                    .slot
+                    .write()
+                    .expect("candidate material slot lock poisoned") = None;
+            }
+        }
+        (slot, true)
+    }
+
+    fn cancel_fetch(&mut self, job_id: &str) {
+        if let Some(entry) = self.entries.get_mut(job_id) {
+            entry.fetch_started = false;
+        }
+    }
+
+    fn finish_fetch(
+        &mut self,
+        template: &NodeMiningTemplate,
+        slot: &CandidateMaterialSlot,
+        material: Option<CandidateTemplateMaterial>,
+    ) {
+        let Some(entry) = self.entries.get_mut(&template.job_id) else {
+            return;
+        };
+        if entry.template != *template || !Arc::ptr_eq(&entry.slot, slot) {
+            return;
+        }
+        entry.fetch_started = false;
+        if let Some(material) = material {
+            *entry
+                .slot
+                .write()
+                .expect("candidate material slot lock poisoned") = Some(Arc::new(material));
+        }
+    }
 }
 
 impl LiveTemplateProvider {
@@ -356,6 +612,21 @@ impl LiveTemplateProvider {
         Self {
             node,
             pool_address: pool_address.into(),
+            stateless_full: false,
+            material_cache: Arc::new(Mutex::new(TemplateMaterialCache::default())),
+            material_fetch: Arc::new(Mutex::new(None)),
+            material_fetch_limit: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    pub fn new_stateless(node: CsdNodeClient, pool_address: impl Into<String>) -> Self {
+        Self {
+            node,
+            pool_address: pool_address.into(),
+            stateless_full: true,
+            material_cache: Arc::new(Mutex::new(TemplateMaterialCache::default())),
+            material_fetch: Arc::new(Mutex::new(None)),
+            material_fetch_limit: Arc::new(Semaphore::new(1)),
         }
     }
 }
@@ -363,10 +634,61 @@ impl LiveTemplateProvider {
 #[async_trait]
 impl TemplateProvider for LiveTemplateProvider {
     async fn current_job(&self) -> Result<PoolJob> {
-        self.node
-            .mining_template(&self.pool_address)
-            .await?
-            .into_pool_job()
+        let template = self.node.mining_template(&self.pool_address).await?;
+        let mut job = template.clone().into_pool_job()?;
+        if !self.stateless_full {
+            return Ok(job);
+        }
+
+        let (slot, should_fetch) = self
+            .material_cache
+            .lock()
+            .expect("template material cache lock poisoned")
+            .slot_for(&template);
+        job.candidate_material = slot.clone();
+        if should_fetch {
+            let node = self.node.clone();
+            let job_id = template.job_id.clone();
+            let fetch_limit = self.material_fetch_limit.clone();
+            let material_cache = self.material_cache.clone();
+            let mut in_flight = self
+                .material_fetch
+                .lock()
+                .expect("template material fetch lock poisoned");
+            if let Some((previous_job_id, previous)) = in_flight.as_ref()
+                && previous_job_id != &job_id
+            {
+                previous.abort();
+                self.material_cache
+                    .lock()
+                    .expect("template material cache lock poisoned")
+                    .cancel_fetch(previous_job_id);
+            }
+            let task_job_id = job_id.clone();
+            let task = tokio::spawn(async move {
+                let material = match fetch_limit.acquire_owned().await {
+                    Ok(_permit) => match tokio::time::timeout(
+                        STATELESS_TEMPLATE_FETCH_TIMEOUT,
+                        node.mining_template_material(&task_job_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(full_template)) => match full_template.into_parts() {
+                            Ok((full_base, material)) if full_base == template => Some(material),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                material_cache
+                    .lock()
+                    .expect("template material cache lock poisoned")
+                    .finish_fetch(&template, &slot, material);
+            });
+            *in_flight = Some((job_id, task));
+        }
+        Ok(job)
     }
 
     async fn current_tip(&self) -> Result<Option<Hash32>> {
@@ -446,7 +768,11 @@ pub fn job_from_notify(
         coinbase_suffix,
         merkle_branch,
     };
-    Ok(PoolJob { notify, template })
+    Ok(PoolJob {
+        notify,
+        template,
+        candidate_material: Arc::new(RwLock::new(None)),
+    })
 }
 
 #[cfg(test)]
@@ -454,9 +780,25 @@ mod tests {
     use super::*;
     use axum::{
         Json, Router,
+        extract::State,
         http::{HeaderMap, StatusCode},
         routing::{get, post},
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn node_health_accepts_official_peer_count_field() {
+        let health: NodeHealth = serde_json::from_value(serde_json::json!({
+            "height": 59092,
+            "tip": format!("0x{}", "11".repeat(32)),
+            "chainwork": "160000",
+            "peer_count": 8,
+        }))
+        .unwrap();
+
+        assert_eq!(health.peers, Some(8));
+        assert_eq!(health.extra["peer_count"], serde_json::Value::Null);
+    }
 
     #[tokio::test]
     async fn sends_bearer_token_to_adapter_endpoints() {
@@ -536,6 +878,222 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn cached_candidate_submit_keeps_the_legacy_endpoint_and_body() {
+        async fn cached(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            assert_eq!(body["job_id"], "job1");
+            assert!(body.get("block_template_hex").is_none());
+            Json(serde_json::json!({"ok": true, "hash": body["hash_hex"]}))
+        }
+        async fn full() -> StatusCode {
+            panic!("legacy candidate submit must not call the full endpoint")
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/api/rpc/block/submit", post(cached))
+                    .route("/api/rpc/block/submit-full", post(full)),
+            )
+            .await
+            .unwrap();
+        });
+        let candidate = BlockCandidateSubmitRequest {
+            job_id: "job1".to_owned(),
+            worker_name: "worker".to_owned(),
+            header_hex: "aa".repeat(84),
+            hash_hex: "11".repeat(32),
+            coinbase_txid_hex: "22".repeat(32),
+            coinbase_hex: "44".repeat(80),
+            merkle_root_hex: "33".repeat(32),
+            extranonce2_hex: "01020304".to_owned(),
+            ntime_hex: "665544cc".to_owned(),
+            nonce_hex: "00000001".to_owned(),
+        };
+
+        let response = CsdNodeClient::new(format!("http://{address}"))
+            .submit_candidate(&candidate)
+            .await
+            .unwrap();
+        assert!(response.ok);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nonstateless_provider_only_fetches_the_compact_template() {
+        async fn compact() -> Json<NodeMiningTemplate> {
+            Json(NodeMiningTemplate {
+                job_id: "job1".to_owned(),
+                prev_hash_be_hex: "00".repeat(32),
+                coinb1_hex: "aa".to_owned(),
+                coinb2_hex: "bb".to_owned(),
+                merkle_branches_hex: vec![],
+                version_hex: "20000000".to_owned(),
+                nbits_hex: "207fffff".to_owned(),
+                ntime_hex: "665544cc".to_owned(),
+                clean_jobs: true,
+                share_target_hex: "ff".repeat(32),
+                network_target_hex: "00".repeat(32),
+            })
+        }
+        async fn material() -> StatusCode {
+            panic!("nonstateless provider must not request template material")
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/api/rpc/mining/template", get(compact))
+                    .route("/api/rpc/mining/template-material", get(material)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let provider = LiveTemplateProvider::new(
+            CsdNodeClient::new(format!("http://{address}")),
+            "00".repeat(20),
+        );
+        let job = provider.current_job().await.unwrap();
+        assert_eq!(job.template.job_id, "job1");
+        assert!(job.candidate_material.read().unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stateless_provider_retries_material_after_transient_failure() {
+        #[derive(Clone)]
+        struct MaterialState {
+            calls: Arc<AtomicUsize>,
+        }
+
+        async fn compact() -> Json<NodeMiningTemplate> {
+            Json(NodeMiningTemplate {
+                job_id: "job1".to_owned(),
+                prev_hash_be_hex: "00".repeat(32),
+                coinb1_hex: "aa".to_owned(),
+                coinb2_hex: "bb".to_owned(),
+                merkle_branches_hex: vec![],
+                version_hex: "20000000".to_owned(),
+                nbits_hex: "207fffff".to_owned(),
+                ntime_hex: "665544cc".to_owned(),
+                clean_jobs: true,
+                share_target_hex: "ff".repeat(32),
+                network_target_hex: "00".repeat(32),
+            })
+        }
+
+        async fn material(
+            State(state): State<MaterialState>,
+        ) -> std::result::Result<Json<StatelessNodeMiningTemplate>, StatusCode> {
+            if state.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            let bytes = b"official-template-material";
+            Ok(Json(StatelessNodeMiningTemplate {
+                template: compact().await.0,
+                block_template_hex: hex::encode(bytes),
+                block_template_sha256_hex: hex::encode(Sha256::digest(bytes)),
+                block_template_bytes: bytes.len() as u64,
+            }))
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn({
+            let calls = calls.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/api/rpc/mining/template", get(compact))
+                        .route("/api/rpc/mining/template-material", get(material))
+                        .with_state(MaterialState { calls }),
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let provider = LiveTemplateProvider::new_stateless(
+            CsdNodeClient::new(format!("http://{address}")),
+            "00".repeat(20),
+        );
+        let first = provider.current_job().await.unwrap();
+        assert!(first.candidate_material.read().unwrap().is_none());
+
+        let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let job = provider.current_job().await.unwrap();
+                if job.candidate_material.read().unwrap().is_some() {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transient material failure should be retried");
+
+        let material = recovered
+            .candidate_material
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(material.block_template_bytes, 26);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chunked_template_material_response_is_stopped_at_the_body_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunk = vec![b'a'; 1024 * 1024];
+            for _ in 0..5 {
+                if stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if stream.write_all(&chunk).await.is_err()
+                    || stream.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+
+        let error = CsdNodeClient::new(format!("http://{address}"))
+            .mining_template_material("job1")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NodeError::InvalidResponse(_)));
+        server.await.unwrap();
+    }
+
     #[test]
     fn builds_easy_static_job() {
         let job = easy_static_job("job1");
@@ -603,6 +1161,111 @@ mod tests {
         assert_eq!(json["job_id"], "job1");
         assert_eq!(json["header_hex"].as_str().unwrap().len(), 168);
         assert_eq!(json["coinbase_hex"].as_str().unwrap().len(), 160);
+        assert!(json.get("block_template_hex").is_none());
+    }
+
+    #[test]
+    fn validates_opaque_candidate_template_material() {
+        let bytes = b"official-consensus-bincode-is-opaque-to-the-pool";
+        let digest = hex::encode(Sha256::digest(bytes));
+        let template = StatelessNodeMiningTemplate {
+            template: NodeMiningTemplate {
+                job_id: "job1".to_owned(),
+                prev_hash_be_hex: "00".repeat(32),
+                coinb1_hex: "aa".to_owned(),
+                coinb2_hex: "bb".to_owned(),
+                merkle_branches_hex: vec![],
+                version_hex: "20000000".to_owned(),
+                nbits_hex: "207fffff".to_owned(),
+                ntime_hex: "665544cc".to_owned(),
+                clean_jobs: true,
+                share_target_hex: "ff".repeat(32),
+                network_target_hex: "00".repeat(32),
+            },
+            block_template_hex: hex::encode(bytes),
+            block_template_sha256_hex: digest.clone(),
+            block_template_bytes: bytes.len() as u64,
+        };
+
+        let job = template.into_pool_job().unwrap();
+        let material = job.candidate_material.read().unwrap().clone().unwrap();
+        assert_eq!(material.block_template_sha256_hex, digest);
+        assert_eq!(material.block_template_bytes, bytes.len() as u64);
+    }
+
+    #[test]
+    fn tip_churn_keeps_base_jobs_but_bounds_material_slots() {
+        let template = |job_id: String| NodeMiningTemplate {
+            job_id,
+            prev_hash_be_hex: "00".repeat(32),
+            coinb1_hex: "aa".to_owned(),
+            coinb2_hex: "bb".to_owned(),
+            merkle_branches_hex: vec![],
+            version_hex: "20000000".to_owned(),
+            nbits_hex: "207fffff".to_owned(),
+            ntime_hex: "665544cc".to_owned(),
+            clean_jobs: true,
+            share_target_hex: "ff".repeat(32),
+            network_target_hex: "00".repeat(32),
+        };
+        let mut cache = TemplateMaterialCache::default();
+        let mut retained_jobs = Vec::new();
+        for index in 0..=12 {
+            let node_template = template(format!("job-{index}"));
+            let (slot, _) = cache.slot_for(&node_template);
+            *slot.write().unwrap() = Some(Arc::new(CandidateTemplateMaterial {
+                block_template_hex: format!("{index:02x}"),
+                block_template_sha256_hex: hex::encode(Sha256::digest([index as u8])),
+                block_template_bytes: 1,
+            }));
+            let mut retained_job = node_template.into_pool_job().unwrap();
+            retained_job.candidate_material = slot;
+            retained_jobs.push(retained_job);
+        }
+
+        assert_eq!(retained_jobs.len(), 13);
+        assert!(
+            retained_jobs[0]
+                .candidate_material
+                .read()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(retained_jobs[0].template.job_id, "job-0");
+        assert_eq!(retained_jobs[0].template.share_target, [0xff; 32]);
+        assert_eq!(
+            retained_jobs
+                .iter()
+                .filter(|job| job.candidate_material.read().unwrap().is_some())
+                .count(),
+            MAX_STATELESS_TEMPLATE_CACHE_ENTRIES
+        );
+        assert!(!cache.entries.contains_key("job-0"));
+        assert_eq!(cache.entries.len(), MAX_STATELESS_TEMPLATE_CACHE_ENTRIES);
+    }
+
+    #[test]
+    fn rejects_partial_or_mismatched_candidate_template_material() {
+        assert!(candidate_template_material(Some("00"), None, Some(1)).is_err());
+        let template = StatelessNodeMiningTemplate {
+            template: NodeMiningTemplate {
+                job_id: "job1".to_owned(),
+                prev_hash_be_hex: "00".repeat(32),
+                coinb1_hex: "aa".to_owned(),
+                coinb2_hex: "bb".to_owned(),
+                merkle_branches_hex: vec![],
+                version_hex: "20000000".to_owned(),
+                nbits_hex: "207fffff".to_owned(),
+                ntime_hex: "665544cc".to_owned(),
+                clean_jobs: true,
+                share_target_hex: "ff".repeat(32),
+                network_target_hex: "00".repeat(32),
+            },
+            block_template_hex: "00".to_owned(),
+            block_template_sha256_hex: "11".repeat(32),
+            block_template_bytes: 1,
+        };
+        assert!(template.into_pool_job().is_err());
     }
 
     #[test]

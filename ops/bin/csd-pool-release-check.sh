@@ -33,6 +33,30 @@ require_executable() {
   fi
 }
 
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+require_sha256() {
+  local path="$1"
+  local expected="$2"
+  local actual
+  if [[ ! -f "$ROOT_DIR/$path" ]]; then
+    fail "$path sha256 unavailable: file missing"
+    return
+  fi
+  actual="$(sha256_file "$ROOT_DIR/$path")"
+  if [[ "$actual" == "$expected" ]]; then
+    ok "$path sha256 matches $expected"
+  else
+    fail "$path sha256 mismatch: expected $expected, got $actual"
+  fi
+}
+
 require_text() {
   local path="$1"
   local pattern="$2"
@@ -102,12 +126,19 @@ require_file "ops/RELEASE-CHECKLIST.md"
 require_file "ops/INCIDENT-RUNBOOK.md"
 require_file ".github/workflows/ci.yml"
 require_file "docker-compose.yml"
+require_file "migrations/0011_block_candidate_relay_failure.sql"
+require_text "migrations/0011_block_candidate_relay_failure.sql" "submitted_secondary"
+require_text "migrations/0011_block_candidate_relay_failure.sql" "submitted_degraded"
+require_text "migrations/0011_block_candidate_relay_failure.sql" "relay_failed"
+require_text "migrations/0011_block_candidate_relay_failure.sql" "blocks_relay_failed_idx"
 require_executable "ops/bin/csd-pool-build-release.sh"
 require_executable "ops/bin/csd-pool-ci-local.sh"
 require_executable "ops/bin/csd-pool-dev-env.sh"
 require_executable "ops/bin/csd-pool-install-release-self-test.sh"
 require_executable "ops/bin/csd-pool-install-release.sh"
 require_executable "ops/bin/csd-pool-rollback-release.sh"
+require_executable "ops/bin/csd-pool-stateless-candidate-canary-gate.py"
+require_executable "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py"
 require_executable "ops/bin/csd-pool-generate-env.sh"
 require_executable "ops/bin/csd-pool-preflight.sh"
 require_executable "ops/bin/csd-pool-verify.sh"
@@ -1011,23 +1042,82 @@ require_file "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch"
 require_file "ops/csd-node-adapter/MANIFEST.txt"
 require_executable "ops/csd-node-adapter/apply-and-build.sh"
 require_text "ops/csd-node-adapter/MANIFEST.txt" "commit=d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c"
-require_text "ops/csd-node-adapter/MANIFEST.txt" "patch_sha256=264dae8654edb876c8abab07d3dc5fb01e1d0ef463d4e6ea28a29f6ef960fd44"
-require_text "ops/csd-node-adapter/MANIFEST.txt" "p2p_patch_sha256=cb56d3625876cff5fc2f8ad4833405631b47f073d89217e9b93647f99a394bb3"
+require_text "ops/csd-node-adapter/MANIFEST.txt" "patch_sha256=265dfdc620453606b5ff6d4222327056c9bcdf713a3f28827f6932c6aae67dc4"
+require_text "ops/csd-node-adapter/MANIFEST.txt" "p2p_patch_sha256=51dd08cc9cfc0a4539afa67558c1ae005c165d615223e825e75130352eec2075"
+require_text "ops/csd-node-adapter/MANIFEST.txt" "build_script_sha256=80370b68b1f68bce8b88c7496ac081b27c0352f4cbf9eda1eaca9278357815f9"
+require_sha256 "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" "265dfdc620453606b5ff6d4222327056c9bcdf713a3f28827f6932c6aae67dc4"
+require_sha256 "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" "51dd08cc9cfc0a4539afa67558c1ae005c165d615223e825e75130352eec2075"
+require_sha256 "ops/csd-node-adapter/apply-and-build.sh" "80370b68b1f68bce8b88c7496ac081b27c0352f4cbf9eda1eaca9278357815f9"
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'CSD_POOL_ADAPTER_TOKEN'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/rpc/mining/template'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/rpc/mining/template-material'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/rpc/block/submit'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/rpc/block/submit-full'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'node_observability'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'relay_enqueue_elapsed_us'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'persist_index_flush_then_apply'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'accepted_relay_recovered'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'two_official_http_adapters_replay_primary_material_with_secondary_empty_cache'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'p2p_first_canonical_candidate_requires_relay_ack'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'local_canonical_relay_failure_is_retried_before_duplicate_success'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'duplicate_publish_is_idempotent_not_a_new_broadcast'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'actual_gossipsub_peer_ack_corresponds_to_delivered_header'
+require_no_regex \
+  "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" \
+  '^\+.*pool:relay-state' \
+  "adapter patch does not cache relay success instead of requiring a fresh ACK"
 require_text "crates/csd-pool-bridge/src/lib.rs" 'CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'BLOCKED_JOB_CACHE_AFFINITY'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'CSD_POOL_STATELESS_PARALLEL_CANDIDATE_SUBMIT_ENABLED'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'CSD_POOL_STATELESS_PARALLEL_CANDIDATE_LATCH_PATH'
 require_text "crates/csd-pool-bridge/src/lib.rs" 'chain_state_mismatch'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'parallel_submit_bounds_both_node_timeouts'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'health_drift_after_claim_skips_secondary_and_consumes_latch'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'parallel_submit_reports_secondary_success_without_overriding_primary_failure'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'secondary_only_success_persists_status_and_operator_alert'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'persistent_latch_rejects_unsafe_writable_parent'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'slow_latch_persistence_is_bounded_and_fails_closed'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'parallel_submit_skips_secondary_without_relay_peers_or_latch_claim'
+require_text "crates/csd-pool-node/src/lib.rs" 'stateless_provider_retries_material_after_transient_failure'
+require_text "crates/csd-pool-node/src/lib.rs" 'node_health_accepts_official_peer_count_field'
+require_text "crates/csd-pool-db/src/lib.rs" 'candidate_status_distinguishes_rejection_from_ambiguous_transport_failure'
 require_text "ops/env/csd-pool.env.example" 'CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED=false'
+require_text "ops/env/csd-pool.env.example" 'CSD_POOL_STATELESS_PARALLEL_CANDIDATE_SUBMIT_ENABLED=false'
+require_text "ops/env/csd-pool.env.example" 'CSD_POOL_STATELESS_PARALLEL_CANDIDATE_LATCH_PATH=/var/lib/csd-pool/stateless-candidate-canary.latch'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate.py" 'PASS_LOCAL_EVIDENCE_GATE'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate.py" 'production_change_authorized=false'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate.py" 'MAX_CPU_PERCENT = 20.0'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate.py" 'MAX_FD = 1_000'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate.py" 'MAX_PG_CONNECTIONS = 60'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate.py" 'rollback.disable_stateless_before_restart'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_tampered_config_snapshot_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_rollback_snapshot_stateless_enabled_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_rollback_snapshot_legacy_parallel_enabled_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_rollback_snapshot_primary_label_mismatch_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_rollback_snapshot_duplicate_control_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_rollback_snapshot_world_readable_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_rollback_snapshot_command_line_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_rollback_snapshot_control_character_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_expired_production_snapshot_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_future_production_snapshot_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_malformed_production_snapshot_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_widened_snapshot_age_policy_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_ab_tip_mismatch_fails'
+require_text "ops/bin/csd-pool-stateless-candidate-canary-gate-self-test.py" 'test_zero_node_peers_fails'
 require_file "docs/validation/candidate-parallel-submit-canary-20260721.md"
-require_text "docs/validation/candidate-parallel-submit-canary-20260721.md" 'node-a remains authoritative'
+require_text "docs/validation/candidate-parallel-submit-canary-20260721.md" 'BLOCKED_JOB_CACHE_AFFINITY'
+require_text "docs/validation/candidate-parallel-submit-canary-20260721.md" 'CSD_POOL_STATELESS_PARALLEL_CANDIDATE_SUBMIT_ENABLED=false'
+require_text "docs/validation/candidate-parallel-submit-canary-20260721.md" 'submitted_secondary'
+require_text "docs/validation/candidate-parallel-submit-canary-20260721.md" 'Local PASS never authorizes production.'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'choose_pool_block_time'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'let time = now.max(min_ok);'
 require_text "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" 'ADDR_BACKOFF_RETENTION_SECS'
 require_text "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" 'dial_failed peer='
 require_text "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" 'addr_dial_is_pending'
+require_text "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" 'PENDING_DIAL_RETENTION_SECS'
+require_text "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" 'record_dial_submission'
+require_text "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" 'synchronous_dial_failure_enters_backoff_without_pending_state'
+require_text "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" 'expired_pending_dial_does_not_block_retry'
 require_no_regex \
   "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" \
   '^\+.*choose_block_time\(&st\.db' \

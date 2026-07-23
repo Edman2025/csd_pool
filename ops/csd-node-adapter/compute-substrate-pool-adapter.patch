@@ -1,40 +1,23 @@
 --- a/src/api/mod.rs
 +++ b/src/api/mod.rs
-@@ -2,6 +2,7 @@
- 
- use axum::{
-     extract::{Path, Query, State},
+@@ -4 +4,2 @@
+-    extract::{Path, Query, State},
++    extract::{DefaultBodyLimit, Path, Query, State},
 +    http::{HeaderMap, StatusCode},
-     routing::{get, post},
-     Json, Router,
- };
-@@ -12,15 +13,21 @@
- use std::collections::{HashMap, HashSet};
- 
- use crate::chain::index::{get_hidx, HeaderIndex};
+@@ -14,0 +16,4 @@
 +use crate::chain::index::{header_hash, index_header};
 +use crate::chain::lock::ChainLock;
 +use crate::chain::pow::{bits_to_target_bytes, expected_bits, pow_ok};
 +use crate::chain::reorg::maybe_reorg_to;
- use crate::crypto::{sighash, txid};
- use crate::net::mempool::{Mempool, MempoolStats};
- use crate::net::GossipTxEvent;
- use crate::params::GENESIS_HASH;
- use crate::state::app_state::{get_proposal, get_topk, k_proposal, Attestation, Proposal};
- use crate::state::db::{get_tip, get_utxo_meta, k_block, Stores};
+@@ -21 +26 @@
 -use crate::types::{AppPayload, Block, Hash32, OutPoint, Transaction, TxOut};
 +use crate::types::{AppPayload, Block, BlockHeader, Hash20, Hash32, OutPoint, Transaction, TxOut};
- use libp2p::PeerId;
- use std::sync::atomic::{AtomicUsize, Ordering};
+@@ -22,0 +28 @@
++use sha2::{Digest, Sha256};
+@@ -23,0 +30,2 @@
 +use std::sync::RwLock;
 +use std::time::{Instant, SystemTime, UNIX_EPOCH};
- 
- fn c() -> crate::codec::ConsensusBincode {
-     crate::codec::consensus_bincode()
-@@ -35,6 +42,60 @@
-     pub connected_peers: Arc<AtomicUsize>,
-     pub known_peers: Arc<AtomicUsize>,
-     pub peer_id: PeerId,
+@@ -37,0 +46,37 @@
 +    pub chain_lock: ChainLock,
 +    pub mined_headers: tokio::sync::mpsc::UnboundedSender<crate::net::MinedHeaderEvent>,
 +    pool_jobs: Arc<RwLock<HashMap<String, PoolMiningJob>>>,
@@ -46,6 +29,7 @@
 +    coinb1: Vec<u8>,
 +    coinb2: Vec<u8>,
 +    height: u64,
++    template: PoolTemplateResp,
 +}
 +
 +#[derive(Deserialize)]
@@ -53,7 +37,7 @@
 +    address: String,
 +}
 +
-+#[derive(Serialize)]
++#[derive(Clone, Serialize)]
 +struct PoolTemplateResp {
 +    job_id: String,
 +    prev_hash_be_hex: String,
@@ -69,12 +53,33 @@
 +}
 +
 +#[derive(Deserialize)]
++struct PoolTemplateMaterialQuery {
++    job_id: String,
+@@ -40,0 +86,41 @@
++struct PoolTemplateMaterialResp {
++    #[serde(flatten)]
++    template: PoolTemplateResp,
++    block_template_hex: String,
++    block_template_sha256_hex: String,
++    block_template_bytes: u64,
++}
++
++#[derive(Clone, Deserialize, Serialize)]
 +struct PoolCandidateReq {
 +    job_id: String,
 +    header_hex: String,
 +    hash_hex: String,
 +    coinbase_txid_hex: String,
 +    coinbase_hex: String,
++}
++
++#[derive(Clone, Deserialize, Serialize)]
++struct PoolFullCandidateReq {
++    #[serde(flatten)]
++    candidate: PoolCandidateReq,
++    block_template_hex: String,
++    block_template_sha256_hex: String,
++    block_template_bytes: u64,
 +}
 +
 +#[derive(Serialize)]
@@ -89,40 +94,37 @@
 +#[derive(Deserialize)]
 +struct PoolBlockStatusQuery {
 +    hash: String,
- }
- 
- #[derive(Serialize)]
-@@ -350,6 +411,8 @@
-     connected_peers: Arc<AtomicUsize>,
-     known_peers: Arc<AtomicUsize>,
-     peer_id: PeerId,
++}
++
++#[derive(Serialize)]
+@@ -352,0 +439,2 @@
 +    chain_lock: ChainLock,
 +    mined_headers: tokio::sync::mpsc::UnboundedSender<crate::net::MinedHeaderEvent>,
- ) -> Router {
-     let st = ApiState {
-         db,
-@@ -358,6 +421,9 @@
-         connected_peers,
-         known_peers,
-         peer_id,
+@@ -360,0 +449,3 @@
 +        chain_lock,
 +        mined_headers,
 +        pool_jobs: Arc::new(RwLock::new(HashMap::new())),
-     };
- 
-     Router::new()
-@@ -407,9 +473,439 @@
-         .route("/tx/template/attest", post(tx_template_attest))
-         // Optional write endpoint:
-         .route("/tx/submit", post(tx_submit))
+@@ -409,0 +501,13 @@
 +        .route("/api/network", get(pool_network))
 +        .route("/api/rpc/mining/template", get(pool_mining_template))
++        .route(
++            "/api/rpc/mining/template-material",
++            get(pool_mining_template_material),
++        )
 +        .route("/api/rpc/block/submit", post(pool_block_submit))
++        .route(
++            "/api/rpc/block/submit-full",
++            post(pool_block_submit_full)
++                .layer(DefaultBodyLimit::max(MAX_STATELESS_FULL_BODY_BYTES)),
++        )
 +        .route("/api/rpc/block/status", get(pool_block_status))
-         .with_state(st)
-+}
-+
+@@ -412,0 +517,741 @@
 +type PoolApiError = (StatusCode, Json<serde_json::Value>);
++const POOL_EXTRANONCE_PLACEHOLDER: [u8; 8] =
++    [0xfa, 0xce, 0xb0, 0x0c, 0xc5, 0xd0, 0x0d, 0x01];
++const MAX_STATELESS_TEMPLATE_HEX_LEN: usize = crate::params::MAX_BLOCK_BYTES * 2;
++const MAX_STATELESS_FULL_BODY_BYTES: usize = MAX_STATELESS_TEMPLATE_HEX_LEN + 512 * 1024;
++const POOL_HEADER_RELAY_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 +
 +fn pool_api_auth(headers: &HeaderMap) -> Result<(), PoolApiError> {
 +    let expected = std::env::var("CSD_POOL_ADAPTER_TOKEN").unwrap_or_default();
@@ -180,8 +182,8 @@
 +        layer = next;
 +    }
 +    branch
- }
- 
++}
++
 +async fn pool_network(headers: HeaderMap) -> Result<Json<serde_json::Value>, PoolApiError> {
 +    pool_api_auth(&headers)?;
 +    Ok(Json(serde_json::json!({
@@ -216,15 +218,19 @@
 +        crate::chain::mine::build_template(&st.db, &st.mempool, miner, height, 500)
 +            .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 +
-+    const PLACEHOLDER: [u8; 8] = [0xfa, 0xce, 0xb0, 0x0c, 0xc5, 0xd0, 0x0d, 0x01];
-+    txs[0].inputs[0].script_sig.extend_from_slice(&PLACEHOLDER);
++    txs[0]
++        .inputs[0]
++        .script_sig
++        .extend_from_slice(&POOL_EXTRANONCE_PLACEHOLDER);
 +    let coinbase_bytes = c()
 +        .serialize(&txs[0])
 +        .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 +    let positions = coinbase_bytes
-+        .windows(PLACEHOLDER.len())
++        .windows(POOL_EXTRANONCE_PLACEHOLDER.len())
 +        .enumerate()
-+        .filter_map(|(index, bytes)| (bytes == PLACEHOLDER).then_some(index))
++        .filter_map(|(index, bytes)| {
++            (bytes == POOL_EXTRANONCE_PLACEHOLDER).then_some(index)
++        })
 +        .collect::<Vec<_>>();
 +    if positions.len() != 1 {
 +        return Err(pool_api_error(
@@ -234,7 +240,7 @@
 +    }
 +    let split = positions[0];
 +    let coinb1 = coinbase_bytes[..split].to_vec();
-+    let coinb2 = coinbase_bytes[split + PLACEHOLDER.len()..].to_vec();
++    let coinb2 = coinbase_bytes[split + POOL_EXTRANONCE_PLACEHOLDER.len()..].to_vec();
 +    let time = crate::chain::mine::choose_pool_block_time(&st.db, &parent, parent_hi.as_ref())
 +        .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 +    if time > u64::from(u32::MAX) {
@@ -259,6 +265,24 @@
 +    let job_id = hex::encode(header_hash(&block.header));
 +    let txids = block.txs.iter().map(txid).collect::<Vec<_>>();
 +    let branches = pool_merkle_branch(&txids);
++    let mut prev_be = parent;
++    prev_be.reverse();
++    let mut pdiff1 = [0u8; 32];
++    pdiff1[4] = 0xff;
++    pdiff1[5] = 0xff;
++    let response = PoolTemplateResp {
++        job_id: job_id.clone(),
++        prev_hash_be_hex: hex::encode(prev_be),
++        coinb1_hex: hex::encode(&coinb1),
++        coinb2_hex: hex::encode(&coinb2),
++        merkle_branches_hex: branches.iter().map(hex::encode).collect(),
++        version_hex: format!("{:08x}", 1u32),
++        nbits_hex: format!("{bits:08x}"),
++        ntime_hex: format!("{:08x}", time as u32),
++        clean_jobs: true,
++        share_target_hex: hex::encode(pdiff1),
++        network_target_hex: hex::encode(bits_to_target_bytes(bits)),
++    };
 +    {
 +        let mut jobs = st.pool_jobs.write().map_err(|_| {
 +            pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, "pool job cache poisoned")
@@ -274,26 +298,40 @@
 +                coinb1: coinb1.clone(),
 +                coinb2: coinb2.clone(),
 +                height,
++                template: response.clone(),
 +            },
 +        );
 +    }
-+    let mut prev_be = parent;
-+    prev_be.reverse();
-+    let mut pdiff1 = [0u8; 32];
-+    pdiff1[4] = 0xff;
-+    pdiff1[5] = 0xff;
-+    Ok(Json(PoolTemplateResp {
-+        job_id,
-+        prev_hash_be_hex: hex::encode(prev_be),
-+        coinb1_hex: hex::encode(coinb1),
-+        coinb2_hex: hex::encode(coinb2),
-+        merkle_branches_hex: branches.iter().map(hex::encode).collect(),
-+        version_hex: format!("{:08x}", 1u32),
-+        nbits_hex: format!("{bits:08x}"),
-+        ntime_hex: format!("{:08x}", time as u32),
-+        clean_jobs: true,
-+        share_target_hex: hex::encode(pdiff1),
-+        network_target_hex: hex::encode(bits_to_target_bytes(bits)),
++    Ok(Json(response))
++}
++
++async fn pool_mining_template_material(
++    headers: HeaderMap,
++    Query(query): Query<PoolTemplateMaterialQuery>,
++    State(st): State<ApiState>,
++) -> Result<Json<PoolTemplateMaterialResp>, PoolApiError> {
++    pool_api_auth(&headers)?;
++    let job = st
++        .pool_jobs
++        .read()
++        .map_err(|_| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, "pool job cache poisoned"))?
++        .get(&query.job_id)
++        .cloned()
++        .ok_or_else(|| pool_api_error(StatusCode::CONFLICT, "stale or unknown pool job"))?;
++    let bytes = c()
++        .serialize(&job.block)
++        .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
++    if bytes.len() > crate::params::MAX_BLOCK_BYTES {
++        return Err(pool_api_error(
++            StatusCode::INTERNAL_SERVER_ERROR,
++            "cached pool block exceeds consensus size limit",
++        ));
++    }
++    Ok(Json(PoolTemplateMaterialResp {
++        template: job.template,
++        block_template_hex: hex::encode(&bytes),
++        block_template_sha256_hex: hex::encode(Sha256::digest(&bytes)),
++        block_template_bytes: bytes.len() as u64,
 +    }))
 +}
 +
@@ -321,6 +359,25 @@
 +    value.strip_prefix("0x").unwrap_or(value)
 +}
 +
++fn canonical_chain_contains(db: &Stores, tip: &Hash32, wanted: &Hash32) -> anyhow::Result<bool> {
++    let Some(wanted_header) = get_hidx(db, wanted)? else {
++        return Ok(false);
++    };
++    let Some(mut cursor) = get_hidx(db, tip)? else {
++        return Ok(false);
++    };
++    if cursor.height < wanted_header.height {
++        return Ok(false);
++    }
++    while cursor.height > wanted_header.height {
++        let Some(parent) = get_hidx(db, &cursor.parent)? else {
++            return Ok(false);
++        };
++        cursor = parent;
++    }
++    Ok(cursor.hash == *wanted)
++}
++
 +async fn pool_block_submit(
 +    headers: HeaderMap,
 +    State(st): State<ApiState>,
@@ -341,11 +398,106 @@
 +        .get(&request.job_id)
 +        .cloned()
 +        .ok_or_else(|| pool_api_error(StatusCode::CONFLICT, "stale or unknown pool job"))?;
++    let block = assemble_pool_block(job.block, &job.coinb1, &job.coinb2, &request)?;
++    apply_pool_block(&st, block, request_started, request_received_unix_ms).await
++}
++
++async fn pool_block_submit_full(
++    headers: HeaderMap,
++    State(st): State<ApiState>,
++    Json(request): Json<PoolFullCandidateReq>,
++) -> Result<Json<PoolBlockResp>, PoolApiError> {
++    pool_api_auth(&headers)?;
++    let request_started = Instant::now();
++    let request_received_unix_ms = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_millis()
++        .try_into()
++        .unwrap_or(u64::MAX);
++    let encoded = normalized_hash(&request.block_template_hex);
++    if encoded.len() > MAX_STATELESS_TEMPLATE_HEX_LEN || encoded.len() % 2 != 0 {
++        return Err(pool_api_error(
++            StatusCode::PAYLOAD_TOO_LARGE,
++            "block_template_hex exceeds the encoded consensus limit or has odd length",
++        ));
++    }
++    let template_bytes = hex::decode(encoded)
++        .map_err(|_| pool_api_error(StatusCode::BAD_REQUEST, "block_template_hex is invalid"))?;
++    if template_bytes.len() > crate::params::MAX_BLOCK_BYTES
++        || request.block_template_bytes != template_bytes.len() as u64
++    {
++        return Err(pool_api_error(
++            StatusCode::BAD_REQUEST,
++            "block template byte length mismatch",
++        ));
++    }
++    let digest = hex::encode(Sha256::digest(&template_bytes));
++    if !digest.eq_ignore_ascii_case(normalized_hash(
++        &request.block_template_sha256_hex,
++    )) {
++        return Err(pool_api_error(
++            StatusCode::BAD_REQUEST,
++            "block template sha256 mismatch",
++        ));
++    }
++    let template: Block = c().deserialize(&template_bytes).map_err(|error| {
++        pool_api_error(
++            StatusCode::BAD_REQUEST,
++            format!("block template decode failed: {error}"),
++        )
++    })?;
++    if c().serialize(&template).ok().as_deref() != Some(template_bytes.as_slice()) {
++        return Err(pool_api_error(
++            StatusCode::BAD_REQUEST,
++            "block template encoding is not canonical",
++        ));
++    }
++    if !hex::encode(header_hash(&template.header))
++        .eq_ignore_ascii_case(normalized_hash(&request.candidate.job_id))
++    {
++        return Err(pool_api_error(
++            StatusCode::CONFLICT,
++            "job_id does not bind the canonical block template",
++        ));
++    }
++    let template_coinbase = template.txs.first().ok_or_else(|| {
++        pool_api_error(StatusCode::BAD_REQUEST, "block template has no coinbase")
++    })?;
++    let template_coinbase_bytes = c()
++        .serialize(template_coinbase)
++        .map_err(|error| pool_api_error(StatusCode::BAD_REQUEST, error))?;
++    let positions = template_coinbase_bytes
++        .windows(POOL_EXTRANONCE_PLACEHOLDER.len())
++        .enumerate()
++        .filter_map(|(index, bytes)| {
++            (bytes == POOL_EXTRANONCE_PLACEHOLDER).then_some(index)
++        })
++        .collect::<Vec<_>>();
++    if positions.len() != 1 {
++        return Err(pool_api_error(
++            StatusCode::BAD_REQUEST,
++            "block template coinbase placeholder is not unique",
++        ));
++    }
++    let split = positions[0];
++    let coinb1 = &template_coinbase_bytes[..split];
++    let coinb2 = &template_coinbase_bytes[split + POOL_EXTRANONCE_PLACEHOLDER.len()..];
++    let block = assemble_pool_block(template, coinb1, coinb2, &request.candidate)?;
++    apply_pool_block(&st, block, request_started, request_received_unix_ms).await
++}
++
++fn assemble_pool_block(
++    mut block: Block,
++    coinb1: &[u8],
++    coinb2: &[u8],
++    request: &PoolCandidateReq,
++) -> Result<Block, PoolApiError> {
 +    let coinbase_bytes = hex::decode(normalized_hash(&request.coinbase_hex))
 +        .map_err(|_| pool_api_error(StatusCode::BAD_REQUEST, "coinbase_hex is invalid"))?;
-+    if coinbase_bytes.len() != job.coinb1.len() + 8 + job.coinb2.len()
-+        || !coinbase_bytes.starts_with(&job.coinb1)
-+        || !coinbase_bytes.ends_with(&job.coinb2)
++    if coinbase_bytes.len() != coinb1.len() + 8 + coinb2.len()
++        || !coinbase_bytes.starts_with(coinb1)
++        || !coinbase_bytes.ends_with(coinb2)
 +    {
 +        return Err(pool_api_error(
 +            StatusCode::BAD_REQUEST,
@@ -364,8 +516,8 @@
 +            "coinbase encoding is not canonical",
 +        ));
 +    }
-+    let coinbase_txid = txid(&coinbase);
-+    if !hex::encode(coinbase_txid).eq_ignore_ascii_case(normalized_hash(&request.coinbase_txid_hex))
++    if !hex::encode(txid(&coinbase))
++        .eq_ignore_ascii_case(normalized_hash(&request.coinbase_txid_hex))
 +    {
 +        return Err(pool_api_error(
 +            StatusCode::BAD_REQUEST,
@@ -374,21 +526,22 @@
 +    }
 +    let header = decode_pool_header(&request.header_hex)
 +        .map_err(|error| pool_api_error(StatusCode::BAD_REQUEST, error))?;
-+    if header.version != job.block.header.version
-+        || header.prev != job.block.header.prev
-+        || header.time != job.block.header.time
-+        || header.bits != job.block.header.bits
++    if header.version != block.header.version
++        || header.prev != block.header.prev
++        || header.time != block.header.time
++        || header.bits != block.header.bits
 +    {
 +        return Err(pool_api_error(
 +            StatusCode::CONFLICT,
 +            "header fixed fields do not match pool job",
 +        ));
 +    }
-+    let mut block = job.block.clone();
-+    block.txs[0] = coinbase;
++    let Some(first) = block.txs.first_mut() else {
++        return Err(pool_api_error(StatusCode::BAD_REQUEST, "pool job has no coinbase"));
++    };
++    *first = coinbase;
 +    block.header = header;
-+    let merkle = crate::chain::mine::merkle_root(&block.txs);
-+    if block.header.merkle != merkle {
++    if block.header.merkle != crate::chain::mine::merkle_root(&block.txs) {
 +        return Err(pool_api_error(
 +            StatusCode::BAD_REQUEST,
 +            "block merkle root mismatch",
@@ -396,10 +549,7 @@
 +    }
 +    let hash = header_hash(&block.header);
 +    if !hex::encode(hash).eq_ignore_ascii_case(normalized_hash(&request.hash_hex)) {
-+        return Err(pool_api_error(
-+            StatusCode::BAD_REQUEST,
-+            "block hash mismatch",
-+        ));
++        return Err(pool_api_error(StatusCode::BAD_REQUEST, "block hash mismatch"));
 +    }
 +    if !pow_ok(&hash, block.header.bits) {
 +        return Err(pool_api_error(
@@ -407,11 +557,150 @@
 +            "block proof of work failed",
 +        ));
 +    }
++    Ok(block)
++}
 +
++fn persist_index_flush_then_apply<E>(
++    insert: impl FnOnce() -> Result<(), E>,
++    index: impl FnOnce() -> Result<(), E>,
++    flush: impl FnOnce() -> Result<(), E>,
++    apply: impl FnOnce() -> Result<(), E>,
++) -> Result<(), E> {
++    insert()?;
++    index()?;
++    flush()?;
++    apply()
++}
++
++fn relay_failure(status: &str, error: impl Into<String>) -> crate::net::MinedHeaderPublishAck {
++    crate::net::MinedHeaderPublishAck {
++        ok: false,
++        status: status.to_string(),
++        message_id: None,
++        error: Some(error.into()),
++        idempotent: false,
++    }
++}
++
++async fn relay_pool_header_with_timeout(
++    mined_headers: &tokio::sync::mpsc::UnboundedSender<crate::net::MinedHeaderEvent>,
++    hash: Hash32,
++    header: BlockHeader,
++    ack_timeout: std::time::Duration,
++) -> (bool, crate::net::MinedHeaderPublishAck) {
++    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
++    let queued = mined_headers
++        .send(crate::net::MinedHeaderEvent {
++            hash,
++            header,
++            ack: Some(ack_tx),
++        })
++        .is_ok();
++    if !queued {
++        return (
++            false,
++            relay_failure(
++                "relay_receiver_closed",
++                "mined header relay receiver is closed",
++            ),
++        );
++    }
++    let ack = match tokio::time::timeout(ack_timeout, ack_rx).await {
++        Ok(Ok(ack)) => ack,
++        Ok(Err(_)) => relay_failure(
++            "relay_ack_closed",
++            "mined header relay ACK sender closed before responding",
++        ),
++        Err(_) => relay_failure(
++            "relay_ack_timeout",
++            format!(
++                "mined header relay ACK timed out after {} ms",
++                ack_timeout.as_millis()
++            ),
++        ),
++    };
++    (true, ack)
++}
++
++async fn relay_pool_header(
++    st: &ApiState,
++    hash: Hash32,
++    header: BlockHeader,
++) -> (bool, crate::net::MinedHeaderPublishAck) {
++    relay_pool_header_with_timeout(
++        &st.mined_headers,
++        hash,
++        header,
++        POOL_HEADER_RELAY_ACK_TIMEOUT,
++    )
++    .await
++}
++
++async fn apply_pool_block(
++    st: &ApiState,
++    block: Block,
++    request_started: Instant,
++    request_received_unix_ms: u64,
++) -> Result<Json<PoolBlockResp>, PoolApiError> {
++    let bytes = c()
++        .serialize(&block)
++        .map_err(|error| pool_api_error(StatusCode::BAD_REQUEST, error))?;
++    if bytes.len() > crate::params::MAX_BLOCK_BYTES {
++        return Err(pool_api_error(
++            StatusCode::BAD_REQUEST,
++            "block exceeds consensus size limit",
++        ));
++    }
++    let hash = header_hash(&block.header);
 +    let _guard = st.chain_lock.lock();
 +    let current_tip = get_tip(&st.db)
 +        .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
 +        .unwrap_or([0u8; 32]);
++    let already_canonical = canonical_chain_contains(&st.db, &current_tip, &hash)
++        .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
++    if already_canonical {
++        let stored = st
++            .db
++            .blocks
++            .get(k_block(&hash))
++            .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
++            .ok_or_else(|| {
++                pool_api_error(StatusCode::CONFLICT, "tip block bytes are missing")
++            })?;
++        let indexed = get_hidx(&st.db, &hash)
++            .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
++        if stored.as_ref() != bytes.as_slice() || indexed.is_none() {
++            return Err(pool_api_error(
++                StatusCode::CONFLICT,
++                "existing tip does not match the submitted canonical block",
++            ));
++        }
++        drop(_guard);
++        let (relay_queued, relay_ack) =
++            relay_pool_header(st, hash, block.header.clone()).await;
++        let relay_ok = relay_ack.ok;
++        return Ok(Json(PoolBlockResp {
++            ok: relay_ok,
++            hash: Some(hex::encode(hash)),
++            status: if relay_ok {
++                "accepted_relay_recovered".to_string()
++            } else {
++                "accepted_local_relay_failed".to_string()
++            },
++            error: (!relay_ok).then(|| relay_ack.error.clone()).flatten(),
++            node_observability: serde_json::json!({
++                "request_received_unix_ms": request_received_unix_ms,
++                "accept_elapsed_us": request_started.elapsed().as_micros() as u64,
++                "relay_enqueue_elapsed_us": request_started.elapsed().as_micros() as u64,
++                "relay_queued": relay_queued,
++                "local_canonical": true,
++                "canonical_tip": current_tip == hash,
++                "relay_ack": relay_ack,
++                "idempotent": true,
++                "relay_retry": true,
++            }),
++        }));
++    }
 +    if current_tip != block.header.prev {
 +        return Err(pool_api_error(
 +            StatusCode::CONFLICT,
@@ -424,58 +713,81 @@
 +        get_hidx(&st.db, &current_tip)
 +            .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
 +    };
-+    let bytes = c()
-+        .serialize(&block)
-+        .map_err(|error| pool_api_error(StatusCode::BAD_REQUEST, error))?;
-+    if bytes.len() > crate::params::MAX_BLOCK_BYTES {
-+        return Err(pool_api_error(
-+            StatusCode::BAD_REQUEST,
-+            "block exceeds consensus size limit",
-+        ));
-+    }
-+    st.db
-+        .blocks
-+        .insert(k_block(&hash), bytes)
-+        .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-+    index_header(&st.db, &block.header, parent_hi.as_ref())
-+        .map_err(|error| pool_api_error(StatusCode::BAD_REQUEST, error))?;
-+    maybe_reorg_to(&st.db, &hash, Some(&st.mempool))
-+        .map_err(|error| pool_api_error(StatusCode::BAD_REQUEST, error))?;
-+    let accepted = get_tip(&st.db).ok().flatten() == Some(hash);
++    persist_index_flush_then_apply(
++        || {
++            st.db
++                .blocks
++                .insert(k_block(&hash), bytes)
++                .map(|_| ())
++                .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))
++        },
++        || {
++            index_header(&st.db, &block.header, parent_hi.as_ref())
++                .map(|_| ())
++                .map_err(|error| pool_api_error(StatusCode::BAD_REQUEST, error))
++        },
++        || {
++            st.db
++                .db
++                .flush()
++                .map(|_| ())
++                .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))
++        },
++        || {
++            maybe_reorg_to(&st.db, &hash, Some(&st.mempool))
++                .map_err(|error| pool_api_error(StatusCode::BAD_REQUEST, error))
++        },
++    )?;
++    let accepted = get_tip(&st.db)
++        .map_err(|error| pool_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
++        == Some(hash);
++    drop(_guard);
 +    let accept_elapsed_us: u64 = request_started
 +        .elapsed()
 +        .as_micros()
 +        .try_into()
 +        .unwrap_or(u64::MAX);
-+    let mut relay_queued = false;
-+    let mut relay_enqueue_elapsed_us = None;
-+    if accepted {
++    let (relay_queued, relay_ack, relay_enqueue_elapsed_us) = if accepted {
 +        st.mempool.remove_mined_block(&block);
-+        relay_queued = st
-+            .mined_headers
-+            .send(crate::net::MinedHeaderEvent {
-+            hash,
-+            header: block.header.clone(),
-+            })
-+            .is_ok();
-+        relay_enqueue_elapsed_us = Some(
++        let enqueue_elapsed_us = Some(
 +            request_started
 +                .elapsed()
 +                .as_micros()
 +                .try_into()
 +                .unwrap_or(u64::MAX),
 +        );
-+    }
++        let (queued, ack) = relay_pool_header(st, hash, block.header.clone()).await;
++        (queued, Some(ack), enqueue_elapsed_us)
++    } else {
++        (false, None, None)
++    };
++    let relay_ok = relay_ack.as_ref().is_some_and(|ack| ack.ok);
++    let submitted_ok = accepted && relay_ok;
++    let status = if !accepted {
++        "orphaned"
++    } else if relay_ok {
++        "accepted"
++    } else {
++        "accepted_local_relay_failed"
++    };
++    let error = if !accepted {
++        Some("block was not selected as canonical tip".to_string())
++    } else {
++        relay_ack.as_ref().and_then(|ack| ack.error.clone())
++    };
 +    Ok(Json(PoolBlockResp {
-+        ok: accepted,
++        ok: submitted_ok,
 +        hash: Some(hex::encode(hash)),
-+        status: if accepted { "accepted" } else { "orphaned" }.to_string(),
-+        error: (!accepted).then(|| "block was not selected as canonical tip".to_string()),
++        status: status.to_string(),
++        error,
 +        node_observability: serde_json::json!({
 +            "request_received_unix_ms": request_received_unix_ms,
 +            "accept_elapsed_us": accept_elapsed_us,
 +            "relay_enqueue_elapsed_us": relay_enqueue_elapsed_us,
 +            "relay_queued": relay_queued,
++            "local_canonical": accepted,
++            "relay_ack": relay_ack,
++            "idempotent": false,
 +        }),
 +    }))
 +}
@@ -548,38 +860,724 @@
 +    })))
 +}
 +
- async fn health(State(st): State<ApiState>) -> Json<HealthResp> {
-     let tip = get_tip(&st.db).unwrap().unwrap_or([0u8; 32]);
-     let hi = get_hidx(&st.db, &tip)
+@@ -2630,0 +3476,702 @@
++
++#[cfg(test)]
++mod pool_candidate_tests {
++    use super::*;
++    use std::cell::RefCell;
++
++    const MAINNET_GENESIS_HEX: &str = "010000000000000000000000000000000000000000000000000000000000000000000000b08ef271327d1e5996b1a24112a3d0c87c0d5401677719af6351d733492f9929f01cf26900000000ffff001eba5bbc0001000000000000000100000001000000000000000000000000000000000000000000000000000000000000000000000000000000ffffffff5f000000000000000000000000000000005265757465727320323032362d30322d30353a204272697461696e20746f20776f726b2077697468204d6963726f736f667420746f206275696c64206465657066616b6520646574656374696f6e2073797374656d2e010000000000000000f2052a0100000000000000000000000000000000000000000000000000000000000000";
++    const TEST_POOL_ADAPTER_TOKEN: &str = "test-pool-adapter-token-32-bytes!!";
++
++    fn header() -> BlockHeader {
++        BlockHeader {
++            version: 1,
++            prev: [0u8; 32],
++            merkle: [1u8; 32],
++            time: 1,
++            bits: crate::params::POW_LIMIT_BITS,
++            nonce: 0,
++        }
++    }
++
++    fn encode_header(header: &BlockHeader) -> String {
++        let mut bytes = [0u8; 84];
++        bytes[0..4].copy_from_slice(&header.version.to_le_bytes());
++        bytes[4..36].copy_from_slice(&header.prev);
++        bytes[36..68].copy_from_slice(&header.merkle);
++        bytes[68..76].copy_from_slice(&header.time.to_le_bytes());
++        bytes[76..80].copy_from_slice(&header.bits.to_le_bytes());
++        bytes[80..84].copy_from_slice(&header.nonce.to_le_bytes());
++        hex::encode(bytes)
++    }
++
++    fn genesis_full_request() -> PoolFullCandidateReq {
++        let solved_bytes = hex::decode(MAINNET_GENESIS_HEX).unwrap();
++        let solved: Block = c().deserialize(&solved_bytes).unwrap();
++        assert_eq!(
++            solved.header.merkle,
++            crate::chain::mine::merkle_root(&solved.txs),
++            "mainnet genesis fixture merkle mismatch"
++        );
++        let solved_hash = header_hash(&solved.header);
++        assert!(pow_ok(&solved_hash, solved.header.bits));
++        let coinbase = c().serialize(&solved.txs[0]).unwrap();
++        assert!(solved.txs[0].inputs[0].script_sig.len() >= 8);
++
++        let mut template = solved.clone();
++        template.txs[0].inputs[0].script_sig[..8]
++            .copy_from_slice(&POOL_EXTRANONCE_PLACEHOLDER);
++        template.header.merkle = crate::chain::mine::merkle_root(&template.txs);
++        let job_id = hex::encode(header_hash(&template.header));
++        let template_bytes = c().serialize(&template).unwrap();
++
++        PoolFullCandidateReq {
++            candidate: PoolCandidateReq {
++                job_id,
++                header_hex: encode_header(&solved.header),
++                hash_hex: hex::encode(solved_hash),
++                coinbase_txid_hex: hex::encode(txid(&solved.txs[0])),
++                coinbase_hex: hex::encode(coinbase),
++            },
++            block_template_hex: hex::encode(&template_bytes),
++            block_template_sha256_hex: hex::encode(Sha256::digest(&template_bytes)),
++            block_template_bytes: template_bytes.len() as u64,
++        }
++    }
++
++    fn fixture_genesis_hash() -> Hash32 {
++        let bytes = hex::decode(MAINNET_GENESIS_HEX).unwrap();
++        let block: Block = c().deserialize(&bytes).unwrap();
++        header_hash(&block.header)
++    }
++
++    fn install_primary_genesis_job(state: &ApiState) -> String {
++        let request = genesis_full_request();
++        let template_bytes = hex::decode(&request.block_template_hex).unwrap();
++        let template: Block = c().deserialize(&template_bytes).unwrap();
++        let template_coinbase = c().serialize(&template.txs[0]).unwrap();
++        let split = template_coinbase
++            .windows(POOL_EXTRANONCE_PLACEHOLDER.len())
++            .position(|bytes| bytes == POOL_EXTRANONCE_PLACEHOLDER)
++            .unwrap();
++        let coinb1 = template_coinbase[..split].to_vec();
++        let coinb2 = template_coinbase[split + POOL_EXTRANONCE_PLACEHOLDER.len()..].to_vec();
++        let txids = template.txs.iter().map(txid).collect::<Vec<_>>();
++        let mut prev_be = template.header.prev;
++        prev_be.reverse();
++        let mut pdiff1 = [0u8; 32];
++        pdiff1[4] = 0xff;
++        pdiff1[5] = 0xff;
++        let job_id = request.candidate.job_id.clone();
++        let response = PoolTemplateResp {
++            job_id: job_id.clone(),
++            prev_hash_be_hex: hex::encode(prev_be),
++            coinb1_hex: hex::encode(&coinb1),
++            coinb2_hex: hex::encode(&coinb2),
++            merkle_branches_hex: pool_merkle_branch(&txids).iter().map(hex::encode).collect(),
++            version_hex: format!("{:08x}", template.header.version),
++            nbits_hex: format!("{:08x}", template.header.bits),
++            ntime_hex: format!("{:08x}", template.header.time as u32),
++            clean_jobs: true,
++            share_target_hex: hex::encode(pdiff1),
++            network_target_hex: hex::encode(bits_to_target_bytes(template.header.bits)),
++        };
++        state.pool_jobs.write().unwrap().insert(
++            job_id.clone(),
++            PoolMiningJob {
++                block: template,
++                coinb1,
++                coinb2,
++                height: 0,
++                template: response,
++            },
++        );
++        job_id
++    }
++
++    async fn genesis_request_from_primary_material(primary: &ApiState) -> PoolFullCandidateReq {
++        let job_id = install_primary_genesis_job(primary);
++        let material = pool_mining_template_material(
++            auth_headers(),
++            Query(PoolTemplateMaterialQuery {
++                job_id: job_id.clone(),
++            }),
++            State(primary.clone()),
++        )
++        .await
++        .unwrap()
++        .0;
++        assert_eq!(material.template.job_id, job_id);
++
++        let mut request = genesis_full_request();
++        request.block_template_hex = material.block_template_hex;
++        request.block_template_sha256_hex = material.block_template_sha256_hex;
++        request.block_template_bytes = material.block_template_bytes;
++        request
++    }
++
++    fn divergent_mempool_transaction(marker: u8) -> Transaction {
++        Transaction {
++            version: 1,
++            inputs: vec![crate::types::TxIn {
++                prevout: OutPoint {
++                    txid: [marker; 32],
++                    vout: 0,
++                },
++                script_sig: vec![marker],
++            }],
++            outputs: vec![TxOut {
++                value: 1,
++                script_pubkey: [marker; 20],
++            }],
++            locktime: 0,
++            app: AppPayload::None,
++        }
++    }
++
++    fn test_state(
++        dir: &tempfile::TempDir,
++    ) -> (
++        ApiState,
++        tokio::sync::mpsc::UnboundedReceiver<crate::net::MinedHeaderEvent>,
++    ) {
++        let db = Arc::new(Stores::open(dir.path().to_str().unwrap()).unwrap());
++        let (tx_gossip, _tx_gossip_rx) = tokio::sync::mpsc::unbounded_channel();
++        let (mined_headers, mined_headers_rx) = tokio::sync::mpsc::unbounded_channel();
++        (
++            ApiState {
++                db,
++                mempool: Arc::new(Mempool::new()),
++                tx_gossip,
++                connected_peers: Arc::new(AtomicUsize::new(1)),
++                known_peers: Arc::new(AtomicUsize::new(1)),
++                peer_id: PeerId::random(),
++                chain_lock: crate::chain::lock::new_chain_lock(),
++                mined_headers,
++                pool_jobs: Arc::new(RwLock::new(HashMap::new())),
++            },
++            mined_headers_rx,
++        )
++    }
++
++    fn success_ack() -> crate::net::MinedHeaderPublishAck {
++        crate::net::MinedHeaderPublishAck {
++            ok: true,
++            status: "published".to_string(),
++            message_id: Some("test-message-id".to_string()),
++            error: None,
++            idempotent: false,
++        }
++    }
++
++    fn idempotent_ack() -> crate::net::MinedHeaderPublishAck {
++        crate::net::MinedHeaderPublishAck {
++            ok: true,
++            status: "already_published".to_string(),
++            message_id: None,
++            error: None,
++            idempotent: true,
++        }
++    }
++
++    fn auth_headers() -> HeaderMap {
++        std::env::set_var("CSD_POOL_ADAPTER_TOKEN", TEST_POOL_ADAPTER_TOKEN);
++        let mut headers = HeaderMap::new();
++        headers.insert(
++            axum::http::header::AUTHORIZATION,
++            format!("Bearer {TEST_POOL_ADAPTER_TOKEN}")
++                .parse()
++                .unwrap(),
++        );
++        headers
++    }
++
++    async fn spawn_official_adapter(state: ApiState) -> (String, tokio::task::JoinHandle<()>) {
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
++            .await
++            .unwrap();
++        let address = listener.local_addr().unwrap();
++        let app = Router::new()
++            .route(
++                "/api/rpc/mining/template-material",
++                get(pool_mining_template_material),
++            )
++            .route(
++                "/api/rpc/block/submit-full",
++                post(pool_block_submit_full)
++                    .layer(DefaultBodyLimit::max(MAX_STATELESS_FULL_BODY_BYTES)),
++            )
++            .with_state(state);
++        let server = tokio::spawn(async move {
++            axum::serve(listener, app).await.unwrap();
++        });
++        (format!("http://{address}"), server)
++    }
++
++    async fn http_get_json(url: String) -> serde_json::Value {
++        tokio::task::spawn_blocking(move || {
++            let response = ureq::get(&url)
++                .set(
++                    axum::http::header::AUTHORIZATION.as_str(),
++                    &format!("Bearer {TEST_POOL_ADAPTER_TOKEN}"),
++                )
++                .call()
++                .unwrap();
++            serde_json::from_str(&response.into_string().unwrap()).unwrap()
++        })
++        .await
++        .unwrap()
++    }
++
++    async fn http_post_json(url: String, body: serde_json::Value) -> serde_json::Value {
++        tokio::task::spawn_blocking(move || {
++            let response = ureq::post(&url)
++                .set(
++                    axum::http::header::AUTHORIZATION.as_str(),
++                    &format!("Bearer {TEST_POOL_ADAPTER_TOKEN}"),
++                )
++                .send_json(body)
++                .unwrap();
++            serde_json::from_str(&response.into_string().unwrap()).unwrap()
++        })
++        .await
++        .unwrap()
++    }
++
++    async fn answer_once(
++        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<crate::net::MinedHeaderEvent>,
++        ack: crate::net::MinedHeaderPublishAck,
++    ) {
++        let event = receiver.recv().await.unwrap();
++        event.ack.unwrap().send(ack).unwrap();
++    }
++
++    #[test]
++    fn pool_candidate_persistence_flushes_before_consensus_apply() {
++        let events = RefCell::new(Vec::new());
++        persist_index_flush_then_apply(
++            || {
++                events.borrow_mut().push("insert");
++                Ok::<_, ()>(())
++            },
++            || {
++                events.borrow_mut().push("index");
++                Ok(())
++            },
++            || {
++                events.borrow_mut().push("flush");
++                Ok(())
++            },
++            || {
++                events.borrow_mut().push("apply");
++                Ok(())
++            },
++        )
++        .unwrap();
++        assert_eq!(*events.borrow(), ["insert", "index", "flush", "apply"]);
++    }
++
++    #[test]
++    fn pool_candidate_flush_failure_prevents_consensus_apply() {
++        let events = RefCell::new(Vec::new());
++        let result = persist_index_flush_then_apply(
++            || {
++                events.borrow_mut().push("insert");
++                Ok::<_, &'static str>(())
++            },
++            || {
++                events.borrow_mut().push("index");
++                Ok(())
++            },
++            || {
++                events.borrow_mut().push("flush");
++                Err("flush failed")
++            },
++            || {
++                events.borrow_mut().push("apply");
++                Ok(())
++            },
++        );
++        assert_eq!(result, Err("flush failed"));
++        assert_eq!(*events.borrow(), ["insert", "index", "flush"]);
++    }
++
++    #[test]
++    fn pool_candidate_flush_panic_cannot_reach_consensus_apply() {
++        let events = RefCell::new(Vec::new());
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            let _ = persist_index_flush_then_apply(
++                || {
++                    events.borrow_mut().push("insert");
++                    Ok::<_, ()>(())
++                },
++                || {
++                    events.borrow_mut().push("index");
++                    Ok(())
++                },
++                || -> Result<(), ()> {
++                    events.borrow_mut().push("flush");
++                    panic!("simulated crash at durability barrier")
++                },
++                || {
++                    events.borrow_mut().push("apply");
++                    Ok(())
++                },
++            );
++        }));
++        assert!(result.is_err());
++        assert_eq!(*events.borrow(), ["insert", "index", "flush"]);
++    }
++
++    #[tokio::test]
++    async fn relay_receiver_closed_is_structured_failure() {
++        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
++        drop(receiver);
++        let (queued, ack) = relay_pool_header_with_timeout(
++            &sender,
++            [2u8; 32],
++            header(),
++            std::time::Duration::from_millis(10),
++        )
++        .await;
++        assert!(!queued);
++        assert!(!ack.ok);
++        assert_eq!(ack.status, "relay_receiver_closed");
++    }
++
++    #[tokio::test]
++    async fn relay_ack_timeout_is_structured_failure() {
++        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
++        let (queued, ack) = relay_pool_header_with_timeout(
++            &sender,
++            [3u8; 32],
++            header(),
++            std::time::Duration::from_millis(10),
++        )
++        .await;
++        assert!(queued);
++        assert!(!ack.ok);
++        assert_eq!(ack.status, "relay_ack_timeout");
++    }
++
++    #[tokio::test]
++    async fn relay_publish_failure_ack_is_preserved() {
++        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
++        let responder = tokio::spawn(async move {
++            let event: crate::net::MinedHeaderEvent = receiver.recv().await.unwrap();
++            event
++                .ack
++                .unwrap()
++                .send(crate::net::MinedHeaderPublishAck {
++                    ok: false,
++                    status: "insufficient_peers".to_string(),
++                    message_id: None,
++                    error: Some("InsufficientPeers".to_string()),
++                    idempotent: false,
++                })
++                .unwrap();
++        });
++        let (queued, ack) = relay_pool_header_with_timeout(
++            &sender,
++            [4u8; 32],
++            header(),
++            std::time::Duration::from_secs(1),
++        )
++        .await;
++        responder.await.unwrap();
++        assert!(queued);
++        assert!(!ack.ok);
++        assert_eq!(ack.status, "insufficient_peers");
++    }
++
++    #[tokio::test]
++    async fn official_full_submit_uses_primary_material_with_empty_secondary_job_cache_and_divergent_mempools() {
++        let primary_dir = tempfile::TempDir::new().unwrap();
++        let secondary_dir = tempfile::TempDir::new().unwrap();
++        let (primary, mut primary_relay) = test_state(&primary_dir);
++        let (secondary, mut secondary_relay) = test_state(&secondary_dir);
++        let request = genesis_request_from_primary_material(&primary).await;
++        let secondary_only_tx = secondary
++            .mempool
++            .force_insert_for_replay(divergent_mempool_transaction(9), 100);
++
++        assert_eq!(primary.pool_jobs.read().unwrap().len(), 1);
++        assert!(secondary.pool_jobs.read().unwrap().is_empty());
++        assert_eq!(primary.mempool.len(), 0);
++        assert_eq!(secondary.mempool.len(), 1);
++
++        let primary_ack = tokio::spawn(async move {
++            answer_once(&mut primary_relay, success_ack()).await;
++        });
++        let primary_result = pool_block_submit_full(
++            auth_headers(),
++            State(primary.clone()),
++            Json(request.clone()),
++        )
++        .await;
++        primary_ack.await.unwrap();
++
++        let secondary_ack = tokio::spawn(async move {
++            answer_once(&mut secondary_relay, success_ack()).await;
++        });
++        let secondary_result = pool_block_submit_full(
++            auth_headers(),
++            State(secondary.clone()),
++            Json(request),
++        )
++        .await;
++        secondary_ack.await.unwrap();
++
++        let primary_response = primary_result.unwrap().0;
++        let secondary_response = secondary_result.unwrap().0;
++        assert!(primary_response.ok);
++        assert!(secondary_response.ok);
++        assert_eq!(primary_response.status, "accepted");
++        assert_eq!(secondary_response.status, "accepted");
++        assert_eq!(get_tip(&primary.db).unwrap(), Some(fixture_genesis_hash()));
++        assert_eq!(get_tip(&secondary.db).unwrap(), Some(fixture_genesis_hash()));
++        assert_eq!(primary.pool_jobs.read().unwrap().len(), 1);
++        assert!(secondary.pool_jobs.read().unwrap().is_empty());
++        assert_eq!(primary.mempool.len(), 0);
++        assert_eq!(secondary.mempool.len(), 0);
++        assert!(!secondary.mempool.contains(&secondary_only_tx));
++    }
++
++    #[tokio::test]
++    async fn two_official_http_adapters_replay_primary_material_with_secondary_empty_cache() {
++        let primary_dir = tempfile::TempDir::new().unwrap();
++        let secondary_dir = tempfile::TempDir::new().unwrap();
++        let (primary, mut primary_relay) = test_state(&primary_dir);
++        let (secondary, mut secondary_relay) = test_state(&secondary_dir);
++        let job_id = install_primary_genesis_job(&primary);
++        secondary
++            .mempool
++            .force_insert_for_replay(divergent_mempool_transaction(7), 100);
++        assert_eq!(primary.pool_jobs.read().unwrap().len(), 1);
++        assert!(secondary.pool_jobs.read().unwrap().is_empty());
++        assert_eq!(primary.mempool.len(), 0);
++        assert_eq!(secondary.mempool.len(), 1);
++
++        let (primary_url, primary_server) = spawn_official_adapter(primary.clone()).await;
++        let (secondary_url, secondary_server) = spawn_official_adapter(secondary.clone()).await;
++        let material = http_get_json(format!(
++            "{primary_url}/api/rpc/mining/template-material?job_id={job_id}"
++        ))
++        .await;
++        let mut body = serde_json::to_value(genesis_full_request()).unwrap();
++        for field in [
++            "block_template_hex",
++            "block_template_sha256_hex",
++            "block_template_bytes",
++        ] {
++            body[field] = material[field].clone();
++        }
++
++        let primary_ack = tokio::spawn(async move {
++            answer_once(&mut primary_relay, success_ack()).await;
++        });
++        let primary_response = http_post_json(
++            format!("{primary_url}/api/rpc/block/submit-full"),
++            body.clone(),
++        )
++        .await;
++        primary_ack.await.unwrap();
++
++        let secondary_ack = tokio::spawn(async move {
++            answer_once(&mut secondary_relay, success_ack()).await;
++        });
++        let secondary_response = http_post_json(
++            format!("{secondary_url}/api/rpc/block/submit-full"),
++            body,
++        )
++        .await;
++        secondary_ack.await.unwrap();
++
++        assert_eq!(primary_response["ok"], true);
++        assert_eq!(primary_response["status"], "accepted");
++        assert_eq!(secondary_response["ok"], true);
++        assert_eq!(secondary_response["status"], "accepted");
++        assert_eq!(get_tip(&primary.db).unwrap(), Some(fixture_genesis_hash()));
++        assert_eq!(get_tip(&secondary.db).unwrap(), Some(fixture_genesis_hash()));
++        assert_eq!(primary.pool_jobs.read().unwrap().len(), 1);
++        assert!(secondary.pool_jobs.read().unwrap().is_empty());
++
++        primary_server.abort();
++        secondary_server.abort();
++    }
++
++    #[tokio::test]
++    async fn malformed_full_candidate_is_rejected_before_consensus_or_relay() {
++        let dir = tempfile::TempDir::new().unwrap();
++        let (state, mut relay) = test_state(&dir);
++        let mut request = genesis_request_from_primary_material(&state).await;
++        let mut malformed = hex::decode(&request.block_template_hex).unwrap();
++        malformed.pop();
++        request.block_template_hex = hex::encode(&malformed);
++        request.block_template_sha256_hex = hex::encode(Sha256::digest(&malformed));
++        request.block_template_bytes = malformed.len() as u64;
++
++        let result = pool_block_submit_full(
++            auth_headers(),
++            State(state.clone()),
++            Json(request),
++        )
++        .await;
++        let (status, Json(body)) = match result {
++            Ok(_) => panic!("malformed full candidate was accepted"),
++            Err(error) => error,
++        };
++        assert_eq!(status, StatusCode::BAD_REQUEST);
++        assert!(body["error"]
++            .as_str()
++            .unwrap()
++            .contains("block template decode failed"));
++        assert_eq!(get_tip(&state.db).unwrap(), None);
++        assert!(tokio::time::timeout(
++            std::time::Duration::from_millis(10),
++            relay.recv()
++        )
++        .await
++        .is_err());
++    }
++
++    #[tokio::test]
++    async fn p2p_first_canonical_candidate_requires_relay_ack() {
++        let dir = tempfile::TempDir::new().unwrap();
++        let (state, mut relay) = test_state(&dir);
++        let bytes = hex::decode(MAINNET_GENESIS_HEX).unwrap();
++        let genesis: Block = c().deserialize(&bytes).unwrap();
++        crate::chain::genesis::ensure_genesis(state.db.clone(), genesis).unwrap();
++
++        let relay_ack = tokio::spawn(async move {
++            answer_once(&mut relay, success_ack()).await;
++        });
++
++        let response = pool_block_submit_full(
++            auth_headers(),
++            State(state.clone()),
++            Json(genesis_full_request()),
++        )
++        .await
++        .unwrap()
++        .0;
++        relay_ack.await.unwrap();
++        assert!(response.ok);
++        assert_eq!(response.status, "accepted_relay_recovered");
++        assert_eq!(response.node_observability["relay_ack"]["status"], "published");
++    }
++
++    #[tokio::test]
++    async fn p2p_first_canonical_ancestor_remains_idempotent_after_tip_advances() {
++        let dir = tempfile::TempDir::new().unwrap();
++        let (state, mut relay) = test_state(&dir);
++        let bytes = hex::decode(MAINNET_GENESIS_HEX).unwrap();
++        let genesis: Block = c().deserialize(&bytes).unwrap();
++        crate::chain::genesis::ensure_genesis(state.db.clone(), genesis).unwrap();
++
++        let genesis_hash = fixture_genesis_hash();
++        let genesis_index = get_hidx(&state.db, &genesis_hash).unwrap().unwrap();
++        let child_hash = [0x42; 32];
++        crate::chain::index::put_hidx(
++            &state.db,
++            &HeaderIndex {
++                hash: child_hash,
++                parent: genesis_hash,
++                height: genesis_index.height + 1,
++                chainwork: genesis_index.chainwork + 1,
++                bits: genesis_index.bits,
++                time: genesis_index.time + 1,
++            },
++        )
++        .unwrap();
++        crate::state::db::set_tip(&state.db, &child_hash).unwrap();
++
++        let relay_ack = tokio::spawn(async move {
++            answer_once(&mut relay, idempotent_ack()).await;
++        });
++        let response = pool_block_submit_full(
++            auth_headers(),
++            State(state.clone()),
++            Json(genesis_full_request()),
++        )
++        .await
++        .unwrap()
++        .0;
++        relay_ack.await.unwrap();
++
++        assert!(response.ok);
++        assert_eq!(response.status, "accepted_relay_recovered");
++        assert_eq!(response.node_observability["local_canonical"], true);
++        assert_eq!(response.node_observability["canonical_tip"], false);
++        assert_eq!(response.node_observability["idempotent"], true);
++        assert_eq!(get_tip(&state.db).unwrap(), Some(child_hash));
++    }
++
++    #[tokio::test]
++    async fn local_canonical_relay_failure_is_retried_before_duplicate_success() {
++        let dir = tempfile::TempDir::new().unwrap();
++        let (state, mut relay) = test_state(&dir);
++
++        let first_ack = tokio::spawn(async move {
++            answer_once(
++                &mut relay,
++                crate::net::MinedHeaderPublishAck {
++                    ok: false,
++                    status: "insufficient_peers".to_string(),
++                    message_id: None,
++                    error: Some("InsufficientPeers".to_string()),
++                    idempotent: false,
++                },
++            )
++            .await;
++            relay
++        });
++        let first = pool_block_submit_full(
++            auth_headers(),
++            State(state.clone()),
++            Json(genesis_full_request()),
++        )
++        .await
++        .unwrap()
++        .0;
++        let mut relay = first_ack.await.unwrap();
++        assert!(!first.ok);
++        assert_eq!(first.status, "accepted_local_relay_failed");
++        assert_eq!(get_tip(&state.db).unwrap(), Some(fixture_genesis_hash()));
++
++        let retry_ack = tokio::spawn(async move {
++            answer_once(&mut relay, success_ack()).await;
++            relay
++        });
++        let retry = pool_block_submit_full(
++            auth_headers(),
++            State(state.clone()),
++            Json(genesis_full_request()),
++        )
++        .await
++        .unwrap()
++        .0;
++        let mut relay = retry_ack.await.unwrap();
++        assert!(retry.ok);
++        assert_eq!(retry.status, "accepted_relay_recovered");
++
++        let duplicate_ack = tokio::spawn(async move {
++            answer_once(&mut relay, idempotent_ack()).await;
++        });
++        let duplicate = pool_block_submit_full(
++            auth_headers(),
++            State(state.clone()),
++            Json(genesis_full_request()),
++        )
++        .await
++        .unwrap()
++        .0;
++        duplicate_ack.await.unwrap();
++        assert!(duplicate.ok);
++        assert_eq!(duplicate.status, "accepted_relay_recovered");
++        assert_eq!(
++            duplicate.node_observability["relay_ack"]["status"],
++            "already_published"
++        );
++        drop(state);
++    }
++}
 --- a/src/chain/mine.rs
 +++ b/src/chain/mine.rs
-@@ -54,7 +54,7 @@
-     layer[0]
- }
- 
+@@ -57 +57 @@
 -fn merkle_root(txs: &[Transaction]) -> Hash32 {
 +pub(crate) fn merkle_root(txs: &[Transaction]) -> Hash32 {
-     let mut ids: Vec<Hash32> = Vec::with_capacity(txs.len());
-     for tx in txs {
-         ids.push(txid(tx));
-@@ -164,7 +164,11 @@
- ///
- /// This MUST track wall-clock time (clamped), or LWMA will drift the wrong way.
- 
+@@ -167 +167,5 @@
 -fn choose_block_time(db: &Stores, parent_tip: &Hash32, parent_hi: Option<&HeaderIndex>) -> u64 {
 +pub(crate) fn choose_block_time(
 +    db: &Stores,
 +    parent_tip: &Hash32,
 +    parent_hi: Option<&HeaderIndex>,
 +) -> u64 {
-     if *parent_tip == [0u8; 32] || parent_hi.is_none() {
-         return 0;
-     }
-@@ -205,16 +209,50 @@
-         std::thread::sleep(std::time::Duration::from_secs(wait));
-     }
- }
--
+@@ -195,0 +200,15 @@
++    }
++}
 +
 +/// Choose a consensus-valid Stratum template time without blocking the RPC task.
 +///
@@ -593,7 +1591,7 @@
 +) -> Result<u64> {
 +    if *parent_tip == [0u8; 32] || parent_hi.is_none() {
 +        return Ok(0);
-+    }
+@@ -196,0 +216,19 @@
 +
 +    let parent = parent_hi.unwrap();
 +    let mtp = median_time_past(db, &parent.hash)?;
@@ -613,53 +1611,377 @@
 +    }
 +
 +    Ok(time)
-+}
-+
- /// Build a fresh block template from the current tip + current UTXO set.
- ///
- /// Key behavior:
- /// - Only includes txs that are valid AND connectable *right now*
- /// - Skips anything that fails validate_tx_for_mempool or has missing inputs
- /// - Sorts by fee (desc) so miners converge under load
- /// - also respects MAX_BLOCK_BYTES (consensus) so we never build an unmineable block
- 
+@@ -207 +245 @@
 -fn build_template(
 +pub(crate) fn build_template(
-     db: &Stores,
-     mempool: &Mempool,
-     miner_h160: Hash20,
 --- a/src/cli/main.rs
 +++ b/src/cli/main.rs
-@@ -1291,6 +1291,8 @@
-                 net.connected_peers.clone(),
-                 net.known_peers.clone(),
-                 net.peer_id,
+@@ -1293,0 +1294,2 @@
 +                chain_lock.clone(),
 +                mined_hdr_tx.clone(),
-             );
- 
-             let listener = tokio::net::TcpListener::bind(&rpc).await?;
-diff --git a/src/net/node.rs b/src/net/node.rs
-index 69a36f2..7d77ced 100644
+@@ -1458,0 +1461 @@
++                                            ack: None,
+--- a/src/net/mempool.rs
++++ b/src/net/mempool.rs
+@@ -450,0 +451,28 @@
++    }
++
++    #[cfg(test)]
++    pub(crate) fn force_insert_for_replay(
++        &self,
++        tx: Transaction,
++        feerate_ppm: u64,
++    ) -> Hash32 {
++        let id = txid(&tx);
++        let bytes = crate::codec::consensus_bincode()
++            .serialized_size(&tx)
++            .unwrap() as usize;
++        let mut inner = self.inner.write().unwrap();
++
++        for input in &tx.inputs {
++            inner.spent.insert(input.prevout, id);
++        }
++        inner.txs.insert(id, tx);
++        inner.total_bytes += bytes;
++
++        let fee_info = FeeInfo {
++            fee: 1,
++            bytes: bytes as u32,
++            feerate_ppm,
++        };
++        inner.feeinfo.insert(id, fee_info);
++        inner.eviction.insert((feerate_ppm, id));
++        id
+@@ -619,24 +647 @@
+-        let id = txid(&tx);
+-        let bytes = crate::codec::consensus_bincode()
+-            .serialized_size(&tx)
+-            .unwrap() as usize;
+-
+-        let mut w = mp.inner.write().unwrap();
+-
+-        for inp in &tx.inputs {
+-            w.spent.insert(inp.prevout, id);
+-        }
+-
+-        w.txs.insert(id, tx);
+-        w.total_bytes += bytes;
+-
+-        let fi = FeeInfo {
+-            fee: 1,
+-            bytes: bytes as u32,
+-            feerate_ppm,
+-        };
+-
+-        w.feeinfo.insert(id, fi);
+-        w.eviction.insert((feerate_ppm, id));
+-
+-        id
++        mp.force_insert_for_replay(tx, feerate_ppm)
+@@ -698 +702,0 @@
+-
+--- a/src/net/mod.rs
++++ b/src/net/mod.rs
+@@ -7 +7,10 @@
+-#[derive(Clone, Debug)]
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
++pub struct MinedHeaderPublishAck {
++    pub ok: bool,
++    pub status: String,
++    pub message_id: Option<String>,
++    pub error: Option<String>,
++    pub idempotent: bool,
++}
++
++#[derive(Debug)]
+@@ -10,0 +20 @@
++    pub ack: Option<tokio::sync::oneshot::Sender<MinedHeaderPublishAck>>,
+@@ -17 +26,0 @@
+-
 --- a/src/net/node.rs
 +++ b/src/net/node.rs
-@@ -1796,7 +1796,7 @@ while inflight.len() < MAX_INFLIGHT_BLOCKS {
-             continue;
-         };
- 
+@@ -42 +42 @@
+-use super::{GossipTxEvent, MinedHeaderEvent};
++use super::{GossipTxEvent, MinedHeaderEvent, MinedHeaderPublishAck};
+@@ -1799 +1799 @@
 -        let Some(_target_hi) = get_hidx(db, &target_h)? else {
 +        let Some(target_hi) = get_hidx(db, &target_h)? else {
- 
-             skip_no_hidx += 1;
- 
-@@ -1900,8 +1900,8 @@ if target_peer.is_none() {
-             continue;
-         };
- 
+@@ -1903,2 +1903,2 @@
 -        if hi.height < best_height {
 -            best_height = hi.height;
 +        if target_hi.height < best_height {
 +            best_height = target_hi.height;
-             best_hash = Some(target_h);
-             best_peer = Some(peer);
-         }
+@@ -2380,3 +2380,36 @@
+-fn publish_header(swarm: &mut Swarm<Behaviour>, header: BlockHeader) -> Result<()> {
+-    let gh = GossipHeader { header };
+-    let bytes = crate::codec::consensus_bincode().serialize(&gh)?;
++fn classify_header_publish(
++    result: std::result::Result<gossipsub::MessageId, gossipsub::PublishError>,
++) -> MinedHeaderPublishAck {
++    match result {
++        Ok(message_id) => MinedHeaderPublishAck {
++            ok: true,
++            status: "published".to_string(),
++            message_id: Some(hex::encode(message_id.0)),
++            error: None,
++            idempotent: false,
++        },
++        Err(gossipsub::PublishError::Duplicate) => MinedHeaderPublishAck {
++            ok: true,
++            status: "already_published".to_string(),
++            message_id: None,
++            error: None,
++            idempotent: true,
++        },
++        Err(error) => {
++            let status = match &error {
++                gossipsub::PublishError::InsufficientPeers => "insufficient_peers",
++                gossipsub::PublishError::MessageTooLarge => "message_too_large",
++                gossipsub::PublishError::SigningError(_) => "signing_error",
++                gossipsub::PublishError::TransformFailed(_) => "transform_failed",
++                gossipsub::PublishError::Duplicate => unreachable!(),
++            };
++            MinedHeaderPublishAck {
++                ok: false,
++                status: status.to_string(),
++                message_id: None,
++                error: Some(error.to_string()),
++                idempotent: false,
++            }
++        }
++    }
++}
+@@ -2384,5 +2417,27 @@
+-    if bytes.len() <= MAX_GOSSIP_MSG_BYTES {
+-        let _ = swarm
+-            .behaviour_mut()
+-            .gossipsub
+-            .publish(IdentTopic::new(TOPIC_HDR), bytes);
++fn publish_header(swarm: &mut Swarm<Behaviour>, header: BlockHeader) -> MinedHeaderPublishAck {
++    let gh = GossipHeader { header };
++    let bytes = match crate::codec::consensus_bincode().serialize(&gh) {
++        Ok(bytes) => bytes,
++        Err(error) => {
++            return MinedHeaderPublishAck {
++                ok: false,
++                status: "serialization_failed".to_string(),
++                message_id: None,
++                error: Some(error.to_string()),
++                idempotent: false,
++            };
++        }
++    };
++
++    if bytes.len() > MAX_GOSSIP_MSG_BYTES {
++        return MinedHeaderPublishAck {
++            ok: false,
++            status: "message_too_large".to_string(),
++            message_id: None,
++            error: Some(format!(
++                "header gossip payload exceeds limit: {} > {}",
++                bytes.len(),
++                MAX_GOSSIP_MSG_BYTES
++            )),
++            idempotent: false,
++        };
+@@ -2391 +2446,6 @@
+-    Ok(())
++    classify_header_publish(
++        swarm
++            .behaviour_mut()
++            .gossipsub
++            .publish(IdentTopic::new(TOPIC_HDR), bytes),
++    )
+@@ -3068 +3128,12 @@
+-    let _ = publish_header(&mut swarm, ev.header);
++    let ack = publish_header(&mut swarm, ev.header);
++    if !ack.ok {
++        eprintln!(
++            "[p2p] mined header publish failed hash={} status={} error={}",
++            hex::encode(ev.hash),
++            ack.status,
++            ack.error.as_deref().unwrap_or("none")
++        );
++    }
++    if let Some(sender) = ev.ack {
++        let _ = sender.send(ack);
++    }
+@@ -4768,0 +4840,41 @@
++
++#[cfg(test)]
++mod pool_header_publish_tests {
++    use super::*;
++
++    fn actual_gossipsub_swarm() -> Swarm<Behaviour> {
++        let key = identity::Keypair::generate_ed25519();
++        let peer_id = PeerId::from(key.public());
++        let transport = libp2p::core::transport::MemoryTransport::default()
++            .upgrade(upgrade::Version::V1)
++            .authenticate(noise::Config::new(&key).unwrap())
++            .multiplex(yamux::Config::default())
++            .boxed();
++        let config = gossipsub::ConfigBuilder::default()
++            .validation_mode(ValidationMode::Permissive)
++            .heartbeat_interval(Duration::from_millis(20))
++            .max_transmit_size(MAX_GOSSIP_MSG_BYTES)
++            .build()
++            .unwrap();
++        let mut gossipsub =
++            gossipsub::Behaviour::new(MessageAuthenticity::Signed(key.clone()), config).unwrap();
++        gossipsub.subscribe(&IdentTopic::new(TOPIC_HDR)).unwrap();
++        let rr = request_response::Behaviour::<SyncCodec>::new(
++            std::iter::once((SYNC_PROTOCOL, ProtocolSupport::Full)),
++            request_response::Config::default(),
++        );
++        let identify = identify::Behaviour::new(identify::Config::new(
++            "/csd/id/1.0.0".to_string(),
++            key.public(),
++        ));
++        Swarm::new(
++            transport,
++            Behaviour {
++                gossipsub,
++                rr,
++                identify,
++            },
++            peer_id,
++            libp2p::swarm::Config::with_tokio_executor(),
++        )
++    }
+@@ -4769,0 +4882,136 @@
++    fn actual_gossipsub_without_peers() -> gossipsub::Behaviour {
++        let key = identity::Keypair::generate_ed25519();
++        let config = gossipsub::ConfigBuilder::default()
++            .validation_mode(ValidationMode::Permissive)
++            .max_transmit_size(MAX_GOSSIP_MSG_BYTES)
++            .build()
++            .unwrap();
++        let mut behaviour =
++            gossipsub::Behaviour::new(MessageAuthenticity::Signed(key), config).unwrap();
++        behaviour.subscribe(&IdentTopic::new(TOPIC_HDR)).unwrap();
++        behaviour
++    }
++
++    #[test]
++    fn successful_gossipsub_publish_is_acknowledged() {
++        let ack = classify_header_publish(Ok(gossipsub::MessageId::from("message-id")));
++        assert!(ack.ok);
++        assert_eq!(ack.status, "published");
++        assert!(!ack.idempotent);
++        assert!(ack.message_id.is_some());
++    }
++
++    #[test]
++    fn duplicate_publish_is_idempotent_not_a_new_broadcast() {
++        let ack = classify_header_publish(Err(gossipsub::PublishError::Duplicate));
++        assert!(ack.ok);
++        assert_eq!(ack.status, "already_published");
++        assert!(ack.idempotent);
++        assert!(ack.message_id.is_none());
++    }
++
++    #[test]
++    fn insufficient_peers_is_a_structured_publish_failure() {
++        let ack = classify_header_publish(Err(gossipsub::PublishError::InsufficientPeers));
++        assert!(!ack.ok);
++        assert_eq!(ack.status, "insufficient_peers");
++        assert_eq!(ack.error.as_deref(), Some("InsufficientPeers"));
++    }
++
++    #[test]
++    fn actual_gossipsub_without_peers_fails_closed() {
++        let mut behaviour = actual_gossipsub_without_peers();
++        let result = behaviour.publish(IdentTopic::new(TOPIC_HDR), vec![1, 2, 3]);
++        let ack = classify_header_publish(result);
++        assert!(!ack.ok);
++        assert_eq!(ack.status, "insufficient_peers");
++        assert_eq!(ack.error.as_deref(), Some("InsufficientPeers"));
++    }
++
++    #[tokio::test]
++    async fn actual_gossipsub_peer_ack_corresponds_to_delivered_header() {
++        let mut publisher = actual_gossipsub_swarm();
++        let mut receiver = actual_gossipsub_swarm();
++        let receiver_peer = *receiver.local_peer_id();
++        publisher.listen_on("/memory/0".parse().unwrap()).unwrap();
++        let listen_addr = tokio::time::timeout(Duration::from_secs(2), async {
++            loop {
++                if let SwarmEvent::NewListenAddr { address, .. } =
++                    publisher.select_next_some().await
++                {
++                    break address;
++                }
++            }
++        })
++        .await
++        .expect("publisher must start listening");
++        receiver
++            .dial(listen_addr.with(libp2p::multiaddr::Protocol::P2p(
++                *publisher.local_peer_id(),
++            )))
++            .unwrap();
++
++        tokio::time::timeout(Duration::from_secs(3), async {
++            loop {
++                tokio::select! {
++                    event = publisher.select_next_some() => {
++                        if let SwarmEvent::Behaviour(OutEvent::Gossipsub(
++                            gossipsub::Event::Subscribed { peer_id, .. }
++                        )) = event {
++                            if peer_id == receiver_peer {
++                                break;
++                            }
++                        }
++                    }
++                    _ = receiver.select_next_some() => {}
++                }
++            }
++        })
++        .await
++        .expect("publisher must observe the receiver subscription");
++
++        let header = BlockHeader {
++            version: 1,
++            prev: [0x11; 32],
++            merkle: [0x22; 32],
++            time: 1_700_000_000,
++            bits: 0x207f_ffff,
++            nonce: 42,
++        };
++        let expected = crate::codec::consensus_bincode()
++            .serialize(&GossipHeader {
++                header: header.clone(),
++            })
++            .unwrap();
++        let ack = publish_header(&mut publisher, header);
++        assert!(ack.ok, "actual gossipsub publish failed: {ack:?}");
++        assert_eq!(ack.status, "published");
++        assert!(!ack.idempotent);
++
++        tokio::time::timeout(Duration::from_secs(3), async {
++            loop {
++                tokio::select! {
++                    _ = publisher.select_next_some() => {}
++                    event = receiver.select_next_some() => {
++                        if let SwarmEvent::Behaviour(OutEvent::Gossipsub(
++                            gossipsub::Event::Message { message, .. }
++                        )) = event {
++                            if message.topic.as_str() == TOPIC_HDR && message.data == expected {
++                                break;
++                            }
++                        }
++                    }
++                }
++            }
++        })
++        .await
++        .expect("receiver must observe the published header");
++    }
++
++    #[test]
++    fn message_too_large_is_a_structured_publish_failure() {
++        let ack = classify_header_publish(Err(gossipsub::PublishError::MessageTooLarge));
++        assert!(!ack.ok);
++        assert_eq!(ack.status, "message_too_large");
++    }
++}

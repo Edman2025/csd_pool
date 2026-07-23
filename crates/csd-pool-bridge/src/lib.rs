@@ -1,7 +1,10 @@
 #![allow(clippy::collapsible_if)] // Production remains on Rust 1.86, before stable let chains.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions, symlink_metadata};
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,8 +17,9 @@ use csd_pool_db::{
     JobRecord, MiningRepository, PgRepository, SessionRecord, ShareEventRecord, ShareRecord,
 };
 use csd_pool_node::{
-    BlockCandidateSubmitRequest, CsdNodeClient, LiveTemplateProvider, NodeHealth, PoolJob,
-    StaticTemplateProvider, SubmitBlockResponse, TemplateProvider,
+    BlockCandidateSubmitRequest, CandidateTemplateMaterial, CsdNodeClient, LiveTemplateProvider,
+    NodeHealth, PoolJob, StatelessBlockCandidateSubmitRequest, StaticTemplateProvider,
+    SubmitBlockResponse, TemplateProvider,
 };
 use csd_pool_protocol::{
     Request, Response, SubmitParams, notify, response_error, response_ok, serialize_line,
@@ -202,17 +206,10 @@ impl RetainedJobs {
             .map(|entry| entry.job.clone())
     }
 
-    fn publish(&self, job: Arc<PoolJob>, reason: JobReason, retention: Duration) {
+    fn publish(&self, job: Arc<PoolJob>, _reason: JobReason, retention: Duration) {
         let now = TokioInstant::now();
         let mut jobs = self.inner.write().expect("retained jobs lock");
-        if reason == JobReason::TipChange {
-            jobs.clear();
-        } else {
-            jobs.retain(|_, entry| {
-                entry.job.template.prev == job.template.prev
-                    && now.saturating_duration_since(entry.published_at) <= retention
-            });
-        }
+        jobs.retain(|_, entry| now.saturating_duration_since(entry.published_at) <= retention);
         jobs.insert(
             job.template.job_id.clone(),
             RetainedJob {
@@ -432,10 +429,19 @@ pub fn template_provider_from_env() -> Result<Arc<dyn TemplateProvider>> {
     }
 
     let (node_url, pool_address) = live_template_config()?;
-    Ok(Arc::new(LiveTemplateProvider::new(
-        CsdNodeClient::from_env(node_url),
-        pool_address,
-    )))
+    let node = CsdNodeClient::from_env(node_url);
+    if csd_pool_config::env_flag_enabled(
+        std::env::var("CSD_POOL_STATELESS_PARALLEL_CANDIDATE_SUBMIT_ENABLED")
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(Arc::new(LiveTemplateProvider::new_stateless(
+            node,
+            pool_address,
+        )))
+    } else {
+        Ok(Arc::new(LiveTemplateProvider::new(node, pool_address)))
+    }
 }
 
 fn live_template_config() -> Result<(String, String)> {
@@ -583,8 +589,18 @@ pub fn block_submitter_from_env() -> Result<Option<Arc<dyn BlockSubmitter>>> {
         let (template_node_url, _) = live_template_config()?;
         require_template_submit_affinity(&template_node_url, &node_url)?;
     }
-    if !csd_pool_config::env_flag_enabled(
+    if csd_pool_config::env_flag_enabled(
         std::env::var("CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED")
+            .ok()
+            .as_deref(),
+    ) {
+        return Err(BridgeError::InvalidConfig(
+            "BLOCKED_JOB_CACHE_AFFINITY: the legacy parallel submit path cannot submit a node-a job to an empty node-b cache"
+                .into(),
+        ));
+    }
+    if !csd_pool_config::env_flag_enabled(
+        std::env::var("CSD_POOL_STATELESS_PARALLEL_CANDIDATE_SUBMIT_ENABLED")
             .ok()
             .as_deref(),
     ) {
@@ -604,6 +620,7 @@ pub fn block_submitter_from_env() -> Result<Option<Arc<dyn BlockSubmitter>>> {
             .ok()
             .as_deref(),
     )?;
+    let latch_path = persistent_candidate_latch_path_from_env()?;
     let primary = Arc::new(CsdCandidateNodeEndpoint::new(
         submit_node_name_from_env(),
         CsdNodeClient::from_env(node_url),
@@ -615,12 +632,44 @@ pub fn block_submitter_from_env() -> Result<Option<Arc<dyn BlockSubmitter>>> {
     Ok(Some(Arc::new(ParallelNodeBlockSubmitter::new(
         primary,
         secondary,
-        Duration::from_millis(env_u64("CSD_POOL_PRIMARY_SUBMIT_TIMEOUT_MS", 2_000)),
-        Duration::from_millis(env_u64("CSD_POOL_SECONDARY_SUBMIT_TIMEOUT_MS", 750)),
-        Duration::from_millis(env_u64("CSD_POOL_PARALLEL_NODE_HEALTH_REFRESH_MS", 1_000)),
-        Duration::from_millis(env_u64("CSD_POOL_PARALLEL_NODE_HEALTH_MAX_AGE_MS", 3_000)),
-        secondary_candidate_budget,
+        ParallelSubmitConfig {
+            primary_timeout: Duration::from_millis(env_u64(
+                "CSD_POOL_PRIMARY_SUBMIT_TIMEOUT_MS",
+                2_000,
+            )),
+            secondary_timeout: Duration::from_millis(env_u64(
+                "CSD_POOL_SECONDARY_SUBMIT_TIMEOUT_MS",
+                750,
+            )),
+            health_refresh: Duration::from_millis(env_u64(
+                "CSD_POOL_PARALLEL_NODE_HEALTH_REFRESH_MS",
+                1_000,
+            )),
+            health_max_age: Duration::from_millis(env_u64(
+                "CSD_POOL_PARALLEL_NODE_HEALTH_MAX_AGE_MS",
+                3_000,
+            )),
+            secondary_candidate_budget,
+        },
+        PersistentCandidateLatch::new(latch_path)?,
     ))))
+}
+
+fn persistent_candidate_latch_path_from_env() -> Result<PathBuf> {
+    let value = std::env::var("CSD_POOL_STATELESS_PARALLEL_CANDIDATE_LATCH_PATH")
+        .map_err(|_| {
+            BridgeError::InvalidConfig(
+                "CSD_POOL_STATELESS_PARALLEL_CANDIDATE_LATCH_PATH is required for the stateless one-shot canary"
+                    .into(),
+            )
+        })?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(BridgeError::InvalidConfig(
+            "CSD_POOL_STATELESS_PARALLEL_CANDIDATE_LATCH_PATH must be absolute".into(),
+        ));
+    }
+    Ok(path)
 }
 
 fn parallel_candidate_submit_budget(value: Option<&str>) -> Result<u64> {
@@ -1187,8 +1236,25 @@ async fn handle_client(
 pub trait BlockSubmitter: Send + Sync {
     async fn submit_candidate(
         &self,
-        candidate: &BlockCandidateSubmitRequest,
+        submission: &BlockCandidateSubmission,
     ) -> Result<SubmitBlockResponse>;
+}
+
+#[derive(Clone, Debug)]
+pub struct BlockCandidateSubmission {
+    candidate: BlockCandidateSubmitRequest,
+    candidate_material: Option<Arc<CandidateTemplateMaterial>>,
+}
+
+impl BlockCandidateSubmission {
+    fn stateless_request(&self) -> Option<StatelessBlockCandidateSubmitRequest<'_>> {
+        self.candidate_material
+            .as_deref()
+            .map(|material| StatelessBlockCandidateSubmitRequest {
+                candidate: &self.candidate,
+                candidate_material: material,
+            })
+    }
 }
 
 #[async_trait::async_trait]
@@ -1197,9 +1263,14 @@ trait CandidateNodeEndpoint: Send + Sync {
 
     async fn health(&self) -> std::result::Result<NodeHealth, String>;
 
-    async fn submit_candidate(
+    async fn submit_cached_candidate(
         &self,
         candidate: &BlockCandidateSubmitRequest,
+    ) -> std::result::Result<SubmitBlockResponse, String>;
+
+    async fn submit_full_candidate(
+        &self,
+        candidate: &StatelessBlockCandidateSubmitRequest<'_>,
     ) -> std::result::Result<SubmitBlockResponse, String>;
 }
 
@@ -1218,9 +1289,9 @@ impl CsdNodeBlockSubmitter {
 impl BlockSubmitter for CsdNodeBlockSubmitter {
     async fn submit_candidate(
         &self,
-        candidate: &BlockCandidateSubmitRequest,
+        submission: &BlockCandidateSubmission,
     ) -> Result<SubmitBlockResponse> {
-        Ok(self.node.submit_candidate(candidate).await?)
+        Ok(self.node.submit_candidate(&submission.candidate).await?)
     }
 }
 
@@ -1246,7 +1317,7 @@ impl CandidateNodeEndpoint for CsdCandidateNodeEndpoint {
         self.node.health().await.map_err(|err| err.to_string())
     }
 
-    async fn submit_candidate(
+    async fn submit_cached_candidate(
         &self,
         candidate: &BlockCandidateSubmitRequest,
     ) -> std::result::Result<SubmitBlockResponse, String> {
@@ -1254,6 +1325,170 @@ impl CandidateNodeEndpoint for CsdCandidateNodeEndpoint {
             .submit_candidate(candidate)
             .await
             .map_err(|err| err.to_string())
+    }
+
+    async fn submit_full_candidate(
+        &self,
+        candidate: &StatelessBlockCandidateSubmitRequest<'_>,
+    ) -> std::result::Result<SubmitBlockResponse, String> {
+        self.node
+            .submit_full_candidate(candidate)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+#[derive(Clone)]
+struct PersistentCandidateLatch {
+    path: Arc<PathBuf>,
+    #[cfg(test)]
+    claim_delay: Duration,
+}
+
+impl PersistentCandidateLatch {
+    fn new(path: PathBuf) -> Result<Self> {
+        let parent = path
+            .parent()
+            .filter(|value| !value.as_os_str().is_empty())
+            .ok_or_else(|| {
+                BridgeError::InvalidConfig("persistent candidate latch has no parent".into())
+            })?;
+        let parent_metadata = symlink_metadata(parent).map_err(|error| {
+            BridgeError::InvalidConfig(format!(
+                "persistent candidate latch parent is unavailable: {error}"
+            ))
+        })?;
+        if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+            return Err(BridgeError::InvalidConfig(
+                "persistent candidate latch parent must be a real directory".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = parent_metadata.permissions().mode();
+            let writable_by_others = mode & 0o022 != 0;
+            let sticky = mode & 0o1000 != 0;
+            if writable_by_others && !sticky {
+                return Err(BridgeError::InvalidConfig(
+                    "persistent candidate latch parent must not be group/world writable without the sticky bit"
+                        .into(),
+                ));
+            }
+        }
+        match symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    if metadata.permissions().mode() & 0o077 != 0 {
+                        return Err(BridgeError::InvalidConfig(
+                            "persistent candidate latch file must have mode 0600 or stricter"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            Ok(_) => {
+                return Err(BridgeError::InvalidConfig(
+                    "persistent candidate latch must be absent or a regular file".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(BridgeError::InvalidConfig(format!(
+                    "persistent candidate latch cannot be inspected: {error}"
+                )));
+            }
+        }
+        Ok(Self {
+            path: Arc::new(path),
+            #[cfg(test)]
+            claim_delay: Duration::ZERO,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_claim_delay(mut self, claim_delay: Duration) -> Self {
+        self.claim_delay = claim_delay;
+        self
+    }
+
+    fn claim(&self, candidate_hash: &str, configured: u64) -> SecondaryCandidateBudgetClaim {
+        let before = u64::from(!Path::new(self.path.as_ref()).exists());
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(self.path.as_ref()) {
+            Ok(mut file) => {
+                let marker = format!(
+                    "version=1\nclaimed_unix_ms={}\ncandidate_hash={}\n",
+                    unix_ms(),
+                    candidate_hash
+                );
+                let persistence = file.write_all(marker.as_bytes()).and_then(|()| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                    }
+                    #[cfg(test)]
+                    if !self.claim_delay.is_zero() {
+                        std::thread::sleep(self.claim_delay);
+                    }
+                    file.sync_all()?;
+                    let parent = self.path.parent().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "persistent candidate latch has no parent",
+                        )
+                    })?;
+                    File::open(parent)?.sync_all()
+                });
+                match persistence {
+                    Ok(()) => SecondaryCandidateBudgetClaim {
+                        configured,
+                        before,
+                        claimed: true,
+                        remaining: 0,
+                        persistence: "o_excl_file",
+                        error: None,
+                    },
+                    Err(error) => SecondaryCandidateBudgetClaim {
+                        configured,
+                        before,
+                        claimed: false,
+                        remaining: 0,
+                        persistence: "o_excl_file",
+                        error: Some(format!("persistent latch write failed: {error}")),
+                    },
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                SecondaryCandidateBudgetClaim {
+                    configured,
+                    before: 0,
+                    claimed: false,
+                    remaining: 0,
+                    persistence: "o_excl_file",
+                    error: None,
+                }
+            }
+            Err(error) => SecondaryCandidateBudgetClaim {
+                configured,
+                before,
+                claimed: false,
+                remaining: 0,
+                persistence: "o_excl_file",
+                error: Some(format!("persistent latch claim failed: {error}")),
+            },
+        }
     }
 }
 
@@ -1267,31 +1502,39 @@ struct ParallelNodeBlockSubmitter {
     health_max_age: Duration,
     health_snapshot: Arc<RwLock<Option<ParallelHealthSnapshot>>>,
     secondary_candidate_budget_configured: u64,
-    secondary_candidate_budget: Arc<AtomicU64>,
+    secondary_candidate_latch: PersistentCandidateLatch,
+}
+
+#[derive(Clone, Copy)]
+struct ParallelSubmitConfig {
+    primary_timeout: Duration,
+    secondary_timeout: Duration,
+    health_refresh: Duration,
+    health_max_age: Duration,
+    secondary_candidate_budget: u64,
 }
 
 impl ParallelNodeBlockSubmitter {
     fn new(
         primary: Arc<dyn CandidateNodeEndpoint>,
         secondary: Arc<dyn CandidateNodeEndpoint>,
-        primary_timeout: Duration,
-        secondary_timeout: Duration,
-        health_refresh: Duration,
-        health_max_age: Duration,
-        secondary_candidate_budget: u64,
+        config: ParallelSubmitConfig,
+        secondary_candidate_latch: PersistentCandidateLatch,
     ) -> Self {
         let submitter = Self {
             primary,
             secondary,
-            primary_timeout: bounded_submit_timeout(primary_timeout),
-            secondary_timeout: bounded_submit_timeout(secondary_timeout),
-            health_refresh: health_refresh
+            primary_timeout: bounded_submit_timeout(config.primary_timeout),
+            secondary_timeout: bounded_submit_timeout(config.secondary_timeout),
+            health_refresh: config
+                .health_refresh
                 .clamp(Duration::from_millis(100), Duration::from_secs(10)),
-            health_max_age: health_max_age
+            health_max_age: config
+                .health_max_age
                 .clamp(Duration::from_millis(250), Duration::from_secs(30)),
             health_snapshot: Arc::new(RwLock::new(None)),
-            secondary_candidate_budget_configured: secondary_candidate_budget,
-            secondary_candidate_budget: Arc::new(AtomicU64::new(secondary_candidate_budget)),
+            secondary_candidate_budget_configured: config.secondary_candidate_budget,
+            secondary_candidate_latch,
         };
         submitter.start_health_watch();
         submitter
@@ -1329,64 +1572,94 @@ impl ParallelNodeBlockSubmitter {
             .expect("parallel health snapshot lock poisoned")
             .clone()
     }
-
-    fn claim_secondary_candidate_budget(&self) -> SecondaryCandidateBudgetClaim {
-        match self.secondary_candidate_budget.compare_exchange(
-            1,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(previous) => SecondaryCandidateBudgetClaim {
-                configured: self.secondary_candidate_budget_configured,
-                before: previous,
-                claimed: true,
-                remaining: 0,
-            },
-            Err(current) => SecondaryCandidateBudgetClaim {
-                configured: self.secondary_candidate_budget_configured,
-                before: current,
-                claimed: false,
-                remaining: current,
-            },
-        }
-    }
 }
 
 #[async_trait::async_trait]
 impl BlockSubmitter for ParallelNodeBlockSubmitter {
     async fn submit_candidate(
         &self,
-        candidate: &BlockCandidateSubmitRequest,
+        submission: &BlockCandidateSubmission,
     ) -> Result<SubmitBlockResponse> {
-        let secondary_budget = self.claim_secondary_candidate_budget();
+        let candidate = &submission.candidate;
+        let full_candidate = submission.stateless_request();
         let health = self.current_health();
-        let eligibility = if secondary_budget.claimed {
-            secondary_submit_eligibility(health.as_ref(), self.health_max_age, candidate)
-        } else {
-            Err("candidate_budget_exhausted")
-        };
-        let primary_submit = submit_to_node(
+        let primary_submit = submit_cached_to_node(
             self.primary.as_ref(),
             candidate,
             self.primary_timeout,
             "authority",
         );
         let secondary_submit = async {
-            match eligibility {
+            let Some(full_candidate) = full_candidate.as_ref() else {
+                return (
+                    SecondaryCandidateBudgetClaim::not_attempted(
+                        self.secondary_candidate_budget_configured,
+                    ),
+                    skipped_submit_audit(
+                        self.secondary.name(),
+                        "best_effort",
+                        "stateless_candidate_material_missing",
+                    ),
+                );
+            };
+            if let Err(reason) =
+                secondary_submit_eligibility(health.as_ref(), self.health_max_age, candidate)
+            {
+                return (
+                    SecondaryCandidateBudgetClaim::not_attempted(
+                        self.secondary_candidate_budget_configured,
+                    ),
+                    skipped_submit_audit(self.secondary.name(), "best_effort", reason),
+                );
+            }
+            let latch = self.secondary_candidate_latch.clone();
+            let candidate_hash = candidate.hash_hex.clone();
+            let configured = self.secondary_candidate_budget_configured;
+            let claim_task =
+                tokio::task::spawn_blocking(move || latch.claim(&candidate_hash, configured));
+            let secondary_budget =
+                match tokio::time::timeout(self.secondary_timeout, claim_task).await {
+                    Ok(Ok(claim)) => claim,
+                    Ok(Err(error)) => SecondaryCandidateBudgetClaim::failed(
+                        configured,
+                        format!("persistent latch task failed: {error}"),
+                    ),
+                    Err(_) => SecondaryCandidateBudgetClaim::failed(
+                        configured,
+                        format!(
+                            "persistent latch claim timed out after {} ms",
+                            self.secondary_timeout.as_millis()
+                        ),
+                    ),
+                };
+            let post_claim_health = self.current_health();
+            let eligibility = if secondary_budget.error.is_some() {
+                Err("candidate_budget_persistence_failed")
+            } else if !secondary_budget.claimed {
+                Err("candidate_budget_exhausted")
+            } else {
+                secondary_submit_eligibility(
+                    post_claim_health.as_ref(),
+                    self.health_max_age,
+                    candidate,
+                )
+            };
+            let audit = match eligibility {
                 Ok(()) => {
-                    submit_to_node(
+                    submit_full_to_node(
                         self.secondary.as_ref(),
-                        candidate,
+                        full_candidate,
                         self.secondary_timeout,
                         "best_effort",
                     )
                     .await
                 }
                 Err(reason) => skipped_submit_audit(self.secondary.name(), "best_effort", reason),
-            }
+            };
+            (secondary_budget, audit)
         };
-        let (primary_audit, secondary_audit) = tokio::join!(primary_submit, secondary_submit);
+        let (primary_audit, (secondary_budget, secondary_audit)) =
+            tokio::join!(primary_submit, secondary_submit);
 
         let primary_ok = primary_audit
             .response
@@ -1396,7 +1669,8 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
             .response
             .as_ref()
             .is_some_and(|value| value.ok);
-        let status = parallel_submit_status(primary_ok, secondary_ok, &secondary_audit);
+        let status =
+            parallel_submit_status(primary_ok, secondary_ok, &primary_audit, &secondary_audit);
         let primary_health = health
             .as_ref()
             .map(|value| value.primary.clone())
@@ -1405,17 +1679,25 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
             .as_ref()
             .map(|value| value.secondary.clone())
             .unwrap_or_else(|| unavailable_health_audit(self.secondary.name()));
-        let mut response = primary_audit
-            .response
-            .clone()
-            .unwrap_or_else(|| SubmitBlockResponse {
-                ok: false,
-                hash: Some(candidate.hash_hex.clone()),
-                extra: serde_json::json!({
-                    "status": "authority_submit_failed",
-                    "retryable": true,
-                }),
-            });
+        let mut response = if secondary_ok && !primary_ok {
+            secondary_audit
+                .response
+                .clone()
+                .expect("secondary_ok requires a response")
+        } else {
+            primary_audit
+                .response
+                .clone()
+                .unwrap_or_else(|| SubmitBlockResponse {
+                    ok: false,
+                    hash: Some(candidate.hash_hex.clone()),
+                    extra: serde_json::json!({
+                        "status": "authority_submit_failed",
+                        "retryable": true,
+                    }),
+                })
+        };
+        response.ok = primary_ok || secondary_ok;
         let mut extra = response.extra.as_object().cloned().unwrap_or_default();
         extra.insert(
             "parallel_submit".to_owned(),
@@ -1426,11 +1708,23 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
                 "status": status,
                 "authority_ok": primary_ok,
                 "secondary_ok": secondary_ok,
+                "accepted_by": match (primary_ok, secondary_ok) {
+                    (true, true) => "both",
+                    (true, false) => "authority",
+                    (false, true) => "secondary",
+                    (false, false) => "none",
+                },
+                "local_canonical_nodes": {
+                    "authority": primary_audit.response.as_ref().is_some_and(node_response_has_local_canonical_relay_failure),
+                    "secondary": secondary_audit.response.as_ref().is_some_and(node_response_has_local_canonical_relay_failure),
+                },
                 "secondary_candidate_budget": {
                     "configured": secondary_budget.configured,
                     "before": secondary_budget.before,
                     "claimed": secondary_budget.claimed,
                     "remaining": secondary_budget.remaining,
+                    "persistence": secondary_budget.persistence,
+                    "error": secondary_budget.error,
                 },
                 "health_age_ms": health.as_ref().map(ParallelHealthSnapshot::age_ms),
                 "primary_health": primary_health_json(&primary_health),
@@ -1461,12 +1755,38 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SecondaryCandidateBudgetClaim {
     configured: u64,
     before: u64,
     claimed: bool,
     remaining: u64,
+    persistence: &'static str,
+    error: Option<String>,
+}
+
+impl SecondaryCandidateBudgetClaim {
+    fn not_attempted(configured: u64) -> Self {
+        Self {
+            configured,
+            before: configured,
+            claimed: false,
+            remaining: configured,
+            persistence: "not_attempted",
+            error: None,
+        }
+    }
+
+    fn failed(configured: u64, error: String) -> Self {
+        Self {
+            configured,
+            before: configured,
+            claimed: false,
+            remaining: 0,
+            persistence: "o_excl_file",
+            error: Some(error),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1508,6 +1828,34 @@ struct SubmitAudit {
     response: Option<SubmitBlockResponse>,
     error: Option<String>,
     skip_reason: Option<&'static str>,
+}
+
+fn node_response_has_local_canonical_relay_failure(response: &SubmitBlockResponse) -> bool {
+    response
+        .extra
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("accepted_local_relay_failed")
+        || (response
+            .extra
+            .pointer("/node_observability/local_canonical")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && response
+                .extra
+                .pointer("/node_observability/relay_ack/ok")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false))
+}
+
+fn submit_outcome(response: &SubmitBlockResponse) -> &'static str {
+    if response.ok {
+        "accepted"
+    } else if node_response_has_local_canonical_relay_failure(response) {
+        "local_canonical_relay_failed"
+    } else {
+        "rejected"
+    }
 }
 
 async fn health_with_timeout(
@@ -1553,7 +1901,7 @@ async fn health_with_timeout(
     }
 }
 
-async fn submit_to_node(
+async fn submit_cached_to_node(
     endpoint: &dyn CandidateNodeEndpoint,
     candidate: &BlockCandidateSubmitRequest,
     timeout_duration: Duration,
@@ -1561,7 +1909,11 @@ async fn submit_to_node(
 ) -> SubmitAudit {
     let started_unix_ms = unix_ms();
     let started = Instant::now();
-    let result = timeout(timeout_duration, endpoint.submit_candidate(candidate)).await;
+    let result = timeout(
+        timeout_duration,
+        endpoint.submit_cached_candidate(candidate),
+    )
+    .await;
     let elapsed_us = elapsed_us(started);
     let finished_unix_ms = unix_ms();
     match result {
@@ -1571,7 +1923,58 @@ async fn submit_to_node(
             started_unix_ms,
             finished_unix_ms,
             elapsed_us,
-            outcome: if response.ok { "accepted" } else { "rejected" },
+            outcome: submit_outcome(&response),
+            response: Some(response),
+            error: None,
+            skip_reason: None,
+        },
+        Ok(Err(error)) => SubmitAudit {
+            node: endpoint.name().to_owned(),
+            role,
+            started_unix_ms,
+            finished_unix_ms,
+            elapsed_us,
+            outcome: "transport_error",
+            response: None,
+            error: Some(error),
+            skip_reason: None,
+        },
+        Err(_) => SubmitAudit {
+            node: endpoint.name().to_owned(),
+            role,
+            started_unix_ms,
+            finished_unix_ms,
+            elapsed_us,
+            outcome: "timeout",
+            response: None,
+            error: Some(format!(
+                "submit timeout after {} ms",
+                timeout_duration.as_millis()
+            )),
+            skip_reason: None,
+        },
+    }
+}
+
+async fn submit_full_to_node(
+    endpoint: &dyn CandidateNodeEndpoint,
+    candidate: &StatelessBlockCandidateSubmitRequest<'_>,
+    timeout_duration: Duration,
+    role: &'static str,
+) -> SubmitAudit {
+    let started_unix_ms = unix_ms();
+    let started = Instant::now();
+    let result = timeout(timeout_duration, endpoint.submit_full_candidate(candidate)).await;
+    let elapsed_us = elapsed_us(started);
+    let finished_unix_ms = unix_ms();
+    match result {
+        Ok(Ok(response)) => SubmitAudit {
+            node: endpoint.name().to_owned(),
+            role,
+            started_unix_ms,
+            finished_unix_ms,
+            elapsed_us,
+            outcome: submit_outcome(&response),
             response: Some(response),
             error: None,
             skip_reason: None,
@@ -1638,9 +2041,13 @@ fn secondary_submit_eligibility(
         && secondary
             .chainwork
             .as_deref()
-            .is_some_and(|value| !value.is_empty());
+            .is_some_and(|value| !value.is_empty())
+        && secondary.peers.is_some();
     if !primary_complete || !secondary_complete {
         return Err("health_incomplete");
+    }
+    if secondary.peers == Some(0) {
+        return Err("secondary_no_peers");
     }
     let primary_tip =
         CanonicalBlockHash::from_display_hex(primary.tip.as_deref().ok_or("health_incomplete")?)
@@ -1718,13 +2125,29 @@ fn skipped_submit_audit(node: &str, role: &'static str, reason: &'static str) ->
 fn parallel_submit_status(
     primary_ok: bool,
     secondary_ok: bool,
+    primary: &SubmitAudit,
     secondary: &SubmitAudit,
 ) -> &'static str {
     match (primary_ok, secondary_ok, secondary.outcome) {
         (true, true, _) => "both_accepted",
         (true, false, "skipped") => "authority_accepted_secondary_skipped",
+        (true, false, "local_canonical_relay_failed") => {
+            "authority_accepted_secondary_local_canonical_relay_failed"
+        }
         (true, false, _) => "authority_accepted_secondary_failed",
+        (false, true, _) if primary.outcome == "local_canonical_relay_failed" => {
+            "secondary_accepted_authority_local_canonical_relay_failed"
+        }
         (false, true, _) => "secondary_accepted_authority_failed",
+        (false, false, "local_canonical_relay_failed")
+            if primary.outcome == "local_canonical_relay_failed" =>
+        {
+            "both_local_canonical_relay_failed"
+        }
+        (false, false, _) if primary.outcome == "local_canonical_relay_failed" => {
+            "authority_local_canonical_relay_failed"
+        }
+        (false, false, "local_canonical_relay_failed") => "secondary_local_canonical_relay_failed",
         (false, false, "skipped") => "authority_failed_secondary_skipped",
         (false, false, _) => "both_failed",
     }
@@ -1823,10 +2246,18 @@ async fn submit_block_candidate(
     };
 
     let effort_pct = block_effort_pct(job, pool_state, difficulty);
-    let request = block_candidate_submit_request(job, miner, submit, share, extranonce1_le);
+    let submission = BlockCandidateSubmission {
+        candidate: block_candidate_submit_request(job, miner, submit, share, extranonce1_le),
+        candidate_material: job
+            .candidate_material
+            .read()
+            .expect("candidate material slot lock poisoned")
+            .clone(),
+    };
+    let request = &submission.candidate;
     let detected_to_submit_start_us = observation.elapsed_us();
     let node_submit_started = Instant::now();
-    let submit_result = submitter.submit_candidate(&request).await;
+    let submit_result = submitter.submit_candidate(&submission).await;
     let node_roundtrip_us = elapsed_us(node_submit_started);
     let response = match submit_result {
         Ok(mut response) => {
@@ -1860,7 +2291,7 @@ async fn submit_block_candidate(
                 repository
                     .record_block_candidate(&block_candidate_record(
                         miner,
-                        &request,
+                        &submission,
                         &failed_response,
                         effort_pct,
                     ))
@@ -1913,7 +2344,10 @@ async fn submit_block_candidate(
     if let Some(repository) = repository {
         repository
             .record_block_candidate(&block_candidate_record(
-                miner, &request, &response, effort_pct,
+                miner,
+                &submission,
+                &response,
+                effort_pct,
             ))
             .await?;
     }
@@ -2042,10 +2476,12 @@ fn block_candidate_submit_request(
 
 fn block_candidate_record(
     miner: &str,
-    request: &BlockCandidateSubmitRequest,
+    submission: &BlockCandidateSubmission,
     response: &SubmitBlockResponse,
     effort_pct: f64,
 ) -> csd_pool_db::BlockCandidateRecord {
+    let request = &submission.candidate;
+    let material = submission.candidate_material.as_deref();
     csd_pool_db::BlockCandidateRecord {
         hash_hex: response
             .hash
@@ -2056,11 +2492,14 @@ fn block_candidate_record(
         worker_name: request.worker_name.clone(),
         reward_base_units: 0,
         effort_pct,
-        candidate_payload_json: serde_json::to_value(request).unwrap_or_else(|_| {
-            serde_json::json!({
-                "job_id": request.job_id,
-                "hash_hex": request.hash_hex,
-            })
+        candidate_payload_json: serde_json::json!({
+            "worker_name": request.worker_name,
+            "job_id": request.job_id,
+            "extranonce2_hex": request.extranonce2_hex,
+            "nonce_hex": request.nonce_hex,
+            "hash_hex": request.hash_hex,
+            "block_template_sha256_hex": material.map(|value| &value.block_template_sha256_hex),
+            "block_template_bytes": material.map(|value| value.block_template_bytes),
         }),
         submit_response_json: serde_json::to_value(response).unwrap_or_else(|_| {
             serde_json::json!({
@@ -2870,6 +3309,7 @@ mod tests {
     #[derive(Clone)]
     enum MockSubmitBehavior {
         Response(bool),
+        LocalCanonicalRelayFailed(&'static str),
         Error(&'static str),
         DelayedResponse(Duration, bool),
     }
@@ -2880,6 +3320,8 @@ mod tests {
         health_error: Option<&'static str>,
         behavior: MockSubmitBehavior,
         submit_calls: AtomicUsize,
+        cached_submit_calls: AtomicUsize,
+        full_submit_calls: AtomicUsize,
     }
 
     impl MockCandidateNodeEndpoint {
@@ -2896,11 +3338,18 @@ mod tests {
                 health_error: None,
                 behavior,
                 submit_calls: AtomicUsize::new(0),
+                cached_submit_calls: AtomicUsize::new(0),
+                full_submit_calls: AtomicUsize::new(0),
             }
         }
 
         fn with_tip(mut self, tip: &str) -> Self {
             self.health.tip = Some(tip.to_owned());
+            self
+        }
+
+        fn with_peers(mut self, peers: u64) -> Self {
+            self.health.peers = Some(peers);
             self
         }
     }
@@ -2917,20 +3366,53 @@ mod tests {
                 .unwrap_or_else(|| Ok(self.health.clone()))
         }
 
-        async fn submit_candidate(
+        async fn submit_cached_candidate(
             &self,
             candidate: &BlockCandidateSubmitRequest,
+        ) -> std::result::Result<SubmitBlockResponse, String> {
+            self.cached_submit_calls.fetch_add(1, Ordering::SeqCst);
+            self.submit_response(&candidate.hash_hex).await
+        }
+
+        async fn submit_full_candidate(
+            &self,
+            candidate: &StatelessBlockCandidateSubmitRequest<'_>,
+        ) -> std::result::Result<SubmitBlockResponse, String> {
+            self.full_submit_calls.fetch_add(1, Ordering::SeqCst);
+            self.submit_response(&candidate.candidate.hash_hex).await
+        }
+    }
+
+    impl MockCandidateNodeEndpoint {
+        async fn submit_response(
+            &self,
+            candidate_hash: &str,
         ) -> std::result::Result<SubmitBlockResponse, String> {
             self.submit_calls.fetch_add(1, Ordering::SeqCst);
             let response = |ok| SubmitBlockResponse {
                 ok,
-                hash: Some(candidate.hash_hex.clone()),
+                hash: Some(candidate_hash.to_owned()),
                 extra: serde_json::json!({
                     "status": if ok { "accepted" } else { "rejected" },
                 }),
             };
             match self.behavior {
                 MockSubmitBehavior::Response(ok) => Ok(response(ok)),
+                MockSubmitBehavior::LocalCanonicalRelayFailed(status) => Ok(SubmitBlockResponse {
+                    ok: false,
+                    hash: Some(candidate_hash.to_owned()),
+                    extra: serde_json::json!({
+                        "status": "accepted_local_relay_failed",
+                        "error": status,
+                        "node_observability": {
+                            "local_canonical": true,
+                            "relay_ack": {
+                                "ok": false,
+                                "status": status,
+                            }
+                        }
+                    }),
+                }),
                 MockSubmitBehavior::Error(error) => Err(error.to_owned()),
                 MockSubmitBehavior::DelayedResponse(delay, ok) => {
                     tokio::time::sleep(delay).await;
@@ -2955,6 +3437,25 @@ mod tests {
         }
     }
 
+    fn candidate_material() -> CandidateTemplateMaterial {
+        CandidateTemplateMaterial {
+            block_template_hex: "00".repeat(128),
+            block_template_sha256_hex: "55".repeat(32),
+            block_template_bytes: 128,
+        }
+    }
+
+    fn submission(candidate: BlockCandidateSubmitRequest) -> BlockCandidateSubmission {
+        BlockCandidateSubmission {
+            candidate,
+            candidate_material: Some(Arc::new(candidate_material())),
+        }
+    }
+
+    fn mock_submission() -> BlockCandidateSubmission {
+        submission(mock_candidate())
+    }
+
     const H58427_PARENT_DISPLAY: &str =
         "00000000000013c6d2db4280dd807f75740a3300e84c53d4114b944b9012d56b";
 
@@ -2977,6 +3478,10 @@ mod tests {
             ntime_hex: "6a5ea370".to_owned(),
             nonce_hex: "88e51ba7".to_owned(),
         }
+    }
+
+    fn h58427_submission() -> BlockCandidateSubmission {
+        submission(h58427_candidate())
     }
 
     #[derive(Clone)]
@@ -3005,11 +3510,24 @@ mod tests {
         })
     }
 
+    async fn replay_submit_full(
+        State(state): State<ReplayNodeState>,
+        Json(candidate): Json<serde_json::Value>,
+    ) -> Json<SubmitBlockResponse> {
+        state.submit_calls.fetch_add(1, Ordering::SeqCst);
+        Json(SubmitBlockResponse {
+            ok: true,
+            hash: candidate["hash_hex"].as_str().map(str::to_owned),
+            extra: serde_json::json!({"status": "accepted"}),
+        })
+    }
+
     async fn spawn_replay_node() -> (String, Arc<AtomicUsize>) {
         let submit_calls = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route("/health", axum::routing::get(replay_health))
             .route("/api/rpc/block/submit", post(replay_submit))
+            .route("/api/rpc/block/submit-full", post(replay_submit_full))
             .with_state(ReplayNodeState {
                 submit_calls: submit_calls.clone(),
             });
@@ -3029,14 +3547,43 @@ mod tests {
         let submitter = ParallelNodeBlockSubmitter::new(
             primary,
             secondary,
-            timeout_duration,
-            timeout_duration,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            1,
+            ParallelSubmitConfig {
+                primary_timeout: timeout_duration,
+                secondary_timeout: timeout_duration,
+                health_refresh: Duration::from_secs(10),
+                health_max_age: Duration::from_secs(30),
+                secondary_candidate_budget: 1,
+            },
+            test_candidate_latch(),
         );
         submitter.refresh_health_once().await;
         submitter
+    }
+
+    fn parallel_submitter_without_health_watch(
+        primary: Arc<MockCandidateNodeEndpoint>,
+        secondary: Arc<MockCandidateNodeEndpoint>,
+        latch: PersistentCandidateLatch,
+    ) -> ParallelNodeBlockSubmitter {
+        ParallelNodeBlockSubmitter {
+            primary,
+            secondary,
+            primary_timeout: Duration::from_secs(1),
+            secondary_timeout: Duration::from_secs(1),
+            health_refresh: Duration::from_secs(10),
+            health_max_age: Duration::from_secs(30),
+            health_snapshot: Arc::new(RwLock::new(None)),
+            secondary_candidate_budget_configured: 1,
+            secondary_candidate_latch: latch,
+        }
+    }
+
+    fn test_candidate_latch() -> PersistentCandidateLatch {
+        let path = std::env::temp_dir().join(format!(
+            "csd-pool-secondary-candidate-{}.latch",
+            uuid::Uuid::new_v4()
+        ));
+        PersistentCandidateLatch::new(path).unwrap()
     }
 
     #[test]
@@ -3049,7 +3596,7 @@ mod tests {
     impl BlockSubmitter for FailingBlockSubmitter {
         async fn submit_candidate(
             &self,
-            _candidate: &BlockCandidateSubmitRequest,
+            _submission: &BlockCandidateSubmission,
         ) -> Result<SubmitBlockResponse> {
             Err(BridgeError::InvalidConfig("node unavailable".to_owned()))
         }
@@ -3059,8 +3606,9 @@ mod tests {
     impl BlockSubmitter for ObservableBlockSubmitter {
         async fn submit_candidate(
             &self,
-            candidate: &BlockCandidateSubmitRequest,
+            submission: &BlockCandidateSubmission,
         ) -> Result<SubmitBlockResponse> {
+            let candidate = &submission.candidate;
             Ok(SubmitBlockResponse {
                 ok: true,
                 hash: Some(candidate.hash_hex.clone()),
@@ -3127,9 +3675,28 @@ mod tests {
             .unwrap();
         assert_eq!(receiver.borrow().template.job_id, "job-refreshed");
         assert!(receiver.borrow().notify.clean_jobs);
-        assert!(jobs.retained_jobs().get("job-initial").is_none());
+        assert!(jobs.retained_jobs().get("job-initial").is_some());
         assert!(jobs.retained_jobs().get("job-refreshed").is_some());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn clean_tip_churn_keeps_base_jobs_available_for_share_validation() {
+        let initial = Arc::new(csd_pool_node::easy_static_job("clean-job-0"));
+        let retained = RetainedJobs::with_initial(initial.clone());
+        let retention = Duration::from_secs(900);
+
+        for index in 1..=12 {
+            let mut next = csd_pool_node::easy_static_job(format!("clean-job-{index}"));
+            next.template.prev = [index as u8; 32];
+            next.notify.prev_hash_be_hex = hex::encode(next.template.prev);
+            retained.publish(Arc::new(next), JobReason::TipChange, retention);
+        }
+
+        let old = retained.get("clean-job-0").expect("old base job retained");
+        assert_eq!(old.template.job_id, initial.template.job_id);
+        assert_eq!(old.template.share_target, initial.template.share_target);
+        assert_eq!(retained.len(), 13);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3175,7 +3742,7 @@ mod tests {
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn long_same_tip_gap_keeps_legacy_and_v2_sessions_live_and_accepts_old_job() {
         type TestReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
         type TestWriter = tokio::net::tcp::OwnedWriteHalf;
@@ -3259,7 +3826,9 @@ mod tests {
         }
 
         async fn read_heartbeat(reader: &mut TestReader, previous_job_id: &str) -> String {
-            let frame = read_frame(reader).await;
+            let frame = tokio::time::timeout(Duration::from_secs(1), read_frame(reader))
+                .await
+                .expect("heartbeat frame arrived before the next simulated interval");
             assert_eq!(frame["method"], "mining.notify");
             assert_eq!(frame["params"][8], false);
             let job_id = frame["params"][0].as_str().unwrap().to_owned();
@@ -3343,6 +3912,7 @@ mod tests {
         )
         .await;
 
+        tokio::time::pause();
         tokio::task::yield_now().await;
         let mut legacy_job_id = initial_job.template.job_id.clone();
         let mut v2_job_id = initial_job.template.job_id.clone();
@@ -3772,7 +4342,7 @@ mod tests {
         let response =
             parallel_submitter(primary.clone(), secondary.clone(), Duration::from_secs(1))
                 .await
-                .submit_candidate(&h58427_candidate())
+                .submit_candidate(&h58427_submission())
                 .await
                 .unwrap();
 
@@ -3783,7 +4353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_submit_real_parent_mismatch_consumes_one_shot_budget() {
+    async fn parallel_submit_parent_mismatch_does_not_claim_one_shot_budget() {
         let primary = Arc::new(
             MockCandidateNodeEndpoint::healthy("node-a", MockSubmitBehavior::Response(true))
                 .with_tip(&format!("0x{H58427_PARENT_DISPLAY}")),
@@ -3794,10 +4364,10 @@ mod tests {
         );
         let submitter =
             parallel_submitter(primary.clone(), secondary.clone(), Duration::from_secs(1)).await;
-        let mut mismatch = h58427_candidate();
-        let mut header = hex::decode(&mismatch.header_hex).unwrap();
+        let mut mismatch = h58427_submission();
+        let mut header = hex::decode(&mismatch.candidate.header_hex).unwrap();
         header[4] ^= 0x01;
-        mismatch.header_hex = hex::encode(header);
+        mismatch.candidate.header_hex = hex::encode(header);
 
         let first = submitter.submit_candidate(&mismatch).await.unwrap();
         assert_eq!(
@@ -3806,24 +4376,21 @@ mod tests {
         );
         assert_eq!(
             first.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
-            true
+            false
         );
+        assert!(!submitter.secondary_candidate_latch.path.exists());
         assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 0);
 
         let second = submitter
-            .submit_candidate(&h58427_candidate())
+            .submit_candidate(&h58427_submission())
             .await
             .unwrap();
         assert_eq!(
-            second.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
-            "candidate_budget_exhausted"
-        );
-        assert_eq!(
             second.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
-            false
+            true
         );
         assert_eq!(primary.submit_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3836,8 +4403,8 @@ mod tests {
             "node-b",
             MockSubmitBehavior::Response(true),
         ));
-        let mut candidate = mock_candidate();
-        candidate.header_hex = "00".repeat(83);
+        let mut candidate = mock_submission();
+        candidate.candidate.header_hex = "00".repeat(83);
         let response = parallel_submitter(primary, secondary.clone(), Duration::from_secs(1))
             .await
             .submit_candidate(&candidate)
@@ -3864,7 +4431,7 @@ mod tests {
         let response =
             parallel_submitter(primary.clone(), secondary.clone(), Duration::from_secs(1))
                 .await
-                .submit_candidate(&mock_candidate())
+                .submit_candidate(&mock_submission())
                 .await
                 .unwrap();
 
@@ -3902,12 +4469,12 @@ mod tests {
         ));
         let submitter =
             parallel_submitter(primary.clone(), secondary.clone(), Duration::from_secs(1)).await;
-        let mut first = mock_candidate();
-        first.job_id = "candidate-1".to_owned();
-        first.hash_hex = "11".repeat(32);
-        let mut second = mock_candidate();
-        second.job_id = "candidate-2".to_owned();
-        second.hash_hex = "22".repeat(32);
+        let mut first = mock_submission();
+        first.candidate.job_id = "candidate-1".to_owned();
+        first.candidate.hash_hex = "11".repeat(32);
+        let mut second = mock_submission();
+        second.candidate.job_id = "candidate-2".to_owned();
+        second.candidate.hash_hex = "22".repeat(32);
 
         let (first_response, second_response) = tokio::join!(
             submitter.submit_candidate(&first),
@@ -3954,7 +4521,7 @@ mod tests {
         ));
         let response = parallel_submitter(primary, secondary, Duration::from_secs(1))
             .await
-            .submit_candidate(&mock_candidate())
+            .submit_candidate(&mock_submission())
             .await
             .unwrap();
 
@@ -3981,11 +4548,11 @@ mod tests {
         ));
         let response = parallel_submitter(primary, secondary, Duration::from_secs(1))
             .await
-            .submit_candidate(&mock_candidate())
+            .submit_candidate(&mock_submission())
             .await
             .unwrap();
 
-        assert!(!response.ok);
+        assert!(response.ok);
         assert_eq!(
             response.extra["parallel_submit"]["status"],
             "secondary_accepted_authority_failed"
@@ -3993,6 +4560,150 @@ mod tests {
         assert_eq!(
             response.extra["parallel_submit"]["secondary_submit"]["outcome"],
             "accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn secondary_only_success_persists_status_and_operator_alert() {
+        use csd_pool_db::{BlockRepository, MonitoringRepository};
+
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(false),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Response(true),
+        ));
+        let submission = mock_submission();
+        let response = parallel_submitter(primary, secondary, Duration::from_secs(1))
+            .await
+            .submit_candidate(&submission)
+            .await
+            .unwrap();
+        let repository = csd_pool_db::InMemoryRepository::new();
+        let record = block_candidate_record(
+            "0123456789abcdef0123456789abcdef01234567",
+            &submission,
+            &response,
+            42.0,
+        );
+
+        assert!(repository.record_block_candidate(&record).await.unwrap());
+        let blocks = BlockRepository::list_blocks_to_reconcile(&repository, 10)
+            .await
+            .unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].status, "submitted_secondary");
+        let alerts = repository
+            .list_block_submission_alerts(10, 10)
+            .await
+            .unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].status, "submitted_secondary");
+        assert_eq!(alerts[0].reason, "authority_failed_secondary_accepted");
+        assert_eq!(
+            repository.list_block_candidates().unwrap()[0].submit_response_json["parallel_submit"]
+                ["accepted_by"],
+            "secondary"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_submit_fails_when_both_nodes_are_local_only_without_broadcast() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::LocalCanonicalRelayFailed("insufficient_peers"),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::LocalCanonicalRelayFailed("relay_ack_timeout"),
+        ));
+        let response = parallel_submitter(primary, secondary, Duration::from_secs(1))
+            .await
+            .submit_candidate(&mock_submission())
+            .await
+            .unwrap();
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.extra["parallel_submit"]["status"],
+            "both_local_canonical_relay_failed"
+        );
+        assert_eq!(response.extra["parallel_submit"]["accepted_by"], "none");
+        assert_eq!(
+            response.extra["parallel_submit"]["primary_submit"]["outcome"],
+            "local_canonical_relay_failed"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_submit"]["outcome"],
+            "local_canonical_relay_failed"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["local_canonical_nodes"],
+            serde_json::json!({"authority": true, "secondary": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn secondary_broadcast_success_does_not_hide_authority_local_only_failure() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::LocalCanonicalRelayFailed("insufficient_peers"),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Response(true),
+        ));
+        let response = parallel_submitter(primary, secondary, Duration::from_secs(1))
+            .await
+            .submit_candidate(&mock_submission())
+            .await
+            .unwrap();
+
+        assert!(response.ok);
+        assert_eq!(
+            response.extra["parallel_submit"]["accepted_by"],
+            "secondary"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["status"],
+            "secondary_accepted_authority_local_canonical_relay_failed"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["primary_submit"]["outcome"],
+            "local_canonical_relay_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_broadcast_success_preserves_secondary_local_only_failure() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::LocalCanonicalRelayFailed("relay_ack_timeout"),
+        ));
+        let response = parallel_submitter(primary, secondary, Duration::from_secs(1))
+            .await
+            .submit_candidate(&mock_submission())
+            .await
+            .unwrap();
+
+        assert!(response.ok);
+        assert_eq!(
+            response.extra["parallel_submit"]["accepted_by"],
+            "authority"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["status"],
+            "authority_accepted_secondary_local_canonical_relay_failed"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_submit"]["outcome"],
+            "local_canonical_relay_failed"
         );
     }
 
@@ -4008,7 +4719,7 @@ mod tests {
         ));
         let response = parallel_submitter(primary, secondary, Duration::from_millis(100))
             .await
-            .submit_candidate(&mock_candidate())
+            .submit_candidate(&mock_submission())
             .await
             .unwrap();
 
@@ -4036,7 +4747,7 @@ mod tests {
         );
         let response = parallel_submitter(primary, secondary.clone(), Duration::from_secs(1))
             .await
-            .submit_candidate(&mock_candidate())
+            .submit_candidate(&mock_submission())
             .await
             .unwrap();
 
@@ -4053,7 +4764,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_submit_consumes_one_shot_budget_when_health_gate_skips_secondary() {
+    async fn parallel_submit_skips_secondary_without_relay_peers_or_latch_claim() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(
+            MockCandidateNodeEndpoint::healthy("node-b", MockSubmitBehavior::Response(true))
+                .with_peers(0),
+        );
+        let submitter = parallel_submitter_without_health_watch(
+            primary,
+            secondary.clone(),
+            test_candidate_latch(),
+        );
+        submitter.refresh_health_once().await;
+
+        let response = submitter
+            .submit_candidate(&mock_submission())
+            .await
+            .unwrap();
+
+        assert!(response.ok);
+        assert_eq!(
+            response.extra["parallel_submit"]["status"],
+            "authority_accepted_secondary_skipped"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "secondary_no_peers"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
+            false
+        );
+        assert!(!submitter.secondary_candidate_latch.path.exists());
+        assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_submit_health_mismatch_does_not_claim_and_next_healthy_candidate_can_claim() {
         let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
             "node-a",
             MockSubmitBehavior::Response(true),
@@ -4062,29 +4812,269 @@ mod tests {
             MockCandidateNodeEndpoint::healthy("node-b", MockSubmitBehavior::Response(true))
                 .with_tip(&format!("0x{}", "11".repeat(32))),
         );
-        let submitter =
-            parallel_submitter(primary, secondary.clone(), Duration::from_secs(1)).await;
+        let submitter = parallel_submitter_without_health_watch(
+            primary,
+            secondary.clone(),
+            test_candidate_latch(),
+        );
+        submitter.refresh_health_once().await;
 
-        let first = submitter.submit_candidate(&mock_candidate()).await.unwrap();
+        let first = submitter
+            .submit_candidate(&mock_submission())
+            .await
+            .unwrap();
         assert_eq!(
             first.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
             "chain_state_mismatch"
         );
         assert_eq!(
             first.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
-            true
-        );
-
-        let second = submitter.submit_candidate(&mock_candidate()).await.unwrap();
-        assert_eq!(
-            second.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
-            "candidate_budget_exhausted"
-        );
-        assert_eq!(
-            second.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
             false
         );
-        assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 0);
+        assert!(!submitter.secondary_candidate_latch.path.exists());
+
+        {
+            let mut health = submitter
+                .health_snapshot
+                .write()
+                .expect("parallel health snapshot lock poisoned");
+            let snapshot = health.as_mut().unwrap();
+            snapshot.secondary.snapshot.as_mut().unwrap().tip =
+                Some(format!("0x{}", "00".repeat(32)));
+            snapshot.observed_at = Instant::now();
+        }
+
+        let second = submitter
+            .submit_candidate(&mock_submission())
+            .await
+            .unwrap();
+        assert_eq!(
+            second.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
+            true
+        );
+        assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn candidate_before_first_health_does_not_create_latch() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Response(true),
+        ));
+        let latch = test_candidate_latch();
+        let submitter =
+            parallel_submitter_without_health_watch(primary.clone(), secondary.clone(), latch);
+
+        let first = submitter
+            .submit_candidate(&mock_submission())
+            .await
+            .unwrap();
+        assert!(first.ok);
+        assert_eq!(
+            first.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "health_not_ready"
+        );
+        assert_eq!(
+            first.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
+            false
+        );
+        assert!(!submitter.secondary_candidate_latch.path.exists());
+        assert_eq!(primary.cached_submit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 0);
+
+        submitter.refresh_health_once().await;
+        let second = submitter
+            .submit_candidate(&mock_submission())
+            .await
+            .unwrap();
+        assert!(second.ok);
+        assert_eq!(
+            second.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
+            true
+        );
+        assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn persistent_latch_is_mode_600_and_existing_file_is_fail_closed() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let latch = test_candidate_latch();
+        let path = latch.path.as_ref().clone();
+        let first = latch.claim(&"11".repeat(32), 1);
+        assert!(first.claimed);
+        assert!(first.error.is_none());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let restarted = PersistentCandidateLatch::new(path.clone()).unwrap();
+        let second = restarted.claim(&"22".repeat(32), 1);
+        assert!(!second.claimed);
+        assert!(second.error.is_none());
+        assert_eq!(second.remaining, 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn persistent_latch_rejects_unsafe_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = std::env::temp_dir().join(format!(
+            "csd-pool-secondary-candidate-unsafe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = PersistentCandidateLatch::new(parent.join("candidate.latch"))
+            .err()
+            .expect("unsafe writable parent must fail closed");
+        assert!(error.to_string().contains("group/world writable"));
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn persistent_latch_rejects_existing_file_with_broad_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = std::env::temp_dir().join(format!(
+            "csd-pool-secondary-candidate-mode-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("candidate.latch");
+        std::fs::write(&path, b"claimed\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = PersistentCandidateLatch::new(path.clone())
+            .err()
+            .expect("broad latch permissions must fail closed");
+        assert!(error.to_string().contains("mode 0600 or stricter"));
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_latch_persistence_does_not_delay_primary_request_start() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Response(true),
+        ));
+        let latch = test_candidate_latch().with_claim_delay(Duration::from_millis(150));
+        let submitter = parallel_submitter_without_health_watch(primary.clone(), secondary, latch);
+        submitter.refresh_health_once().await;
+        let submission = mock_submission();
+        let pending = tokio::spawn(async move { submitter.submit_candidate(&submission).await });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(primary.cached_submit_calls.load(Ordering::SeqCst), 1);
+        assert!(!pending.is_finished());
+        assert!(pending.await.unwrap().unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn slow_latch_persistence_is_bounded_and_fails_closed() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Response(true),
+        ));
+        let latch = test_candidate_latch().with_claim_delay(Duration::from_millis(350));
+        let latch_path = latch.path.clone();
+        let mut submitter =
+            parallel_submitter_without_health_watch(primary, secondary.clone(), latch);
+        submitter.secondary_timeout = Duration::from_millis(50);
+        submitter.refresh_health_once().await;
+
+        let started = Instant::now();
+        let response = submitter
+            .submit_candidate(&mock_submission())
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(response.ok);
+        assert_eq!(
+            response.extra["parallel_submit"]["status"],
+            "authority_accepted_secondary_skipped"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "candidate_budget_persistence_failed"
+        );
+        assert!(
+            response.extra["parallel_submit"]["secondary_candidate_budget"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("timed out")
+        );
+        assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 0);
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(latch_path.exists());
+    }
+
+    #[tokio::test]
+    async fn health_drift_after_claim_skips_secondary_and_consumes_latch() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Response(true),
+        ));
+        let latch = test_candidate_latch().with_claim_delay(Duration::from_millis(100));
+        let submitter = Arc::new(parallel_submitter_without_health_watch(
+            primary,
+            secondary.clone(),
+            latch,
+        ));
+        submitter.refresh_health_once().await;
+        let worker = submitter.clone();
+        let pending =
+            tokio::spawn(async move { worker.submit_candidate(&mock_submission()).await });
+
+        while !submitter.secondary_candidate_latch.path.exists() {
+            tokio::task::yield_now().await;
+        }
+        {
+            let mut health = submitter
+                .health_snapshot
+                .write()
+                .expect("parallel health snapshot lock poisoned");
+            let snapshot = health.as_mut().unwrap();
+            snapshot.secondary.snapshot.as_mut().unwrap().tip =
+                Some(format!("0x{}", "44".repeat(32)));
+            snapshot.observed_at = Instant::now();
+        }
+        let response = pending.await.unwrap().unwrap();
+
+        assert!(response.ok);
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
+            true
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "chain_state_mismatch"
+        );
+        assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -4100,15 +5090,21 @@ mod tests {
                 "node-b".to_owned(),
                 CsdNodeClient::new(secondary_url),
             )),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            1,
+            ParallelSubmitConfig {
+                primary_timeout: Duration::from_secs(1),
+                secondary_timeout: Duration::from_secs(1),
+                health_refresh: Duration::from_secs(10),
+                health_max_age: Duration::from_secs(30),
+                secondary_candidate_budget: 1,
+            },
+            test_candidate_latch(),
         );
         submitter.refresh_health_once().await;
 
-        let response = submitter.submit_candidate(&mock_candidate()).await.unwrap();
+        let response = submitter
+            .submit_candidate(&mock_submission())
+            .await
+            .unwrap();
 
         assert!(response.ok);
         assert_eq!(response.extra["parallel_submit"]["status"], "both_accepted");
@@ -4298,9 +5294,13 @@ mod tests {
             hash: Some("22".repeat(32)),
             extra: serde_json::json!({"source": "test"}),
         };
+        let submission = BlockCandidateSubmission {
+            candidate: request,
+            candidate_material: None,
+        };
         let record = block_candidate_record(
             "0123456789abcdef0123456789abcdef01234567",
-            &request,
+            &submission,
             &response,
             91.25,
         );

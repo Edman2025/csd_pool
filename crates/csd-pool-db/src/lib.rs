@@ -67,6 +67,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "job_heartbeat_observability",
         sql: include_str!("../../../migrations/0010_job_heartbeat_observability.sql"),
     },
+    Migration {
+        version: 11,
+        name: "block_candidate_relay_failure",
+        sql: include_str!("../../../migrations/0011_block_candidate_relay_failure.sql"),
+    },
 ];
 
 pub fn all_migrations() -> &'static [Migration] {
@@ -338,13 +343,65 @@ pub struct BlockCandidateRecord {
     pub submit_response_json: serde_json::Value,
 }
 
+fn node_response_has_local_canonical_relay_failure(response: &serde_json::Value) -> bool {
+    response.get("status").and_then(serde_json::Value::as_str)
+        == Some("accepted_local_relay_failed")
+        || (response
+            .pointer("/node_observability/local_canonical")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && response
+                .pointer("/node_observability/relay_ack/ok")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false))
+}
+
+fn block_candidate_has_local_canonical_relay_failure(block: &BlockCandidateRecord) -> bool {
+    let response = &block.submit_response_json;
+    node_response_has_local_canonical_relay_failure(response)
+        || response
+            .pointer("/parallel_submit/primary_submit/response")
+            .is_some_and(node_response_has_local_canonical_relay_failure)
+        || response
+            .pointer("/parallel_submit/secondary_submit/response")
+            .is_some_and(node_response_has_local_canonical_relay_failure)
+}
+
+fn block_candidate_has_ambiguous_submit_outcome(block: &BlockCandidateRecord) -> bool {
+    let response = &block.submit_response_json;
+    response.get("transport_error").is_some()
+        || [
+            "/parallel_submit/primary_submit/outcome",
+            "/parallel_submit/secondary_submit/outcome",
+        ]
+        .iter()
+        .filter_map(|pointer| {
+            response
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+        })
+        .any(|outcome| matches!(outcome, "transport_error" | "timeout"))
+}
+
 fn block_candidate_initial_status(block: &BlockCandidateRecord) -> &'static str {
     let submit_ok = block
         .submit_response_json
         .get("ok")
         .and_then(serde_json::Value::as_bool);
-    let transport_ambiguous = block.submit_response_json.get("transport_error").is_some();
-    if submit_ok == Some(false) && !transport_ambiguous {
+    let accepted_by = block
+        .submit_response_json
+        .pointer("/parallel_submit/accepted_by")
+        .and_then(serde_json::Value::as_str);
+    if submit_ok == Some(true) && accepted_by == Some("secondary") {
+        return "submitted_secondary";
+    }
+    if submit_ok == Some(true) && block_candidate_has_local_canonical_relay_failure(block) {
+        return "submitted_degraded";
+    }
+    if block_candidate_has_local_canonical_relay_failure(block) {
+        return "relay_failed";
+    }
+    if submit_ok == Some(false) && !block_candidate_has_ambiguous_submit_outcome(block) {
         "orphaned"
     } else {
         "submitted"
@@ -1348,7 +1405,7 @@ impl BlockRepository for PgRepository {
                     reward_base_units::text as reward_base_units,
                     coalesce(effort_pct, 0)::text as effort_pct
              from blocks
-             where status in ('submitted', 'seen_on_chain', 'immature')
+             where status in ('submitted', 'submitted_secondary', 'submitted_degraded', 'relay_failed', 'seen_on_chain', 'immature')
              order by submitted_at asc nulls last, id asc
              limit $1",
         )
@@ -1953,13 +2010,18 @@ impl MonitoringRepository for PgRepository {
                  else null
                end as submit_ok,
                case
+                 when status = 'relay_failed' then 'local_canonical_relay_failed'
+                 when status = 'submitted_secondary' then 'authority_failed_secondary_accepted'
+                 when status = 'submitted_degraded' then 'redundant_relay_failed'
                  when submit_response_json ? 'ok' and (submit_response_json->>'ok')::boolean = false
                  then 'submit_response_not_ok'
                  else 'submitted_too_old'
                end as reason
              from blocks
-             where status = 'submitted'
+             where status in ('submitted', 'submitted_secondary', 'submitted_degraded', 'relay_failed')
                and (
+                 status in ('submitted_secondary', 'submitted_degraded', 'relay_failed')
+                 or
                  (submit_response_json ? 'ok' and (submit_response_json->>'ok')::boolean = false)
                  or submitted_at < now() - ($1::text || ' minutes')::interval
                )
@@ -3273,12 +3335,25 @@ impl MonitoringRepository for InMemoryRepository {
                 .submit_response_json
                 .get("ok")
                 .and_then(|value| value.as_bool());
-            if submit_ok == Some(false) {
-                let status = inner
-                    .block_statuses
-                    .get(hash_hex)
-                    .map(|block| block.status.clone())
-                    .unwrap_or_else(|| "submitted".to_owned());
+            let status = inner
+                .block_statuses
+                .get(hash_hex)
+                .map(|block| block.status.clone())
+                .unwrap_or_else(|| "submitted".to_owned());
+            if submit_ok == Some(false)
+                || matches!(
+                    status.as_str(),
+                    "submitted_secondary" | "submitted_degraded" | "relay_failed"
+                )
+            {
+                let reason = match status.as_str() {
+                    "submitted_secondary" => "authority_failed_secondary_accepted".to_owned(),
+                    "submitted_degraded" => "redundant_relay_failed".to_owned(),
+                    _ if block_candidate_has_local_canonical_relay_failure(candidate) => {
+                        "local_canonical_relay_failed".to_owned()
+                    }
+                    _ => "submit_response_not_ok".to_owned(),
+                };
                 alerts.push(BlockSubmissionAlertRecord {
                     hash_hex: hash_hex.clone(),
                     job_id: candidate.job_id.clone(),
@@ -3287,7 +3362,7 @@ impl MonitoringRepository for InMemoryRepository {
                     submitted_at: None,
                     age_seconds: 0,
                     submit_ok,
-                    reason: "submit_response_not_ok".to_owned(),
+                    reason,
                 });
             }
         }
@@ -4027,7 +4102,12 @@ impl BlockRepository for InMemoryRepository {
             .filter(|block| {
                 matches!(
                     block.status.as_str(),
-                    "submitted" | "seen_on_chain" | "immature"
+                    "submitted"
+                        | "submitted_secondary"
+                        | "submitted_degraded"
+                        | "relay_failed"
+                        | "seen_on_chain"
+                        | "immature"
                 )
             })
             .take(usize::try_from(limit.max(0))?)
@@ -4272,6 +4352,9 @@ mod tests {
         let migration = migration_by_version(7).unwrap();
         assert_eq!(migration.name, "payouts_default_paused");
         assert!(migration.sql.contains("payouts_enabled"));
+        let migration = migration_by_version(11).unwrap();
+        assert_eq!(migration.name, "block_candidate_relay_failure");
+        assert!(migration.sql.contains("'relay_failed'"));
     }
 
     #[test]
@@ -4783,8 +4866,105 @@ mod tests {
         });
         assert_eq!(block_candidate_initial_status(&block), "submitted");
 
+        block.submit_response_json = serde_json::json!({
+            "ok": false,
+            "parallel_submit": {
+                "status": "both_failed",
+                "accepted_by": "none",
+                "primary_submit": {"outcome": "timeout", "response": null},
+                "secondary_submit": {"outcome": "rejected", "response": {"ok": false}}
+            }
+        });
+        assert_eq!(block_candidate_initial_status(&block), "submitted");
+
+        block.submit_response_json = serde_json::json!({
+            "ok": false,
+            "parallel_submit": {
+                "status": "both_failed",
+                "accepted_by": "none",
+                "primary_submit": {"outcome": "rejected", "response": {"ok": false}},
+                "secondary_submit": {"outcome": "transport_error", "response": null}
+            }
+        });
+        assert_eq!(block_candidate_initial_status(&block), "submitted");
+
         block.submit_response_json = serde_json::json!({"ok": true});
         assert_eq!(block_candidate_initial_status(&block), "submitted");
+
+        block.submit_response_json = serde_json::json!({
+            "ok": true,
+            "parallel_submit": {
+                "status": "secondary_accepted_authority_failed",
+                "accepted_by": "secondary",
+                "primary_submit": {"outcome": "rejected"},
+                "secondary_submit": {"outcome": "accepted"}
+            }
+        });
+        assert_eq!(
+            block_candidate_initial_status(&block),
+            "submitted_secondary"
+        );
+
+        block.submit_response_json = serde_json::json!({
+            "ok": true,
+            "parallel_submit": {
+                "status": "authority_accepted_secondary_local_canonical_relay_failed",
+                "accepted_by": "authority",
+                "primary_submit": {"response": {"ok": true}},
+                "secondary_submit": {
+                    "response": {
+                        "ok": false,
+                        "status": "accepted_local_relay_failed",
+                        "node_observability": {
+                            "local_canonical": true,
+                            "relay_ack": {"ok": false}
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(block_candidate_initial_status(&block), "submitted_degraded");
+
+        block.submit_response_json = serde_json::json!({
+            "ok": false,
+            "status": "accepted_local_relay_failed",
+            "error": "InsufficientPeers",
+            "node_observability": {
+                "local_canonical": true,
+                "relay_ack": {"ok": false, "status": "insufficient_peers"}
+            }
+        });
+        assert_eq!(block_candidate_initial_status(&block), "relay_failed");
+
+        block.submit_response_json = serde_json::json!({
+            "ok": false,
+            "parallel_submit": {
+                "aggregate_status": "both_local_canonical_relay_failed",
+                "primary_submit": {
+                    "outcome": "rejected",
+                    "response": {
+                        "ok": false,
+                        "status": "accepted_local_relay_failed",
+                        "node_observability": {
+                            "local_canonical": true,
+                            "relay_ack": {"ok": false}
+                        }
+                    }
+                },
+                "secondary_submit": {
+                    "outcome": "rejected",
+                    "response": {
+                        "ok": false,
+                        "status": "accepted_local_relay_failed",
+                        "node_observability": {
+                            "local_canonical": true,
+                            "relay_ack": {"ok": false}
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(block_candidate_initial_status(&block), "relay_failed");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 /target/
 /dist/
+/.codex-tmp/
 /ops/wallet-signer/node_modules/
 /.DS_Store
