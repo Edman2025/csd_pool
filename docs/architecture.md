@@ -658,17 +658,64 @@ submits structured candidate payloads to the configured submit node and can
 record the submitted candidate in `blocks`. Without a database URL, it runs in
 in-memory development mode.
 
-Candidate fanout is a separate, default-off safety feature. When
-`CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED=true`, the bridge starts the
-authoritative node-a submission immediately and submits best-effort to node-b
-only when fresh health snapshots have identical height, tip, and chainwork.
-Both outcomes are persisted in the candidate submit response. Node-a remains
-authoritative, and this mode does not change the accepted-share, candidate DB,
-or notification ordering. The production gray release also requires
-`CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_BUDGET=1`. The first candidate entering
-the submit path atomically consumes that process-local budget, even when the
-health gate skips node-b; every later candidate automatically uses node-a
-only.
+Candidate fanout is a separate, default-off safety feature. The legacy
+`CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED` path is blocked because node-b
+does not own node-a's job cache. Stateless mode always starts node-a's compact
+cached submission immediately. It may submit the same candidate material to
+node-b's official full-candidate endpoint only when fresh health snapshots have
+identical height, tip, and chainwork and node-b has relay peers.
+
+`CSD_POOL_STATELESS_PARALLEL_CANDIDATE_MODE=one_shot` preserves the original
+durable one-candidate canary. `continuous_bounded` replaces the global budget
+with one mode-0600 O_EXCL marker per candidate hash, so each candidate is
+idempotent across daemon restarts without blocking later candidates. Node-b is
+bounded by a non-waiting concurrency limit, submit timeout, and consecutive
+failure circuit breaker. The persistent
+`CSD_POOL_STATELESS_PARALLEL_CANDIDATE_SUBMIT_ENABLED` switch remains the
+global rollback to node-a-only. Both node outcomes and the control/circuit
+state are persisted in the candidate response; secondary-only acceptance is
+recorded as `submitted_secondary`.
+
+The separately gated node-b tip sentinel never fetches or constructs mining
+templates. When fresh A/B health proves that node-b is ahead, or has an
+equal-height competing tip with at least the observed chainwork, the bridge
+marks jobs on the old A parent invalid for share acceptance while retaining
+their IDs for precise stale classification, then polls A for a replacement. It
+publishes only a template fetched from A and marks that replacement clean.
+Normal A tip changes use the same rule: old-parent shares are never counted as
+accepted hashrate. A stale or unknown submit causes the current valid job to be
+resent clean; a session that repeats stale submits three times is disconnected
+so the miner reconnects on the current job. This prevents B from reintroducing
+job-cache affinity, avoids inflated accepted hashrate, and shortens wasted work
+on a parent already known to be stale.
+
+Candidate records include each node tip's locally observed-since timestamp,
+age, and candidate-parent match. These fields expose stale-parent races but do
+not prove global network freshness: two colocated nodes can agree while both
+lag a remote block.
+
+The official adapter's `relay_ack.status=published` means the local libp2p
+gossipsub API accepted the message. Candidate observability therefore records
+`relay_ack_scope=local_gossipsub_publish`, the connected-peer count observed at
+publish, and `relay_remote_delivery_observed=false`. True remote delivery
+requires an application-level receipt from another node; absence of that
+receipt must remain visible but must not delay node-a's authority submit.
+
+The pinned node sync path polls connected peers for tips every 10 seconds,
+limits header-locator requests with a 20-second cooldown, waits up to 60
+seconds for a requested block, and only penalizes a peer as stale at a
+12-block lag. Missing one header gossip can therefore leave a node one block
+behind long enough to miss a candidate race without tripping a peer-health
+redline. The sentinel reduces mining on a parent another local node already
+knows is stale; it does not replace event-driven block catch-up or diverse
+upstream peers.
+
+Running node-a and node-b on one host or one egress ASN is not independent
+propagation. Even disjoint peer IDs can share a route failure or receive the
+same remote tip late. The minimum topology remedy is a fully validating node
+on a different host, provider/ASN, and public egress, with its peer-set digest
+and tip-arrival timestamps compared to node-a. A small or disk-constrained
+server must not be promoted merely to increase the node count.
 
 It should not:
 

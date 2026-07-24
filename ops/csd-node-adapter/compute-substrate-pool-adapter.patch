@@ -118,7 +118,7 @@
 +                .layer(DefaultBodyLimit::max(MAX_STATELESS_FULL_BODY_BYTES)),
 +        )
 +        .route("/api/rpc/block/status", get(pool_block_status))
-@@ -412,0 +517,741 @@
+@@ -412,0 +517,749 @@
 +type PoolApiError = (StatusCode, Json<serde_json::Value>);
 +const POOL_EXTRANONCE_PLACEHOLDER: [u8; 8] =
 +    [0xfa, 0xce, 0xb0, 0x0c, 0xc5, 0xd0, 0x0d, 0x01];
@@ -696,6 +696,10 @@
 +                "local_canonical": true,
 +                "canonical_tip": current_tip == hash,
 +                "relay_ack": relay_ack,
++                "relay_ack_scope": "local_gossipsub_publish",
++                "relay_connected_peers_observed": st.connected_peers.load(std::sync::atomic::Ordering::Relaxed),
++                "relay_remote_delivery_observed": false,
++                "relay_remote_delivery_evidence": "not_available_without_application_ack",
 +                "idempotent": true,
 +                "relay_retry": true,
 +            }),
@@ -787,6 +791,10 @@
 +            "relay_queued": relay_queued,
 +            "local_canonical": accepted,
 +            "relay_ack": relay_ack,
++            "relay_ack_scope": "local_gossipsub_publish",
++            "relay_connected_peers_observed": st.connected_peers.load(std::sync::atomic::Ordering::Relaxed),
++            "relay_remote_delivery_observed": false,
++            "relay_remote_delivery_evidence": "not_available_without_application_ack",
 +            "idempotent": false,
 +        }),
 +    }))
@@ -860,7 +868,7 @@
 +    })))
 +}
 +
-@@ -2630,0 +3476,702 @@
+@@ -2630,0 +3476,714 @@
 +
 +#[cfg(test)]
 +mod pool_candidate_tests {
@@ -1446,6 +1454,18 @@
 +        assert!(response.ok);
 +        assert_eq!(response.status, "accepted_relay_recovered");
 +        assert_eq!(response.node_observability["relay_ack"]["status"], "published");
++        assert_eq!(
++            response.node_observability["relay_ack_scope"],
++            "local_gossipsub_publish"
++        );
++        assert_eq!(
++            response.node_observability["relay_remote_delivery_observed"],
++            false
++        );
++        assert_eq!(
++            response.node_observability["relay_connected_peers_observed"],
++            1
++        );
 +    }
 +
 +    #[tokio::test]

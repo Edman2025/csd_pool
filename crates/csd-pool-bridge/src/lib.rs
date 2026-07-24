@@ -30,12 +30,13 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval, timeout};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+const STALE_JOB_RECONNECT_THRESHOLD: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum BridgeError {
@@ -59,14 +60,16 @@ pub type Result<T> = std::result::Result<T, BridgeError>;
 
 pub async fn run_stratum_server(listen: &str, pool_state: SharedPoolState) -> Result<()> {
     let provider = template_provider_from_env()?;
+    let tip_sentinel = tip_sentinel_from_env()?;
     let block_submitter = block_submitter_from_env()?;
     let repository = mining_repository_from_env().await?;
     let abuse = Arc::new(AbuseManager::new(abuse_config_from_env()?));
     let vardiff = vardiff_config_from_env()?;
-    run_stratum_server_with_provider_and_abuse(
+    run_stratum_server_with_provider_abuse_and_sentinel(
         listen,
         pool_state,
         provider,
+        tip_sentinel,
         repository,
         block_submitter,
         abuse,
@@ -105,7 +108,37 @@ pub async fn run_stratum_server_with_provider_and_abuse(
     abuse: Arc<AbuseManager>,
     vardiff: VardiffConfig,
 ) -> Result<()> {
-    let jobs = SharedJobWatch::start(provider, repository.clone(), pool_state.clone()).await?;
+    run_stratum_server_with_provider_abuse_and_sentinel(
+        listen,
+        pool_state,
+        provider,
+        None,
+        repository,
+        block_submitter,
+        abuse,
+        vardiff,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_stratum_server_with_provider_abuse_and_sentinel(
+    listen: &str,
+    pool_state: SharedPoolState,
+    provider: Arc<dyn TemplateProvider>,
+    tip_sentinel: Option<Arc<dyn JobTipSentinel>>,
+    repository: Option<Arc<dyn MiningRepository>>,
+    block_submitter: Option<Arc<dyn BlockSubmitter>>,
+    abuse: Arc<AbuseManager>,
+    vardiff: VardiffConfig,
+) -> Result<()> {
+    let jobs = SharedJobWatch::start_with_sentinel(
+        provider,
+        tip_sentinel,
+        repository.clone(),
+        pool_state.clone(),
+    )
+    .await?;
     let listener = TcpListener::bind(listen).await?;
     info!(listen, "csd stratum bridge listening");
 
@@ -183,6 +216,7 @@ struct RetainedJob {
 #[derive(Clone, Default)]
 struct RetainedJobs {
     inner: Arc<RwLock<HashMap<String, RetainedJob>>>,
+    invalidated_parents: Arc<RwLock<HashSet<[u8; 32]>>>,
 }
 
 impl RetainedJobs {
@@ -206,10 +240,45 @@ impl RetainedJobs {
             .map(|entry| entry.job.clone())
     }
 
-    fn publish(&self, job: Arc<PoolJob>, _reason: JobReason, retention: Duration) {
+    fn get_for_submit(&self, job_id: &str) -> Option<Arc<PoolJob>> {
+        let job = self.get(job_id)?;
+        (!self.parent_is_invalidated(&job.template.prev)).then_some(job)
+    }
+
+    fn job_parent_is_invalidated(&self, job_id: &str) -> bool {
+        self.get(job_id)
+            .is_some_and(|job| self.parent_is_invalidated(&job.template.prev))
+    }
+
+    fn parent_is_invalidated(&self, parent: &[u8; 32]) -> bool {
+        self.invalidated_parents
+            .read()
+            .expect("invalidated parents lock")
+            .contains(parent)
+    }
+
+    fn publish(&self, job: Arc<PoolJob>, reason: JobReason, retention: Duration) {
         let now = TokioInstant::now();
         let mut jobs = self.inner.write().expect("retained jobs lock");
         jobs.retain(|_, entry| now.saturating_duration_since(entry.published_at) <= retention);
+        let retained_parents = jobs
+            .values()
+            .map(|entry| entry.job.template.prev)
+            .collect::<HashSet<_>>();
+        let mut invalidated = self
+            .invalidated_parents
+            .write()
+            .expect("invalidated parents lock");
+        if reason == JobReason::TipChange {
+            invalidated.extend(
+                retained_parents
+                    .iter()
+                    .copied()
+                    .filter(|parent| parent != &job.template.prev),
+            );
+        }
+        invalidated.retain(|parent| retained_parents.contains(parent));
+        invalidated.remove(&job.template.prev);
         jobs.insert(
             job.template.job_id.clone(),
             RetainedJob {
@@ -219,15 +288,165 @@ impl RetainedJobs {
         );
     }
 
+    fn invalidate_parent(&self, parent: &[u8; 32]) -> usize {
+        let invalidated = self
+            .inner
+            .read()
+            .expect("retained jobs lock")
+            .values()
+            .filter(|entry| &entry.job.template.prev == parent)
+            .count();
+        self.invalidated_parents
+            .write()
+            .expect("invalidated parents lock")
+            .insert(*parent);
+        invalidated
+    }
+
+    fn parent_is_retained(&self, parent: &[u8; 32]) -> bool {
+        !self.parent_is_invalidated(parent)
+            && self
+                .inner
+                .read()
+                .expect("retained jobs lock")
+                .values()
+                .any(|entry| &entry.job.template.prev == parent)
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.read().expect("retained jobs lock").len()
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedNodeTip {
+    height: u64,
+    tip_hex: String,
+    chainwork_hex: String,
+}
+
+impl ObservedNodeTip {
+    fn from_health(health: &NodeHealth) -> std::result::Result<Self, String> {
+        let height = health
+            .height
+            .ok_or_else(|| "tip sentinel health is missing height".to_owned())?;
+        let tip_hex = canonical_health_hash(
+            health
+                .tip
+                .as_deref()
+                .ok_or_else(|| "tip sentinel health is missing tip".to_owned())?,
+        )?;
+        let chainwork_hex = canonical_chainwork(
+            health
+                .chainwork
+                .as_deref()
+                .ok_or_else(|| "tip sentinel health is missing chainwork".to_owned())?,
+        )?;
+        Ok(Self {
+            height,
+            tip_hex,
+            chainwork_hex,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TipSentinelObservation {
+    primary: ObservedNodeTip,
+    secondary: ObservedNodeTip,
+    observed_unix_ms: u64,
+}
+
+#[async_trait::async_trait]
+trait JobTipSentinel: Send + Sync {
+    async fn observe(&self) -> std::result::Result<TipSentinelObservation, String>;
+}
+
+#[derive(Clone)]
+struct CsdJobTipSentinel {
+    primary: CsdNodeClient,
+    secondary: CsdNodeClient,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl JobTipSentinel for CsdJobTipSentinel {
+    async fn observe(&self) -> std::result::Result<TipSentinelObservation, String> {
+        let (primary, secondary) = tokio::join!(
+            timeout(self.timeout, self.primary.health()),
+            timeout(self.timeout, self.secondary.health())
+        );
+        let primary = primary
+            .map_err(|_| "primary tip sentinel health timed out".to_owned())?
+            .map_err(|error| error.to_string())?;
+        let secondary = secondary
+            .map_err(|_| "secondary tip sentinel health timed out".to_owned())?
+            .map_err(|error| error.to_string())?;
+        Ok(TipSentinelObservation {
+            primary: ObservedNodeTip::from_health(&primary)?,
+            secondary: ObservedNodeTip::from_health(&secondary)?,
+            observed_unix_ms: unix_ms(),
+        })
+    }
+}
+
+fn canonical_health_hash(value: &str) -> std::result::Result<String, String> {
+    let value = value
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| value.trim().strip_prefix("0X"))
+        .unwrap_or_else(|| value.trim());
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("tip sentinel tip is not canonical 32-byte hex".to_owned());
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn canonical_chainwork(value: &str) -> std::result::Result<String, String> {
+    let value = value
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| value.trim().strip_prefix("0X"))
+        .unwrap_or_else(|| value.trim());
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("tip sentinel chainwork is not hex".to_owned());
+    }
+    let normalized = value.trim_start_matches('0');
+    Ok(if normalized.is_empty() {
+        "0".to_owned()
+    } else {
+        normalized.to_ascii_lowercase()
+    })
+}
+
+fn chainwork_at_least(left: &str, right: &str) -> bool {
+    let left = left.trim_start_matches('0');
+    let right = right.trim_start_matches('0');
+    left.len() > right.len() || (left.len() == right.len() && left >= right)
+}
+
+fn tip_sentinel_invalidates_parent(
+    current_parent: &[u8; 32],
+    observation: &TipSentinelObservation,
+) -> bool {
+    let current_parent = hex::encode(current_parent);
+    if observation.primary.tip_hex != current_parent {
+        return true;
+    }
+    observation.secondary.height > observation.primary.height
+        || (observation.secondary.height == observation.primary.height
+            && observation.secondary.tip_hex != observation.primary.tip_hex
+            && chainwork_at_least(
+                &observation.secondary.chainwork_hex,
+                &observation.primary.chainwork_hex,
+            ))
+}
+
 impl SharedJobWatch {
-    async fn start(
+    async fn start_with_sentinel(
         provider: Arc<dyn TemplateProvider>,
+        tip_sentinel: Option<Arc<dyn JobTipSentinel>>,
         repository: Option<Arc<dyn MiningRepository>>,
         pool_state: SharedPoolState,
     ) -> Result<Self> {
@@ -252,13 +471,17 @@ impl SharedJobWatch {
             template_mode = template_mode.as_str(),
             "configured mining template refresh"
         );
-        Self::start_with_policy(
+        Self::start_with_policy_and_sentinel(
             provider,
+            tip_sentinel,
             repository,
             pool_state,
             Duration::from_secs(refresh_secs),
             (heartbeat_secs > 0).then(|| Duration::from_secs(heartbeat_secs)),
             Duration::from_secs(retention_secs),
+            Duration::from_millis(
+                env_u64("CSD_POOL_SECONDARY_TIP_SENTINEL_POLL_MS", 250).clamp(100, 5_000),
+            ),
         )
         .await
     }
@@ -280,6 +503,7 @@ impl SharedJobWatch {
         .await
     }
 
+    #[cfg(test)]
     async fn start_with_policy(
         provider: Arc<dyn TemplateProvider>,
         repository: Option<Arc<dyn MiningRepository>>,
@@ -287,6 +511,23 @@ impl SharedJobWatch {
         refresh: Duration,
         heartbeat: Option<Duration>,
         retention: Duration,
+    ) -> Result<Self> {
+        Self::start_with_policy_and_sentinel(
+            provider, None, repository, pool_state, refresh, heartbeat, retention, refresh,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_policy_and_sentinel(
+        provider: Arc<dyn TemplateProvider>,
+        tip_sentinel: Option<Arc<dyn JobTipSentinel>>,
+        repository: Option<Arc<dyn MiningRepository>>,
+        pool_state: SharedPoolState,
+        refresh: Duration,
+        heartbeat: Option<Duration>,
+        retention: Duration,
+        sentinel_poll: Duration,
     ) -> Result<Self> {
         let mut initial_job = provider.current_job().await?;
         initial_job.notify.clean_jobs = true;
@@ -305,14 +546,58 @@ impl SharedJobWatch {
             let mut ticker = interval(refresh);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             ticker.tick().await;
+            let mut sentinel_ticker = interval(sentinel_poll);
+            sentinel_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            sentinel_ticker.tick().await;
             let mut last_publish_at = TokioInstant::now();
             loop {
-                ticker.tick().await;
+                let sentinel_observation = if let Some(sentinel) = tip_sentinel.as_ref() {
+                    tokio::select! {
+                        _ = ticker.tick() => None,
+                        _ = sentinel_ticker.tick() => {
+                            match sentinel.observe().await {
+                                Ok(observation) => Some(observation),
+                                Err(error) => {
+                                    warn!(%error, "secondary tip sentinel observation failed");
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    ticker.tick().await;
+                    None
+                };
                 let current = refresh_sender.borrow().clone();
+                let sentinel_forced_refresh =
+                    sentinel_observation.as_ref().is_some_and(|observation| {
+                        tip_sentinel_invalidates_parent(&current.template.prev, observation)
+                    });
+                if sentinel_forced_refresh {
+                    let invalidated =
+                        refresh_retained_jobs.invalidate_parent(&current.template.prev);
+                    warn!(
+                        job_id = current.template.job_id,
+                        parent = %hex::encode(current.template.prev),
+                        invalidated_jobs = invalidated,
+                        primary_height = sentinel_observation.as_ref().map(|value| value.primary.height),
+                        secondary_height = sentinel_observation.as_ref().map(|value| value.secondary.height),
+                        primary_tip = sentinel_observation.as_ref().map(|value| value.primary.tip_hex.as_str()),
+                        secondary_tip = sentinel_observation.as_ref().map(|value| value.secondary.tip_hex.as_str()),
+                        sentinel_observed_unix_ms = sentinel_observation.as_ref().map(|value| value.observed_unix_ms),
+                        "tip sentinel invalidated stale A-parent jobs; waiting for an A template"
+                    );
+                }
                 let heartbeat_due =
                     heartbeat.is_some_and(|heartbeat| last_publish_at.elapsed() >= heartbeat);
                 let observed_tip = match provider.current_tip().await {
-                    Ok(Some(tip)) if tip == current.template.prev && !heartbeat_due => continue,
+                    Ok(Some(tip))
+                        if tip == current.template.prev
+                            && !heartbeat_due
+                            && !sentinel_forced_refresh =>
+                    {
+                        continue;
+                    }
                     Ok(tip) => tip,
                     Err(err) => {
                         warn!(%err, "mining tip refresh failed; retaining current job");
@@ -348,6 +633,16 @@ impl SharedJobWatch {
                         );
                         continue;
                     }
+                }
+                if !refresh_retained_jobs.parent_is_retained(&next.template.prev)
+                    && next.template.prev == current.template.prev
+                {
+                    warn!(
+                        job_id = next.template.job_id,
+                        parent = %hex::encode(next.template.prev),
+                        "refusing to republish a parent invalidated by the tip sentinel"
+                    );
+                    continue;
                 }
                 let reason = if next.template.prev != current.template.prev {
                     JobReason::TipChange
@@ -442,6 +737,40 @@ pub fn template_provider_from_env() -> Result<Arc<dyn TemplateProvider>> {
     } else {
         Ok(Arc::new(LiveTemplateProvider::new(node, pool_address)))
     }
+}
+
+fn tip_sentinel_from_env() -> Result<Option<Arc<dyn JobTipSentinel>>> {
+    if !tip_sentinel_enabled(
+        std::env::var("CSD_POOL_SECONDARY_TIP_SENTINEL_ENABLED")
+            .ok()
+            .as_deref(),
+    ) {
+        return Ok(None);
+    }
+    let mode = std::env::var("CSD_POOL_TEMPLATE_MODE").unwrap_or_else(|_| "static".to_owned());
+    if !mode.eq_ignore_ascii_case("live") {
+        return Err(BridgeError::InvalidConfig(
+            "secondary tip sentinel requires live template mode".into(),
+        ));
+    }
+    let (primary_url, _) = live_template_config()?;
+    let secondary_url = secondary_submit_node_url_from_env(&primary_url)?;
+    if normalized_node_url(&primary_url) == normalized_node_url(&secondary_url) {
+        return Err(BridgeError::InvalidConfig(
+            "secondary tip sentinel requires distinct primary and secondary node URLs".into(),
+        ));
+    }
+    Ok(Some(Arc::new(CsdJobTipSentinel {
+        primary: CsdNodeClient::from_env(primary_url),
+        secondary: CsdNodeClient::from_env(secondary_url),
+        timeout: Duration::from_millis(
+            env_u64("CSD_POOL_SECONDARY_TIP_SENTINEL_TIMEOUT_MS", 750).clamp(100, 5_000),
+        ),
+    })))
+}
+
+fn tip_sentinel_enabled(value: Option<&str>) -> bool {
+    csd_pool_config::env_flag_enabled(value)
 }
 
 fn live_template_config() -> Result<(String, String)> {
@@ -615,12 +944,7 @@ pub fn block_submitter_from_env() -> Result<Option<Arc<dyn BlockSubmitter>>> {
             "parallel candidate submit requires distinct primary and secondary node URLs".into(),
         ));
     }
-    let secondary_candidate_budget = parallel_candidate_submit_budget(
-        std::env::var("CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_BUDGET")
-            .ok()
-            .as_deref(),
-    )?;
-    let latch_path = persistent_candidate_latch_path_from_env()?;
+    let secondary_control = secondary_candidate_control_from_env()?;
     let primary = Arc::new(CsdCandidateNodeEndpoint::new(
         submit_node_name_from_env(),
         CsdNodeClient::from_env(node_url),
@@ -649,10 +973,42 @@ pub fn block_submitter_from_env() -> Result<Option<Arc<dyn BlockSubmitter>>> {
                 "CSD_POOL_PARALLEL_NODE_HEALTH_MAX_AGE_MS",
                 3_000,
             )),
-            secondary_candidate_budget,
+            secondary_max_in_flight: env_u64("CSD_POOL_STATELESS_SECONDARY_MAX_IN_FLIGHT", 1)
+                .clamp(1, 4) as usize,
+            circuit_failure_threshold: env_u64("CSD_POOL_STATELESS_SECONDARY_CIRCUIT_FAILURES", 3)
+                .clamp(1, 100),
+            circuit_cooldown: Duration::from_millis(
+                env_u64("CSD_POOL_STATELESS_SECONDARY_CIRCUIT_COOLDOWN_MS", 30_000)
+                    .clamp(1_000, 300_000),
+            ),
         },
-        PersistentCandidateLatch::new(latch_path)?,
+        secondary_control,
     ))))
+}
+
+fn secondary_candidate_control_from_env() -> Result<SecondaryCandidateControl> {
+    let mode = std::env::var("CSD_POOL_STATELESS_PARALLEL_CANDIDATE_MODE")
+        .unwrap_or_else(|_| "one_shot".to_owned());
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "one_shot" => {
+            let budget = parallel_candidate_submit_budget(
+                std::env::var("CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_BUDGET")
+                    .ok()
+                    .as_deref(),
+            )?;
+            Ok(SecondaryCandidateControl::OneShot {
+                budget,
+                latch: PersistentCandidateLatch::new(persistent_candidate_latch_path_from_env()?)?,
+            })
+        }
+        "continuous_bounded" => Ok(SecondaryCandidateControl::ContinuousBounded(
+            PersistentCandidateJournal::new(persistent_candidate_state_dir_from_env()?)?,
+        )),
+        _ => Err(BridgeError::InvalidConfig(
+            "CSD_POOL_STATELESS_PARALLEL_CANDIDATE_MODE must be one_shot or continuous_bounded"
+                .into(),
+        )),
+    }
 }
 
 fn persistent_candidate_latch_path_from_env() -> Result<PathBuf> {
@@ -667,6 +1023,22 @@ fn persistent_candidate_latch_path_from_env() -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err(BridgeError::InvalidConfig(
             "CSD_POOL_STATELESS_PARALLEL_CANDIDATE_LATCH_PATH must be absolute".into(),
+        ));
+    }
+    Ok(path)
+}
+
+fn persistent_candidate_state_dir_from_env() -> Result<PathBuf> {
+    let value = std::env::var("CSD_POOL_STATELESS_PARALLEL_CANDIDATE_STATE_DIR").map_err(|_| {
+        BridgeError::InvalidConfig(
+            "CSD_POOL_STATELESS_PARALLEL_CANDIDATE_STATE_DIR is required for continuous_bounded mode"
+                .into(),
+        )
+    })?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(BridgeError::InvalidConfig(
+            "CSD_POOL_STATELESS_PARALLEL_CANDIDATE_STATE_DIR must be absolute".into(),
         ));
     }
     Ok(path)
@@ -830,6 +1202,7 @@ async fn handle_client(
     let mut vardiff = VardiffState::new(vardiff_config);
     let mut difficulty_suggestion_seen = false;
     let mut accepted_share_seen = false;
+    let mut unknown_job_streak = 0_u32;
 
     info!(%peer, session_id, %session_uuid, "client connected");
     let (read_half, mut write_half) = stream.into_split();
@@ -847,9 +1220,14 @@ async fn handle_client(
                         return Ok(());
                     }
                     let current_job = job_rx.borrow_and_update().clone();
-                    write_half
-                        .write_all(serialize_line(&notify(&current_job.notify))?.as_bytes())
-                        .await?;
+                    if retained_jobs
+                        .get_for_submit(&current_job.template.job_id)
+                        .is_some()
+                    {
+                        write_half
+                            .write_all(serialize_line(&notify(&current_job.notify))?.as_bytes())
+                            .await?;
+                    }
                     continue;
                 }
             }
@@ -875,6 +1253,7 @@ async fn handle_client(
 
         debug!(%peer, session_id, %session_uuid, method = request.method, "request");
         let mut pending_difficulty: Option<f64> = None;
+        let mut resync_after_stale_submit = false;
         let response = match request.method.as_str() {
             "mining.subscribe" => {
                 user_agent = parse_subscribe_user_agent(&request.params);
@@ -982,7 +1361,9 @@ async fn handle_client(
                     let worker_address = authorized_worker.as_deref().unwrap_or_default();
                     match SubmitParams::parse(&request.params) {
                         Ok(submit) => {
-                            let submitted_job = retained_jobs.get(&submit.job_id);
+                            let submitted_job = retained_jobs.get_for_submit(&submit.job_id);
+                            let invalidated_parent =
+                                retained_jobs.job_parent_is_invalidated(&submit.job_id);
                             if !authorized_submit_worker(worker_address, &submit.worker_name) {
                                 pool_state.record_share_rejected(worker_address);
                                 abuse.record_invalid_share(peer.ip());
@@ -998,7 +1379,25 @@ async fn handle_client(
                                 )
                                 .await?;
                                 response_error(request.id.unwrap_or(0), 20, "invalid worker")
+                            } else if invalidated_parent {
+                                unknown_job_streak = unknown_job_streak.saturating_add(1);
+                                resync_after_stale_submit = true;
+                                pool_state.record_share_stale(worker_address);
+                                persist_share_event(
+                                    repository.as_deref(),
+                                    &share_event_from_submit(
+                                        session_persisted.then_some(session_uuid.as_str()),
+                                        worker_address,
+                                        &submit,
+                                        "stale",
+                                        "invalidated_parent",
+                                    ),
+                                )
+                                .await?;
+                                response_error(request.id.unwrap_or(0), 21, "stale job")
                             } else if submitted_job.is_none() {
+                                unknown_job_streak = unknown_job_streak.saturating_add(1);
+                                resync_after_stale_submit = true;
                                 pool_state.record_share_stale(worker_address);
                                 persist_share_event(
                                     repository.as_deref(),
@@ -1013,6 +1412,7 @@ async fn handle_client(
                                 .await?;
                                 response_error(request.id.unwrap_or(0), 21, "unknown job")
                             } else if !seen_shares.insert(ShareKey::from_submit(&submit)) {
+                                unknown_job_streak = 0;
                                 pool_state.record_share_rejected(worker_address);
                                 persist_share_event(
                                     repository.as_deref(),
@@ -1027,8 +1427,10 @@ async fn handle_client(
                                 .await?;
                                 response_error(request.id.unwrap_or(0), 22, "duplicate share")
                             } else {
-                                let submitted_job =
-                                    submitted_job.expect("retained job checked above");
+                                unknown_job_streak = 0;
+                                let Some(submitted_job) = submitted_job else {
+                                    unreachable!("retained job checked above");
+                                };
                                 let validation_started = Instant::now();
                                 let validation_result = verify_submit_for_vardiff(
                                     &submitted_job.template,
@@ -1164,6 +1566,37 @@ async fn handle_client(
             .write_all(serialize_line(&response)?.as_bytes())
             .await?;
 
+        if resync_after_stale_submit {
+            let mut current_job = (*job_rx.borrow_and_update().clone()).clone();
+            if retained_jobs
+                .get_for_submit(&current_job.template.job_id)
+                .is_some()
+            {
+                current_job.notify.clean_jobs = true;
+                write_half
+                    .write_all(serialize_line(&notify(&current_job.notify))?.as_bytes())
+                    .await?;
+                info!(
+                    %peer,
+                    session_id,
+                    %session_uuid,
+                    unknown_job_streak,
+                    job_id = current_job.template.job_id,
+                    "resent current clean job after stale submit"
+                );
+            }
+            if unknown_job_streak >= STALE_JOB_RECONNECT_THRESHOLD {
+                warn!(
+                    %peer,
+                    session_id,
+                    %session_uuid,
+                    unknown_job_streak,
+                    "closing session after repeated stale job submissions"
+                );
+                return Ok(());
+            }
+        }
+
         if abuse.is_banned(peer.ip()) {
             warn!(%peer, session_id, %session_uuid, "closing banned stratum session");
             return Ok(());
@@ -1176,18 +1609,28 @@ async fn handle_client(
                 )
                 .await?;
             let current_job = job_rx.borrow_and_update().clone();
-            write_half
-                .write_all(serialize_line(&notify(&current_job.notify))?.as_bytes())
-                .await?;
+            if retained_jobs
+                .get_for_submit(&current_job.template.job_id)
+                .is_some()
+            {
+                write_half
+                    .write_all(serialize_line(&notify(&current_job.notify))?.as_bytes())
+                    .await?;
+            }
         } else if let Some(difficulty) = pending_difficulty {
             write_half
                 .write_all(serialize_line(&set_difficulty(difficulty))?.as_bytes())
                 .await?;
             let mut difficulty_job = (*job_rx.borrow().clone()).clone();
             difficulty_job.notify.clean_jobs = false;
-            write_half
-                .write_all(serialize_line(&notify(&difficulty_job.notify))?.as_bytes())
-                .await?;
+            if retained_jobs
+                .get_for_submit(&difficulty_job.template.job_id)
+                .is_some()
+            {
+                write_half
+                    .write_all(serialize_line(&notify(&difficulty_job.notify))?.as_bytes())
+                    .await?;
+            }
             if session_persisted {
                 if let Some(repository) = repository.as_deref() {
                     if let Err(err) = repository
@@ -1416,7 +1859,7 @@ impl PersistentCandidateLatch {
         self
     }
 
-    fn claim(&self, candidate_hash: &str, configured: u64) -> SecondaryCandidateBudgetClaim {
+    fn claim(&self, candidate_hash: &str, configured: u64) -> SecondaryCandidateClaim {
         let before = u64::from(!Path::new(self.path.as_ref()).exists());
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -1452,42 +1895,318 @@ impl PersistentCandidateLatch {
                     File::open(parent)?.sync_all()
                 });
                 match persistence {
-                    Ok(()) => SecondaryCandidateBudgetClaim {
-                        configured,
-                        before,
+                    Ok(()) => SecondaryCandidateClaim {
+                        mode: "one_shot",
+                        configured: Some(configured),
+                        before: Some(before),
                         claimed: true,
-                        remaining: 0,
+                        remaining: Some(0),
+                        claim_key: candidate_hash.to_owned(),
                         persistence: "o_excl_file",
                         error: None,
                     },
-                    Err(error) => SecondaryCandidateBudgetClaim {
-                        configured,
-                        before,
+                    Err(error) => SecondaryCandidateClaim {
+                        mode: "one_shot",
+                        configured: Some(configured),
+                        before: Some(before),
                         claimed: false,
-                        remaining: 0,
+                        remaining: Some(0),
+                        claim_key: candidate_hash.to_owned(),
                         persistence: "o_excl_file",
                         error: Some(format!("persistent latch write failed: {error}")),
                     },
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                SecondaryCandidateBudgetClaim {
-                    configured,
-                    before: 0,
+                SecondaryCandidateClaim {
+                    mode: "one_shot",
+                    configured: Some(configured),
+                    before: Some(0),
                     claimed: false,
-                    remaining: 0,
+                    remaining: Some(0),
+                    claim_key: candidate_hash.to_owned(),
                     persistence: "o_excl_file",
                     error: None,
                 }
             }
-            Err(error) => SecondaryCandidateBudgetClaim {
-                configured,
-                before,
+            Err(error) => SecondaryCandidateClaim {
+                mode: "one_shot",
+                configured: Some(configured),
+                before: Some(before),
                 claimed: false,
-                remaining: 0,
+                remaining: Some(0),
+                claim_key: candidate_hash.to_owned(),
                 persistence: "o_excl_file",
                 error: Some(format!("persistent latch claim failed: {error}")),
             },
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PersistentCandidateJournal {
+    directory: Arc<PathBuf>,
+    #[cfg(test)]
+    claim_delay: Duration,
+}
+
+impl PersistentCandidateJournal {
+    fn new(directory: PathBuf) -> Result<Self> {
+        validate_persistent_candidate_directory(&directory)?;
+        Ok(Self {
+            directory: Arc::new(directory),
+            #[cfg(test)]
+            claim_delay: Duration::ZERO,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_claim_delay(mut self, claim_delay: Duration) -> Self {
+        self.claim_delay = claim_delay;
+        self
+    }
+
+    fn claim(&self, candidate_hash: &str) -> SecondaryCandidateClaim {
+        if candidate_hash.len() != 64
+            || !candidate_hash
+                .bytes()
+                .all(|value| value.is_ascii_hexdigit())
+        {
+            return SecondaryCandidateClaim::failed(
+                "continuous_bounded",
+                candidate_hash,
+                "candidate hash is not canonical 32-byte hex".to_owned(),
+            );
+        }
+        let claim_key = candidate_hash.to_ascii_lowercase();
+        let path = self.directory.join(format!("{claim_key}.claim"));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                let marker = format!(
+                    "version=1\nclaimed_unix_ms={}\ncandidate_hash={claim_key}\n",
+                    unix_ms()
+                );
+                let persistence = file.write_all(marker.as_bytes()).and_then(|()| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                    }
+                    #[cfg(test)]
+                    if !self.claim_delay.is_zero() {
+                        std::thread::sleep(self.claim_delay);
+                    }
+                    file.sync_all()?;
+                    File::open(self.directory.as_ref())?.sync_all()
+                });
+                match persistence {
+                    Ok(()) => SecondaryCandidateClaim {
+                        mode: "continuous_bounded",
+                        configured: None,
+                        before: None,
+                        claimed: true,
+                        remaining: None,
+                        claim_key,
+                        persistence: "o_excl_per_candidate",
+                        error: None,
+                    },
+                    Err(error) => SecondaryCandidateClaim::failed(
+                        "continuous_bounded",
+                        &claim_key,
+                        format!("persistent candidate journal write failed: {error}"),
+                    ),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                SecondaryCandidateClaim {
+                    mode: "continuous_bounded",
+                    configured: None,
+                    before: None,
+                    claimed: false,
+                    remaining: None,
+                    claim_key,
+                    persistence: "o_excl_per_candidate",
+                    error: None,
+                }
+            }
+            Err(error) => SecondaryCandidateClaim::failed(
+                "continuous_bounded",
+                &claim_key,
+                format!("persistent candidate journal claim failed: {error}"),
+            ),
+        }
+    }
+}
+
+fn validate_persistent_candidate_directory(directory: &Path) -> Result<()> {
+    let metadata = symlink_metadata(directory).map_err(|error| {
+        BridgeError::InvalidConfig(format!(
+            "persistent candidate state directory is unavailable: {error}"
+        ))
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(BridgeError::InvalidConfig(
+            "persistent candidate state path must be a real directory".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(BridgeError::InvalidConfig(
+                "persistent candidate state directory must have mode 0700 or stricter".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+enum SecondaryCandidateControl {
+    OneShot {
+        budget: u64,
+        latch: PersistentCandidateLatch,
+    },
+    ContinuousBounded(PersistentCandidateJournal),
+}
+
+impl SecondaryCandidateControl {
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::OneShot { .. } => "one_shot",
+            Self::ContinuousBounded(_) => "continuous_bounded",
+        }
+    }
+
+    fn not_attempted(&self) -> SecondaryCandidateClaim {
+        match self {
+            Self::OneShot { budget, .. } => {
+                SecondaryCandidateClaim::not_attempted("one_shot", Some(*budget), Some(*budget))
+            }
+            Self::ContinuousBounded(_) => {
+                SecondaryCandidateClaim::not_attempted("continuous_bounded", None, None)
+            }
+        }
+    }
+
+    fn failed(&self, candidate_hash: &str, error: String) -> SecondaryCandidateClaim {
+        match self {
+            Self::OneShot { budget, .. } => {
+                SecondaryCandidateClaim::failed_one_shot(*budget, candidate_hash, error)
+            }
+            Self::ContinuousBounded(_) => {
+                SecondaryCandidateClaim::failed("continuous_bounded", candidate_hash, error)
+            }
+        }
+    }
+
+    fn claim(&self, candidate_hash: &str) -> SecondaryCandidateClaim {
+        match self {
+            Self::OneShot { budget, latch } => latch.claim(candidate_hash, *budget),
+            Self::ContinuousBounded(journal) => journal.claim(candidate_hash),
+        }
+    }
+
+    fn exhausted_reason(&self) -> &'static str {
+        match self {
+            Self::OneShot { .. } => "candidate_budget_exhausted",
+            Self::ContinuousBounded(_) => "candidate_already_submitted_to_secondary",
+        }
+    }
+
+    fn persistence_failure_reason(&self) -> &'static str {
+        match self {
+            Self::OneShot { .. } => "candidate_budget_persistence_failed",
+            Self::ContinuousBounded(_) => "candidate_control_persistence_failed",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SecondaryCircuitBreaker {
+    failure_threshold: u64,
+    cooldown: Duration,
+    state: Arc<Mutex<SecondaryCircuitState>>,
+}
+
+#[derive(Clone, Debug)]
+struct SecondaryCircuitState {
+    consecutive_failures: u64,
+    open_until: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SecondaryCircuitSnapshot {
+    consecutive_failures: u64,
+    open_remaining_ms: u64,
+}
+
+impl SecondaryCircuitBreaker {
+    fn new(failure_threshold: u64, cooldown: Duration) -> Self {
+        Self {
+            failure_threshold,
+            cooldown,
+            state: Arc::new(Mutex::new(SecondaryCircuitState {
+                consecutive_failures: 0,
+                open_until: None,
+            })),
+        }
+    }
+
+    fn eligibility(&self) -> std::result::Result<(), &'static str> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("secondary circuit breaker lock poisoned");
+        if state
+            .open_until
+            .is_some_and(|deadline| deadline > Instant::now())
+        {
+            return Err("secondary_circuit_open");
+        }
+        state.open_until = None;
+        Ok(())
+    }
+
+    fn record(&self, audit: &SubmitAudit) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("secondary circuit breaker lock poisoned");
+        if audit.outcome == "accepted" {
+            state.consecutive_failures = 0;
+            state.open_until = None;
+            return;
+        }
+        if audit.outcome == "skipped" {
+            return;
+        }
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= self.failure_threshold {
+            state.open_until = Some(Instant::now() + self.cooldown);
+        }
+    }
+
+    fn snapshot(&self) -> SecondaryCircuitSnapshot {
+        let state = self
+            .state
+            .lock()
+            .expect("secondary circuit breaker lock poisoned");
+        SecondaryCircuitSnapshot {
+            consecutive_failures: state.consecutive_failures,
+            open_remaining_ms: state
+                .open_until
+                .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+                .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+                .unwrap_or(0),
         }
     }
 }
@@ -1501,8 +2220,9 @@ struct ParallelNodeBlockSubmitter {
     health_refresh: Duration,
     health_max_age: Duration,
     health_snapshot: Arc<RwLock<Option<ParallelHealthSnapshot>>>,
-    secondary_candidate_budget_configured: u64,
-    secondary_candidate_latch: PersistentCandidateLatch,
+    secondary_control: SecondaryCandidateControl,
+    secondary_in_flight: Arc<Semaphore>,
+    secondary_circuit: SecondaryCircuitBreaker,
 }
 
 #[derive(Clone, Copy)]
@@ -1511,7 +2231,9 @@ struct ParallelSubmitConfig {
     secondary_timeout: Duration,
     health_refresh: Duration,
     health_max_age: Duration,
-    secondary_candidate_budget: u64,
+    secondary_max_in_flight: usize,
+    circuit_failure_threshold: u64,
+    circuit_cooldown: Duration,
 }
 
 impl ParallelNodeBlockSubmitter {
@@ -1519,7 +2241,7 @@ impl ParallelNodeBlockSubmitter {
         primary: Arc<dyn CandidateNodeEndpoint>,
         secondary: Arc<dyn CandidateNodeEndpoint>,
         config: ParallelSubmitConfig,
-        secondary_candidate_latch: PersistentCandidateLatch,
+        secondary_control: SecondaryCandidateControl,
     ) -> Self {
         let submitter = Self {
             primary,
@@ -1533,8 +2255,12 @@ impl ParallelNodeBlockSubmitter {
                 .health_max_age
                 .clamp(Duration::from_millis(250), Duration::from_secs(30)),
             health_snapshot: Arc::new(RwLock::new(None)),
-            secondary_candidate_budget_configured: config.secondary_candidate_budget,
-            secondary_candidate_latch,
+            secondary_control,
+            secondary_in_flight: Arc::new(Semaphore::new(config.secondary_max_in_flight)),
+            secondary_circuit: SecondaryCircuitBreaker::new(
+                config.circuit_failure_threshold,
+                config.circuit_cooldown,
+            ),
         };
         submitter.start_health_watch();
         submitter
@@ -1551,14 +2277,33 @@ impl ParallelNodeBlockSubmitter {
     }
 
     async fn refresh_health_once(&self) {
+        let previous = self.current_health();
         let (primary, secondary) = tokio::join!(
             health_with_timeout(self.primary.as_ref(), self.secondary_timeout),
             health_with_timeout(self.secondary.as_ref(), self.secondary_timeout)
         );
+        let observed_unix_ms = unix_ms();
         let snapshot = ParallelHealthSnapshot {
+            primary_tip_observed_since_unix_ms: tip_observed_since(
+                previous.as_ref().map(|value| &value.primary),
+                previous
+                    .as_ref()
+                    .and_then(|value| value.primary_tip_observed_since_unix_ms),
+                &primary,
+                observed_unix_ms,
+            ),
+            secondary_tip_observed_since_unix_ms: tip_observed_since(
+                previous.as_ref().map(|value| &value.secondary),
+                previous
+                    .as_ref()
+                    .and_then(|value| value.secondary_tip_observed_since_unix_ms),
+                &secondary,
+                observed_unix_ms,
+            ),
             primary,
             secondary,
             observed_at: Instant::now(),
+            observed_unix_ms,
         };
         *self
             .health_snapshot
@@ -1571,6 +2316,16 @@ impl ParallelNodeBlockSubmitter {
             .read()
             .expect("parallel health snapshot lock poisoned")
             .clone()
+    }
+
+    #[cfg(test)]
+    fn one_shot_latch_path(&self) -> &Path {
+        match &self.secondary_control {
+            SecondaryCandidateControl::OneShot { latch, .. } => latch.path.as_ref(),
+            SecondaryCandidateControl::ContinuousBounded(_) => {
+                panic!("submitter does not use the one-shot latch")
+            }
+        }
     }
 }
 
@@ -1592,9 +2347,7 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
         let secondary_submit = async {
             let Some(full_candidate) = full_candidate.as_ref() else {
                 return (
-                    SecondaryCandidateBudgetClaim::not_attempted(
-                        self.secondary_candidate_budget_configured,
-                    ),
+                    self.secondary_control.not_attempted(),
                     skipped_submit_audit(
                         self.secondary.name(),
                         "best_effort",
@@ -1602,41 +2355,59 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
                     ),
                 );
             };
+            if let Err(reason) = self.secondary_circuit.eligibility() {
+                return (
+                    self.secondary_control.not_attempted(),
+                    skipped_submit_audit(self.secondary.name(), "best_effort", reason),
+                );
+            }
+            let _in_flight = if self.secondary_control.mode() == "continuous_bounded" {
+                let Ok(permit) = self.secondary_in_flight.clone().try_acquire_owned() else {
+                    return (
+                        self.secondary_control.not_attempted(),
+                        skipped_submit_audit(
+                            self.secondary.name(),
+                            "best_effort",
+                            "secondary_concurrency_limit",
+                        ),
+                    );
+                };
+                Some(permit)
+            } else {
+                None
+            };
             if let Err(reason) =
                 secondary_submit_eligibility(health.as_ref(), self.health_max_age, candidate)
             {
                 return (
-                    SecondaryCandidateBudgetClaim::not_attempted(
-                        self.secondary_candidate_budget_configured,
-                    ),
+                    self.secondary_control.not_attempted(),
                     skipped_submit_audit(self.secondary.name(), "best_effort", reason),
                 );
             }
-            let latch = self.secondary_candidate_latch.clone();
+            let control = self.secondary_control.clone();
             let candidate_hash = candidate.hash_hex.clone();
-            let configured = self.secondary_candidate_budget_configured;
-            let claim_task =
-                tokio::task::spawn_blocking(move || latch.claim(&candidate_hash, configured));
-            let secondary_budget =
+            let claim_hash = candidate_hash.clone();
+            let claim_task = tokio::task::spawn_blocking(move || control.claim(&claim_hash));
+            let secondary_claim =
                 match tokio::time::timeout(self.secondary_timeout, claim_task).await {
                     Ok(Ok(claim)) => claim,
-                    Ok(Err(error)) => SecondaryCandidateBudgetClaim::failed(
-                        configured,
+                    Ok(Err(error)) => self.secondary_control.failed(
+                        &candidate_hash,
                         format!("persistent latch task failed: {error}"),
                     ),
-                    Err(_) => SecondaryCandidateBudgetClaim::failed(
-                        configured,
+                    Err(_) => self.secondary_control.failed(
+                        &candidate_hash,
                         format!(
-                            "persistent latch claim timed out after {} ms",
+                            "persistent secondary claim timed out after {} ms",
                             self.secondary_timeout.as_millis()
                         ),
                     ),
                 };
             let post_claim_health = self.current_health();
-            let eligibility = if secondary_budget.error.is_some() {
-                Err("candidate_budget_persistence_failed")
-            } else if !secondary_budget.claimed {
-                Err("candidate_budget_exhausted")
+            let eligibility = if secondary_claim.error.is_some() {
+                Err(self.secondary_control.persistence_failure_reason())
+            } else if !secondary_claim.claimed {
+                Err(self.secondary_control.exhausted_reason())
             } else {
                 secondary_submit_eligibility(
                     post_claim_health.as_ref(),
@@ -1656,9 +2427,10 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
                 }
                 Err(reason) => skipped_submit_audit(self.secondary.name(), "best_effort", reason),
             };
-            (secondary_budget, audit)
+            self.secondary_circuit.record(&audit);
+            (secondary_claim, audit)
         };
-        let (primary_audit, (secondary_budget, secondary_audit)) =
+        let (primary_audit, (secondary_claim, secondary_audit)) =
             tokio::join!(primary_submit, secondary_submit);
 
         let primary_ok = primary_audit
@@ -1698,6 +2470,7 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
                 })
         };
         response.ok = primary_ok || secondary_ok;
+        let circuit = self.secondary_circuit.snapshot();
         let mut extra = response.extra.as_object().cloned().unwrap_or_default();
         extra.insert(
             "parallel_submit".to_owned(),
@@ -1718,15 +2491,31 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
                     "authority": primary_audit.response.as_ref().is_some_and(node_response_has_local_canonical_relay_failure),
                     "secondary": secondary_audit.response.as_ref().is_some_and(node_response_has_local_canonical_relay_failure),
                 },
+                "secondary_candidate_control": {
+                    "mode": secondary_claim.mode,
+                    "persistent_global_switch": "CSD_POOL_STATELESS_PARALLEL_CANDIDATE_SUBMIT_ENABLED",
+                    "claim_key": secondary_claim.claim_key,
+                    "claimed": secondary_claim.claimed,
+                    "persistence": secondary_claim.persistence,
+                    "error": secondary_claim.error,
+                    "circuit": {
+                        "failure_threshold": self.secondary_circuit.failure_threshold,
+                        "consecutive_failures": circuit.consecutive_failures,
+                        "open_remaining_ms": circuit.open_remaining_ms,
+                    },
+                },
                 "secondary_candidate_budget": {
-                    "configured": secondary_budget.configured,
-                    "before": secondary_budget.before,
-                    "claimed": secondary_budget.claimed,
-                    "remaining": secondary_budget.remaining,
-                    "persistence": secondary_budget.persistence,
-                    "error": secondary_budget.error,
+                    "configured": secondary_claim.configured,
+                    "before": secondary_claim.before,
+                    "claimed": secondary_claim.claimed,
+                    "remaining": secondary_claim.remaining,
+                    "persistence": secondary_claim.persistence,
+                    "error": secondary_claim.error,
                 },
                 "health_age_ms": health.as_ref().map(ParallelHealthSnapshot::age_ms),
+                "candidate_parent_health": health
+                    .as_ref()
+                    .map(|snapshot| candidate_parent_health_json(snapshot, candidate)),
                 "primary_health": primary_health_json(&primary_health),
                 "secondary_health": primary_health_json(&secondary_health),
                 "primary_submit": submit_audit_json(&primary_audit),
@@ -1745,8 +2534,11 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
             primary_outcome = primary_audit.outcome,
             secondary_outcome = secondary_audit.outcome,
             secondary_skip_reason = secondary_audit.skip_reason.unwrap_or("none"),
-            secondary_budget_claimed = secondary_budget.claimed,
-            secondary_budget_remaining = secondary_budget.remaining,
+            secondary_control_mode = secondary_claim.mode,
+            secondary_claimed = secondary_claim.claimed,
+            secondary_budget_remaining = ?secondary_claim.remaining,
+            secondary_circuit_failures = circuit.consecutive_failures,
+            secondary_circuit_open_ms = circuit.open_remaining_ms,
             primary_elapsed_us = primary_audit.elapsed_us,
             secondary_elapsed_us = secondary_audit.elapsed_us,
             "parallel candidate submission completed"
@@ -1756,33 +2548,52 @@ impl BlockSubmitter for ParallelNodeBlockSubmitter {
 }
 
 #[derive(Clone, Debug)]
-struct SecondaryCandidateBudgetClaim {
-    configured: u64,
-    before: u64,
+struct SecondaryCandidateClaim {
+    mode: &'static str,
+    configured: Option<u64>,
+    before: Option<u64>,
     claimed: bool,
-    remaining: u64,
+    remaining: Option<u64>,
+    claim_key: String,
     persistence: &'static str,
     error: Option<String>,
 }
 
-impl SecondaryCandidateBudgetClaim {
-    fn not_attempted(configured: u64) -> Self {
+impl SecondaryCandidateClaim {
+    fn not_attempted(mode: &'static str, configured: Option<u64>, remaining: Option<u64>) -> Self {
         Self {
+            mode,
             configured,
             before: configured,
             claimed: false,
-            remaining: configured,
+            remaining,
+            claim_key: String::new(),
             persistence: "not_attempted",
             error: None,
         }
     }
 
-    fn failed(configured: u64, error: String) -> Self {
+    fn failed(mode: &'static str, candidate_hash: &str, error: String) -> Self {
         Self {
-            configured,
-            before: configured,
+            mode,
+            configured: None,
+            before: None,
             claimed: false,
-            remaining: 0,
+            remaining: None,
+            claim_key: candidate_hash.to_owned(),
+            persistence: "o_excl_per_candidate",
+            error: Some(error),
+        }
+    }
+
+    fn failed_one_shot(configured: u64, candidate_hash: &str, error: String) -> Self {
+        Self {
+            mode: "one_shot",
+            configured: Some(configured),
+            before: Some(configured),
+            claimed: false,
+            remaining: Some(0),
+            claim_key: candidate_hash.to_owned(),
             persistence: "o_excl_file",
             error: Some(error),
         }
@@ -1805,6 +2616,9 @@ struct ParallelHealthSnapshot {
     primary: HealthAudit,
     secondary: HealthAudit,
     observed_at: Instant,
+    observed_unix_ms: u64,
+    primary_tip_observed_since_unix_ms: Option<u64>,
+    secondary_tip_observed_since_unix_ms: Option<u64>,
 }
 
 impl ParallelHealthSnapshot {
@@ -1815,6 +2629,62 @@ impl ParallelHealthSnapshot {
             .try_into()
             .unwrap_or(u64::MAX)
     }
+}
+
+fn health_tip_identity(audit: &HealthAudit) -> Option<(u64, String, String)> {
+    let snapshot = audit.snapshot.as_ref()?;
+    Some((
+        snapshot.height?,
+        canonical_health_hash(snapshot.tip.as_deref()?).ok()?,
+        canonical_chainwork(snapshot.chainwork.as_deref()?).ok()?,
+    ))
+}
+
+fn tip_observed_since(
+    previous: Option<&HealthAudit>,
+    previous_since: Option<u64>,
+    current: &HealthAudit,
+    observed_unix_ms: u64,
+) -> Option<u64> {
+    let current_identity = health_tip_identity(current)?;
+    if previous.and_then(health_tip_identity).as_ref() == Some(&current_identity) {
+        Some(previous_since.unwrap_or(observed_unix_ms))
+    } else {
+        Some(observed_unix_ms)
+    }
+}
+
+fn candidate_parent_health_json(
+    snapshot: &ParallelHealthSnapshot,
+    candidate: &BlockCandidateSubmitRequest,
+) -> serde_json::Value {
+    let candidate_parent = CanonicalBlockHash::from_candidate_header(candidate);
+    let primary_tip = snapshot
+        .primary
+        .snapshot
+        .as_ref()
+        .and_then(|health| health.tip.as_deref())
+        .and_then(CanonicalBlockHash::from_display_hex);
+    let secondary_tip = snapshot
+        .secondary
+        .snapshot
+        .as_ref()
+        .and_then(|health| health.tip.as_deref())
+        .and_then(CanonicalBlockHash::from_display_hex);
+    serde_json::json!({
+        "health_observed_unix_ms": snapshot.observed_unix_ms,
+        "primary_tip_observed_since_unix_ms": snapshot.primary_tip_observed_since_unix_ms,
+        "primary_tip_age_ms": snapshot.primary_tip_observed_since_unix_ms
+            .map(|since| snapshot.observed_unix_ms.saturating_sub(since)),
+        "secondary_tip_observed_since_unix_ms": snapshot.secondary_tip_observed_since_unix_ms,
+        "secondary_tip_age_ms": snapshot.secondary_tip_observed_since_unix_ms
+            .map(|since| snapshot.observed_unix_ms.saturating_sub(since)),
+        "candidate_parent_matches_primary": candidate_parent.is_some() && candidate_parent == primary_tip,
+        "candidate_parent_matches_secondary": candidate_parent.is_some() && candidate_parent == secondary_tip,
+        "nodes_same_tip": primary_tip.is_some() && primary_tip == secondary_tip,
+        "scope": "local_node_tip_observation",
+        "global_freshness_proven": false,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -3303,6 +4173,69 @@ mod tests {
         }
     }
 
+    struct SentinelAwareTemplateProvider {
+        state: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl TemplateProvider for SentinelAwareTemplateProvider {
+        async fn current_job(&self) -> csd_pool_node::Result<PoolJob> {
+            let caught_up = self.state.load(Ordering::SeqCst) >= 2;
+            let mut job = csd_pool_node::easy_static_job(if caught_up {
+                "sentinel-new"
+            } else {
+                "sentinel-old"
+            });
+            if caught_up {
+                job.template.prev = [1; 32];
+                job.notify.prev_hash_be_hex = "01".repeat(32);
+            }
+            Ok(job)
+        }
+
+        async fn current_tip(&self) -> csd_pool_node::Result<Option<[u8; 32]>> {
+            Ok(Some(if self.state.load(Ordering::SeqCst) >= 2 {
+                [1; 32]
+            } else {
+                [0; 32]
+            }))
+        }
+    }
+
+    struct ScriptedTipSentinel {
+        state: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl JobTipSentinel for ScriptedTipSentinel {
+        async fn observe(&self) -> std::result::Result<TipSentinelObservation, String> {
+            let state = self.state.load(Ordering::SeqCst);
+            let primary_new = state >= 2;
+            let secondary_new = state >= 1;
+            Ok(TipSentinelObservation {
+                primary: ObservedNodeTip {
+                    height: if primary_new { 11 } else { 10 },
+                    tip_hex: if primary_new {
+                        "01".repeat(32)
+                    } else {
+                        "00".repeat(32)
+                    },
+                    chainwork_hex: if primary_new { "11" } else { "10" }.to_owned(),
+                },
+                secondary: ObservedNodeTip {
+                    height: if secondary_new { 11 } else { 10 },
+                    tip_hex: if secondary_new {
+                        "01".repeat(32)
+                    } else {
+                        "00".repeat(32)
+                    },
+                    chainwork_hex: if secondary_new { "11" } else { "10" }.to_owned(),
+                },
+                observed_unix_ms: unix_ms(),
+            })
+        }
+    }
+
     struct FailingBlockSubmitter;
     struct ObservableBlockSubmitter;
 
@@ -3552,9 +4485,14 @@ mod tests {
                 secondary_timeout: timeout_duration,
                 health_refresh: Duration::from_secs(10),
                 health_max_age: Duration::from_secs(30),
-                secondary_candidate_budget: 1,
+                secondary_max_in_flight: 1,
+                circuit_failure_threshold: 3,
+                circuit_cooldown: Duration::from_secs(30),
             },
-            test_candidate_latch(),
+            SecondaryCandidateControl::OneShot {
+                budget: 1,
+                latch: test_candidate_latch(),
+            },
         );
         submitter.refresh_health_once().await;
         submitter
@@ -3573,8 +4511,30 @@ mod tests {
             health_refresh: Duration::from_secs(10),
             health_max_age: Duration::from_secs(30),
             health_snapshot: Arc::new(RwLock::new(None)),
-            secondary_candidate_budget_configured: 1,
-            secondary_candidate_latch: latch,
+            secondary_control: SecondaryCandidateControl::OneShot { budget: 1, latch },
+            secondary_in_flight: Arc::new(Semaphore::new(1)),
+            secondary_circuit: SecondaryCircuitBreaker::new(3, Duration::from_secs(30)),
+        }
+    }
+
+    fn continuous_submitter_without_health_watch(
+        primary: Arc<MockCandidateNodeEndpoint>,
+        secondary: Arc<MockCandidateNodeEndpoint>,
+        journal: PersistentCandidateJournal,
+        failure_threshold: u64,
+        cooldown: Duration,
+    ) -> ParallelNodeBlockSubmitter {
+        ParallelNodeBlockSubmitter {
+            primary,
+            secondary,
+            primary_timeout: Duration::from_secs(1),
+            secondary_timeout: Duration::from_secs(1),
+            health_refresh: Duration::from_secs(10),
+            health_max_age: Duration::from_secs(30),
+            health_snapshot: Arc::new(RwLock::new(None)),
+            secondary_control: SecondaryCandidateControl::ContinuousBounded(journal),
+            secondary_in_flight: Arc::new(Semaphore::new(1)),
+            secondary_circuit: SecondaryCircuitBreaker::new(failure_threshold, cooldown),
         }
     }
 
@@ -3584,6 +4544,20 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         PersistentCandidateLatch::new(path).unwrap()
+    }
+
+    fn test_candidate_journal() -> (PersistentCandidateJournal, PathBuf) {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "csd-pool-secondary-candidates-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (PersistentCandidateJournal::new(path.clone()).unwrap(), path)
     }
 
     #[test]
@@ -3676,12 +4650,18 @@ mod tests {
         assert_eq!(receiver.borrow().template.job_id, "job-refreshed");
         assert!(receiver.borrow().notify.clean_jobs);
         assert!(jobs.retained_jobs().get("job-initial").is_some());
+        assert!(jobs.retained_jobs().get_for_submit("job-initial").is_none());
         assert!(jobs.retained_jobs().get("job-refreshed").is_some());
+        assert!(
+            jobs.retained_jobs()
+                .get_for_submit("job-refreshed")
+                .is_some()
+        );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
-    fn clean_tip_churn_keeps_base_jobs_available_for_share_validation() {
+    fn clean_tip_churn_keeps_base_jobs_for_classification_but_not_acceptance() {
         let initial = Arc::new(csd_pool_node::easy_static_job("clean-job-0"));
         let retained = RetainedJobs::with_initial(initial.clone());
         let retention = Duration::from_secs(900);
@@ -3696,7 +4676,23 @@ mod tests {
         let old = retained.get("clean-job-0").expect("old base job retained");
         assert_eq!(old.template.job_id, initial.template.job_id);
         assert_eq!(old.template.share_target, initial.template.share_target);
+        assert!(retained.get_for_submit("clean-job-0").is_none());
+        assert!(retained.get_for_submit("clean-job-12").is_some());
         assert_eq!(retained.len(), 13);
+    }
+
+    #[test]
+    fn invalidated_parent_remains_classifiable_but_cannot_accept_shares() {
+        let job = Arc::new(csd_pool_node::easy_static_job("stale-parent-job"));
+        let parent = job.template.prev;
+        let retained = RetainedJobs::with_initial(job);
+
+        assert!(retained.get_for_submit("stale-parent-job").is_some());
+        assert_eq!(retained.invalidate_parent(&parent), 1);
+        assert!(retained.get("stale-parent-job").is_some());
+        assert!(retained.job_parent_is_invalidated("stale-parent-job"));
+        assert!(retained.get_for_submit("stale-parent-job").is_none());
+        assert!(!retained.parent_is_retained(&parent));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3734,6 +4730,12 @@ mod tests {
         assert_eq!(heartbeat_job.template.prev, [0; 32]);
         assert!(!heartbeat_job.notify.clean_jobs);
         assert!(jobs.retained_jobs().get(&initial_id).is_some());
+        assert!(jobs.retained_jobs().get_for_submit(&initial_id).is_some());
+        assert!(
+            jobs.retained_jobs()
+                .get_for_submit(&heartbeat_job.template.job_id)
+                .is_some()
+        );
         assert_eq!(jobs.retained_jobs().len(), 2);
 
         let totals = state.snapshot().totals;
@@ -3742,7 +4744,7 @@ mod tests {
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn long_same_tip_gap_keeps_legacy_and_v2_sessions_live_and_accepts_old_job() {
         type TestReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
         type TestWriter = tokio::net::tcp::OwnedWriteHalf;
@@ -3826,9 +4828,7 @@ mod tests {
         }
 
         async fn read_heartbeat(reader: &mut TestReader, previous_job_id: &str) -> String {
-            let frame = tokio::time::timeout(Duration::from_secs(1), read_frame(reader))
-                .await
-                .expect("heartbeat frame arrived before the next simulated interval");
+            let frame = read_frame(reader).await;
             assert_eq!(frame["method"], "mining.notify");
             assert_eq!(frame["params"][8], false);
             let job_id = frame["params"][0].as_str().unwrap().to_owned();
@@ -3912,13 +4912,18 @@ mod tests {
         )
         .await;
 
-        tokio::time::pause();
         tokio::task::yield_now().await;
         let mut legacy_job_id = initial_job.template.job_id.clone();
         let mut v2_job_id = initial_job.template.job_id.clone();
         for _ in 0..4 {
             tokio::time::advance(Duration::from_secs(120)).await;
-            tokio::task::yield_now().await;
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+                if jobs.sender.borrow().template.job_id != legacy_job_id {
+                    break;
+                }
+            }
+            assert_ne!(jobs.sender.borrow().template.job_id, legacy_job_id);
             legacy_job_id = read_heartbeat(&mut legacy_reader, &legacy_job_id).await;
             v2_job_id = read_heartbeat(&mut v2_reader, &v2_job_id).await;
         }
@@ -3982,6 +4987,114 @@ mod tests {
             .unwrap();
         assert_eq!(receiver.borrow().template.job_id, "job-fresh");
         assert!(provider.calls.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[test]
+    fn secondary_tip_sentinel_is_disabled_by_default() {
+        assert!(!tip_sentinel_enabled(None));
+        assert!(!tip_sentinel_enabled(Some("false")));
+        assert!(tip_sentinel_enabled(Some("true")));
+    }
+
+    #[test]
+    fn secondary_tip_sentinel_does_not_invalidate_when_b_is_behind() {
+        let current = [1; 32];
+        let behind = TipSentinelObservation {
+            primary: ObservedNodeTip {
+                height: 11,
+                tip_hex: "01".repeat(32),
+                chainwork_hex: "11".to_owned(),
+            },
+            secondary: ObservedNodeTip {
+                height: 10,
+                tip_hex: "00".repeat(32),
+                chainwork_hex: "10".to_owned(),
+            },
+            observed_unix_ms: 1,
+        };
+        assert!(!tip_sentinel_invalidates_parent(&current, &behind));
+    }
+
+    #[test]
+    fn secondary_tip_sentinel_invalidates_equal_height_competing_tip() {
+        let current = [1; 32];
+        let behind = TipSentinelObservation {
+            primary: ObservedNodeTip {
+                height: 11,
+                tip_hex: "01".repeat(32),
+                chainwork_hex: "11".to_owned(),
+            },
+            secondary: ObservedNodeTip {
+                height: 10,
+                tip_hex: "00".repeat(32),
+                chainwork_hex: "10".to_owned(),
+            },
+            observed_unix_ms: 1,
+        };
+        let competing = TipSentinelObservation {
+            secondary: ObservedNodeTip {
+                height: 11,
+                tip_hex: "02".repeat(32),
+                chainwork_hex: "11".to_owned(),
+            },
+            ..behind
+        };
+        assert!(tip_sentinel_invalidates_parent(&current, &competing));
+    }
+
+    #[tokio::test]
+    async fn secondary_tip_sentinel_fences_old_jobs_until_a_template_catches_up() {
+        let state = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(SentinelAwareTemplateProvider {
+            state: state.clone(),
+        });
+        let sentinel = Arc::new(ScriptedTipSentinel {
+            state: state.clone(),
+        });
+        let jobs = SharedJobWatch::start_with_policy_and_sentinel(
+            provider,
+            Some(sentinel),
+            None,
+            SharedPoolState::new(),
+            Duration::from_millis(50),
+            None,
+            Duration::from_secs(60),
+            Duration::from_millis(5),
+        )
+        .await
+        .unwrap();
+        let mut receiver = jobs.subscribe();
+        let old_job_id = receiver.borrow().template.job_id.clone();
+        assert!(jobs.retained_jobs().get(&old_job_id).is_some());
+
+        state.store(1, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !jobs.retained_jobs().job_parent_is_invalidated(&old_job_id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(jobs.retained_jobs().get(&old_job_id).is_some());
+        assert!(jobs.retained_jobs().get_for_submit(&old_job_id).is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), receiver.changed())
+                .await
+                .is_err(),
+            "B must never provide or cause publication of a mining template"
+        );
+
+        state.store(2, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let current = receiver.borrow().clone();
+        assert_eq!(current.template.job_id, "sentinel-new");
+        assert_eq!(current.template.prev, [1; 32]);
+        assert!(current.notify.clean_jobs);
+        assert!(jobs.retained_jobs().get(&old_job_id).is_some());
+        assert!(jobs.retained_jobs().get_for_submit(&old_job_id).is_none());
     }
 
     #[tokio::test]
@@ -4378,7 +5491,7 @@ mod tests {
             first.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
             false
         );
-        assert!(!submitter.secondary_candidate_latch.path.exists());
+        assert!(!submitter.one_shot_latch_path().exists());
         assert_eq!(secondary.submit_calls.load(Ordering::SeqCst), 0);
 
         let second = submitter
@@ -4798,7 +5911,7 @@ mod tests {
             response.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
             false
         );
-        assert!(!submitter.secondary_candidate_latch.path.exists());
+        assert!(!submitter.one_shot_latch_path().exists());
         assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -4831,7 +5944,7 @@ mod tests {
             first.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
             false
         );
-        assert!(!submitter.secondary_candidate_latch.path.exists());
+        assert!(!submitter.one_shot_latch_path().exists());
 
         {
             let mut health = submitter
@@ -4882,7 +5995,7 @@ mod tests {
             first.extra["parallel_submit"]["secondary_candidate_budget"]["claimed"],
             false
         );
-        assert!(!submitter.secondary_candidate_latch.path.exists());
+        assert!(!submitter.one_shot_latch_path().exists());
         assert_eq!(primary.cached_submit_calls.load(Ordering::SeqCst), 1);
         assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 0);
 
@@ -4897,6 +6010,244 @@ mod tests {
             true
         );
         assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn continuous_bounded_submits_each_candidate_once_across_restart() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Response(true),
+        ));
+        let (journal, directory) = test_candidate_journal();
+        let submitter = continuous_submitter_without_health_watch(
+            primary.clone(),
+            secondary.clone(),
+            journal,
+            3,
+            Duration::from_secs(30),
+        );
+        submitter.refresh_health_once().await;
+
+        let first = mock_submission();
+        let mut second = mock_submission();
+        second.candidate.job_id = "candidate-2".to_owned();
+        second.candidate.hash_hex = "22".repeat(32);
+        assert!(submitter.submit_candidate(&first).await.unwrap().ok);
+        assert!(submitter.submit_candidate(&second).await.unwrap().ok);
+        let duplicate = submitter.submit_candidate(&first).await.unwrap();
+
+        assert_eq!(primary.cached_submit_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            duplicate.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "candidate_already_submitted_to_secondary"
+        );
+        assert_eq!(
+            duplicate.extra["parallel_submit"]["secondary_candidate_control"]["mode"],
+            "continuous_bounded"
+        );
+
+        let restarted = continuous_submitter_without_health_watch(
+            primary.clone(),
+            secondary.clone(),
+            PersistentCandidateJournal::new(directory.clone()).unwrap(),
+            3,
+            Duration::from_secs(30),
+        );
+        restarted.refresh_health_once().await;
+        let replay = restarted.submit_candidate(&second).await.unwrap();
+        assert!(replay.ok);
+        assert_eq!(
+            replay.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "candidate_already_submitted_to_secondary"
+        );
+        assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn continuous_bounded_slow_claim_does_not_delay_primary_start() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Response(true),
+        ));
+        let (journal, directory) = test_candidate_journal();
+        let submitter = continuous_submitter_without_health_watch(
+            primary.clone(),
+            secondary,
+            journal.with_claim_delay(Duration::from_millis(150)),
+            3,
+            Duration::from_secs(30),
+        );
+        submitter.refresh_health_once().await;
+        let pending =
+            tokio::spawn(async move { submitter.submit_candidate(&mock_submission()).await });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(primary.cached_submit_calls.load(Ordering::SeqCst), 1);
+        assert!(!pending.is_finished());
+        assert!(pending.await.unwrap().unwrap().ok);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn continuous_bounded_limits_secondary_concurrency_without_blocking_primary() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::DelayedResponse(Duration::from_millis(100), true),
+        ));
+        let (journal, directory) = test_candidate_journal();
+        let submitter = continuous_submitter_without_health_watch(
+            primary.clone(),
+            secondary.clone(),
+            journal,
+            3,
+            Duration::from_secs(30),
+        );
+        submitter.refresh_health_once().await;
+        let first = mock_submission();
+        let mut second = mock_submission();
+        second.candidate.job_id = "candidate-2".to_owned();
+        second.candidate.hash_hex = "22".repeat(32);
+
+        let (first, second) = tokio::join!(
+            submitter.submit_candidate(&first),
+            submitter.submit_candidate(&second)
+        );
+        let responses = [first.unwrap(), second.unwrap()];
+        assert_eq!(primary.cached_submit_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| {
+                    response.extra["parallel_submit"]["secondary_submit"]["skip_reason"]
+                        == "secondary_concurrency_limit"
+                })
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn continuous_bounded_circuit_breaker_isolated_from_primary_and_recovers() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::Error("node-b unavailable"),
+        ));
+        let (journal, directory) = test_candidate_journal();
+        let submitter = continuous_submitter_without_health_watch(
+            primary.clone(),
+            secondary.clone(),
+            journal,
+            2,
+            Duration::from_millis(50),
+        );
+        submitter.refresh_health_once().await;
+
+        for value in [0x11, 0x22] {
+            let mut submission = mock_submission();
+            submission.candidate.hash_hex = format!("{value:02x}").repeat(32);
+            assert!(submitter.submit_candidate(&submission).await.unwrap().ok);
+        }
+        let mut blocked = mock_submission();
+        blocked.candidate.hash_hex = "33".repeat(32);
+        let blocked = submitter.submit_candidate(&blocked).await.unwrap();
+        assert!(blocked.ok);
+        assert_eq!(
+            blocked.extra["parallel_submit"]["secondary_submit"]["skip_reason"],
+            "secondary_circuit_open"
+        );
+        assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(primary.cached_submit_calls.load(Ordering::SeqCst), 3);
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let mut retry = mock_submission();
+        retry.candidate.hash_hex = "44".repeat(32);
+        assert!(submitter.submit_candidate(&retry).await.unwrap().ok);
+        assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(primary.cached_submit_calls.load(Ordering::SeqCst), 4);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn continuous_bounded_secondary_timeout_keeps_primary_success() {
+        let primary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-a",
+            MockSubmitBehavior::Response(true),
+        ));
+        let secondary = Arc::new(MockCandidateNodeEndpoint::healthy(
+            "node-b",
+            MockSubmitBehavior::DelayedResponse(Duration::from_secs(1), true),
+        ));
+        let (journal, directory) = test_candidate_journal();
+        let mut submitter = continuous_submitter_without_health_watch(
+            primary.clone(),
+            secondary.clone(),
+            journal,
+            3,
+            Duration::from_secs(30),
+        );
+        submitter.secondary_timeout = Duration::from_millis(250);
+        submitter.refresh_health_once().await;
+
+        let started = Instant::now();
+        let response = submitter
+            .submit_candidate(&mock_submission())
+            .await
+            .unwrap();
+        assert!(response.ok);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(
+            response.extra["parallel_submit"]["accepted_by"],
+            "authority"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_submit"]["outcome"],
+            "timeout"
+        );
+        assert_eq!(
+            response.extra["parallel_submit"]["secondary_candidate_control"]["circuit"]["consecutive_failures"],
+            1
+        );
+        assert_eq!(primary.cached_submit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary.full_submit_calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn continuous_candidate_journal_requires_private_real_directory() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("csd-pool-secondary-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = PersistentCandidateJournal::new(directory.clone())
+            .err()
+            .expect("broad state directory permissions must fail closed");
+        assert!(error.to_string().contains("mode 0700"));
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]
@@ -4919,7 +6270,7 @@ mod tests {
         let second = restarted.claim(&"22".repeat(32), 1);
         assert!(!second.claimed);
         assert!(second.error.is_none());
-        assert_eq!(second.remaining, 0);
+        assert_eq!(second.remaining, Some(0));
         std::fs::remove_file(path).unwrap();
     }
 
@@ -5050,7 +6401,7 @@ mod tests {
         let pending =
             tokio::spawn(async move { worker.submit_candidate(&mock_submission()).await });
 
-        while !submitter.secondary_candidate_latch.path.exists() {
+        while !submitter.one_shot_latch_path().exists() {
             tokio::task::yield_now().await;
         }
         {
@@ -5095,9 +6446,14 @@ mod tests {
                 secondary_timeout: Duration::from_secs(1),
                 health_refresh: Duration::from_secs(10),
                 health_max_age: Duration::from_secs(30),
-                secondary_candidate_budget: 1,
+                secondary_max_in_flight: 1,
+                circuit_failure_threshold: 3,
+                circuit_cooldown: Duration::from_secs(30),
             },
-            test_candidate_latch(),
+            SecondaryCandidateControl::OneShot {
+                budget: 1,
+                latch: test_candidate_latch(),
+            },
         );
         submitter.refresh_health_once().await;
 
@@ -5321,6 +6677,9 @@ mod tests {
                 "node_observability": {
                     "accept_elapsed_us": 125,
                     "relay_queued": true,
+                    "relay_ack_scope": "local_gossipsub_publish",
+                    "relay_connected_peers_observed": 8,
+                    "relay_remote_delivery_observed": false,
                 },
             }),
         };
@@ -5335,6 +6694,18 @@ mod tests {
         assert_eq!(
             response.extra["node_observability"]["accept_elapsed_us"],
             125
+        );
+        assert_eq!(
+            response.extra["node_observability"]["relay_ack_scope"],
+            "local_gossipsub_publish"
+        );
+        assert_eq!(
+            response.extra["node_observability"]["relay_connected_peers_observed"],
+            8
+        );
+        assert_eq!(
+            response.extra["node_observability"]["relay_remote_delivery_observed"],
+            false
         );
         assert_eq!(
             response.extra["pool_observability"]["candidate_detected_unix_ms"],
@@ -5356,6 +6727,52 @@ mod tests {
             candidate_node_duration(&response, "relay_enqueue_elapsed_us"),
             None
         );
+    }
+
+    #[test]
+    fn parallel_health_tracks_tip_age_without_claiming_global_freshness() {
+        let audit = |tip: &str| HealthAudit {
+            node: "node-a".to_owned(),
+            started_unix_ms: 1,
+            finished_unix_ms: 2,
+            elapsed_us: 1_000,
+            outcome: "ok",
+            snapshot: Some(NodeHealth {
+                height: Some(100),
+                tip: Some(tip.to_owned()),
+                chainwork: Some("1000".to_owned()),
+                peers: Some(8),
+                extra: serde_json::Value::Null,
+            }),
+            error: None,
+        };
+        let original = audit(&format!("0x{}", "00".repeat(32)));
+        let same = audit(&format!("0x{}", "00".repeat(32)));
+        let changed = audit(&format!("0x{}", "01".repeat(32)));
+        assert_eq!(tip_observed_since(None, None, &original, 100), Some(100));
+        assert_eq!(
+            tip_observed_since(Some(&original), Some(100), &same, 250),
+            Some(100)
+        );
+        assert_eq!(
+            tip_observed_since(Some(&same), Some(100), &changed, 300),
+            Some(300)
+        );
+
+        let snapshot = ParallelHealthSnapshot {
+            primary: same.clone(),
+            secondary: same,
+            observed_at: Instant::now(),
+            observed_unix_ms: 250,
+            primary_tip_observed_since_unix_ms: Some(100),
+            secondary_tip_observed_since_unix_ms: Some(125),
+        };
+        let value = candidate_parent_health_json(&snapshot, &mock_candidate());
+        assert_eq!(value["primary_tip_age_ms"], 150);
+        assert_eq!(value["secondary_tip_age_ms"], 125);
+        assert_eq!(value["candidate_parent_matches_primary"], true);
+        assert_eq!(value["candidate_parent_matches_secondary"], true);
+        assert_eq!(value["global_freshness_proven"], false);
     }
 
     #[test]

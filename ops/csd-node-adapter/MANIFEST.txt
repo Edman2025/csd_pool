@@ -1,7 +1,7 @@
 upstream=https://github.com/compute-substrate/compute-substrate.git
 commit=d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c
 patch=compute-substrate-pool-adapter.patch
-patch_sha256=265dfdc620453606b5ff6d4222327056c9bcdf713a3f28827f6932c6aae67dc4
+patch_sha256=00166e10a3a25747b671467cd5c91d9d6fa29ec4a7d5d4b29a0685b0f026e0bc
 p2p_patch=compute-substrate-p2p-backoff.patch
 p2p_patch_sha256=51dd08cc9cfc0a4539afa67558c1ae005c165d615223e825e75130352eec2075
 build_script=apply-and-build.sh

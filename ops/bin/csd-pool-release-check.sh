@@ -1042,10 +1042,10 @@ require_file "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch"
 require_file "ops/csd-node-adapter/MANIFEST.txt"
 require_executable "ops/csd-node-adapter/apply-and-build.sh"
 require_text "ops/csd-node-adapter/MANIFEST.txt" "commit=d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c"
-require_text "ops/csd-node-adapter/MANIFEST.txt" "patch_sha256=265dfdc620453606b5ff6d4222327056c9bcdf713a3f28827f6932c6aae67dc4"
+require_text "ops/csd-node-adapter/MANIFEST.txt" "patch_sha256=00166e10a3a25747b671467cd5c91d9d6fa29ec4a7d5d4b29a0685b0f026e0bc"
 require_text "ops/csd-node-adapter/MANIFEST.txt" "p2p_patch_sha256=51dd08cc9cfc0a4539afa67558c1ae005c165d615223e825e75130352eec2075"
 require_text "ops/csd-node-adapter/MANIFEST.txt" "build_script_sha256=80370b68b1f68bce8b88c7496ac081b27c0352f4cbf9eda1eaca9278357815f9"
-require_sha256 "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" "265dfdc620453606b5ff6d4222327056c9bcdf713a3f28827f6932c6aae67dc4"
+require_sha256 "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" "00166e10a3a25747b671467cd5c91d9d6fa29ec4a7d5d4b29a0685b0f026e0bc"
 require_sha256 "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" "51dd08cc9cfc0a4539afa67558c1ae005c165d615223e825e75130352eec2075"
 require_sha256 "ops/csd-node-adapter/apply-and-build.sh" "80370b68b1f68bce8b88c7496ac081b27c0352f4cbf9eda1eaca9278357815f9"
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'CSD_POOL_ADAPTER_TOKEN'
@@ -1057,6 +1057,9 @@ require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'node_o
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'relay_enqueue_elapsed_us'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'persist_index_flush_then_apply'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'accepted_relay_recovered'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'relay_ack_scope'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'local_gossipsub_publish'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'relay_remote_delivery_observed'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'two_official_http_adapters_replay_primary_material_with_secondary_empty_cache'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'p2p_first_canonical_candidate_requires_relay_ack'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'local_canonical_relay_failure_is_retried_before_duplicate_success'
@@ -1078,12 +1081,31 @@ require_text "crates/csd-pool-bridge/src/lib.rs" 'secondary_only_success_persist
 require_text "crates/csd-pool-bridge/src/lib.rs" 'persistent_latch_rejects_unsafe_writable_parent'
 require_text "crates/csd-pool-bridge/src/lib.rs" 'slow_latch_persistence_is_bounded_and_fails_closed'
 require_text "crates/csd-pool-bridge/src/lib.rs" 'parallel_submit_skips_secondary_without_relay_peers_or_latch_claim'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'continuous_bounded_submits_each_candidate_once_across_restart'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'continuous_bounded_limits_secondary_concurrency_without_blocking_primary'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'continuous_bounded_circuit_breaker_isolated_from_primary_and_recovers'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'continuous_bounded_secondary_timeout_keeps_primary_success'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'secondary_tip_sentinel_is_disabled_by_default'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'secondary_tip_sentinel_does_not_invalidate_when_b_is_behind'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'secondary_tip_sentinel_invalidates_equal_height_competing_tip'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'secondary_tip_sentinel_fences_old_jobs_until_a_template_catches_up'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'invalidated_parent_remains_classifiable_but_cannot_accept_shares'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'clean_tip_churn_keeps_base_jobs_for_classification_but_not_acceptance'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'closing session after repeated stale job submissions'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'continuous_bounded_slow_claim_does_not_delay_primary_start'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'parallel_health_tracks_tip_age_without_claiming_global_freshness'
+require_text "ops/env/csd-pool.env.example" 'CSD_POOL_SECONDARY_TIP_SENTINEL_ENABLED=false'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '"relay_ack_scope": "local_gossipsub_publish"'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '"relay_remote_delivery_observed": false'
+require_text "crates/csd-pool-bridge/src/lib.rs" 'CSD_POOL_STATELESS_PARALLEL_CANDIDATE_STATE_DIR'
 require_text "crates/csd-pool-node/src/lib.rs" 'stateless_provider_retries_material_after_transient_failure'
 require_text "crates/csd-pool-node/src/lib.rs" 'node_health_accepts_official_peer_count_field'
 require_text "crates/csd-pool-db/src/lib.rs" 'candidate_status_distinguishes_rejection_from_ambiguous_transport_failure'
 require_text "ops/env/csd-pool.env.example" 'CSD_POOL_PARALLEL_CANDIDATE_SUBMIT_ENABLED=false'
 require_text "ops/env/csd-pool.env.example" 'CSD_POOL_STATELESS_PARALLEL_CANDIDATE_SUBMIT_ENABLED=false'
 require_text "ops/env/csd-pool.env.example" 'CSD_POOL_STATELESS_PARALLEL_CANDIDATE_LATCH_PATH=/var/lib/csd-pool/stateless-candidate-canary.latch'
+require_text "ops/env/csd-pool.env.example" 'CSD_POOL_STATELESS_PARALLEL_CANDIDATE_MODE=one_shot'
+require_text "ops/env/csd-pool.env.example" 'CSD_POOL_STATELESS_PARALLEL_CANDIDATE_STATE_DIR=/var/lib/csd-pool/stateless-candidates'
 require_text "ops/systemd/csd-pool-migrated-daemon.service" 'ProtectSystem=strict'
 require_text "ops/systemd/csd-pool-migrated-daemon.service" 'ReadWritePaths=/data/csd-pool/state /data/csd-pool/log /data/csd-pool/backup /var/lib/csd-pool'
 require_text "ops/bin/csd-pool-stateless-candidate-canary-gate.py" 'PASS_LOCAL_EVIDENCE_GATE'
