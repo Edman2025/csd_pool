@@ -1042,12 +1042,12 @@ require_file "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch"
 require_file "ops/csd-node-adapter/MANIFEST.txt"
 require_executable "ops/csd-node-adapter/apply-and-build.sh"
 require_text "ops/csd-node-adapter/MANIFEST.txt" "commit=d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c"
-require_text "ops/csd-node-adapter/MANIFEST.txt" "patch_sha256=00166e10a3a25747b671467cd5c91d9d6fa29ec4a7d5d4b29a0685b0f026e0bc"
+require_text "ops/csd-node-adapter/MANIFEST.txt" "patch_sha256=39a36f3af0f6d3bc6ab5f6efe538d45377a58302f90b80fc0a6678f4019f9b05"
 require_text "ops/csd-node-adapter/MANIFEST.txt" "p2p_patch_sha256=51dd08cc9cfc0a4539afa67558c1ae005c165d615223e825e75130352eec2075"
-require_text "ops/csd-node-adapter/MANIFEST.txt" "build_script_sha256=80370b68b1f68bce8b88c7496ac081b27c0352f4cbf9eda1eaca9278357815f9"
-require_sha256 "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" "00166e10a3a25747b671467cd5c91d9d6fa29ec4a7d5d4b29a0685b0f026e0bc"
+require_text "ops/csd-node-adapter/MANIFEST.txt" "build_script_sha256=c1c24e18577b55e847dc372b0206ee0eaaa3a854d7c9c073d586fbe2d70ff5a3"
+require_sha256 "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" "39a36f3af0f6d3bc6ab5f6efe538d45377a58302f90b80fc0a6678f4019f9b05"
 require_sha256 "ops/csd-node-adapter/compute-substrate-p2p-backoff.patch" "51dd08cc9cfc0a4539afa67558c1ae005c165d615223e825e75130352eec2075"
-require_sha256 "ops/csd-node-adapter/apply-and-build.sh" "80370b68b1f68bce8b88c7496ac081b27c0352f4cbf9eda1eaca9278357815f9"
+require_sha256 "ops/csd-node-adapter/apply-and-build.sh" "c1c24e18577b55e847dc372b0206ee0eaaa3a854d7c9c073d586fbe2d70ff5a3"
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'CSD_POOL_ADAPTER_TOKEN'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/rpc/mining/template'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/rpc/mining/template-material'
@@ -1065,6 +1065,24 @@ require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'p2p_fi
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'local_canonical_relay_failure_is_retried_before_duplicate_success'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'duplicate_publish_is_idempotent_not_a_new_broadcast'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'actual_gossipsub_peer_ack_corresponds_to_delivered_header'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'signed_application_receipt_round_trips_from_remote_peer'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'signed_receipt_path_recovers_after_observer_disconnect'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'receipt_rejects_wrong_genesis_unsigned_self_and_unknown_hash'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '/api/rpc/block/relay-status'
+require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" 'signed_application_header_receipt'
+require_executable "ops/bin/csd-pool-relay-observer-run.sh"
+require_executable "ops/bin/csd-pool-relay-observer-self-test.sh"
+require_file "ops/env/csd-pool-relay-observer.env.example"
+require_file "ops/systemd/csd-pool-relay-observer.service.in"
+require_file "ops/systemd/csd-pool-relay-observer-canary.service"
+require_text "ops/systemd/csd-pool-relay-observer.service.in" 'PrivateDevices=true'
+require_text "ops/systemd/csd-pool-relay-observer.service.in" 'DevicePolicy=closed'
+require_text "ops/systemd/csd-pool-relay-observer.service.in" 'MemoryHigh=@MEMORY_HIGH_BYTES@'
+require_text "ops/systemd/csd-pool-relay-observer.service.in" 'MemoryMax=@MEMORY_MAX_BYTES@'
+require_text "ops/systemd/csd-pool-relay-observer-canary.service" 'CPUQuota=50%'
+require_text "ops/systemd/csd-pool-relay-observer-canary.service" 'MemoryHigh=536870912'
+require_text "ops/systemd/csd-pool-relay-observer-canary.service" 'MemoryMax=805306368'
+require_text "ops/systemd/csd-pool-relay-observer-canary.service" 'RuntimeMaxSec=1800'
 require_no_regex \
   "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" \
   '^\+.*pool:relay-state' \
@@ -1095,6 +1113,9 @@ require_text "crates/csd-pool-bridge/src/lib.rs" 'closing session after repeated
 require_text "crates/csd-pool-bridge/src/lib.rs" 'continuous_bounded_slow_claim_does_not_delay_primary_start'
 require_text "crates/csd-pool-bridge/src/lib.rs" 'parallel_health_tracks_tip_age_without_claiming_global_freshness'
 require_text "ops/env/csd-pool.env.example" 'CSD_POOL_SECONDARY_TIP_SENTINEL_ENABLED=false'
+require_text "ops/env/csd-pool.env.example" 'CSD_POOL_TIP_SENTINEL_NODE_URL='
+require_text "ops/env/csd-pool.env.example" 'CSD_POOL_TIP_SENTINEL_NODE_TOKEN='
+require_text "ops/env/csd-pool.env.example" 'CSD_POOL_TIP_SENTINEL_NODE_CA_CERT='
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '"relay_ack_scope": "local_gossipsub_publish"'
 require_text "ops/csd-node-adapter/compute-substrate-pool-adapter.patch" '"relay_remote_delivery_observed": false'
 require_text "crates/csd-pool-bridge/src/lib.rs" 'CSD_POOL_STATELESS_PARALLEL_CANDIDATE_STATE_DIR'

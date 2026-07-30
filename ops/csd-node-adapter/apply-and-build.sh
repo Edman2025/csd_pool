@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="${1:-${CSD_SOURCE_DIR:-}}"
 EXPECTED_COMMIT="d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c"
-EXPECTED_PATCH_SHA256="265dfdc620453606b5ff6d4222327056c9bcdf713a3f28827f6932c6aae67dc4"
+EXPECTED_PATCH_SHA256="39a36f3af0f6d3bc6ab5f6efe538d45377a58302f90b80fc0a6678f4019f9b05"
 EXPECTED_P2P_PATCH_SHA256="51dd08cc9cfc0a4539afa67558c1ae005c165d615223e825e75130352eec2075"
 PATCH_FILE="$SCRIPT_DIR/compute-substrate-pool-adapter.patch"
 P2P_PATCH_FILE="$SCRIPT_DIR/compute-substrate-p2p-backoff.patch"
@@ -41,7 +41,7 @@ search_source() {
 [[ "$(sha256_value "$P2P_PATCH_FILE")" == "$EXPECTED_P2P_PATCH_SHA256" ]] || \
   fail "P2P backoff patch checksum mismatch"
 
-for path in src/api/mod.rs src/chain/mine.rs src/cli/main.rs src/net/mempool.rs src/net/mod.rs src/net/node.rs; do
+for path in src/api/mod.rs src/chain/mine.rs src/cli/main.rs src/net/mempool.rs src/net/mod.rs src/net/node.rs src/net/proto.rs; do
   git -C "$SOURCE_DIR" diff --quiet -- "$path" || fail "source file already modified: $path"
 done
 
@@ -93,6 +93,18 @@ search_source 'duplicate_publish_is_idempotent_not_a_new_broadcast' "$SOURCE_DIR
   fail "duplicate mined-header publish idempotency replay missing after patch"
 search_source 'actual_gossipsub_peer_ack_corresponds_to_delivered_header' "$SOURCE_DIR/src/net/node.rs" || \
   fail "actual gossipsub peer delivery replay missing after patch"
+search_source 'signed_application_receipt_round_trips_from_remote_peer' "$SOURCE_DIR/src/net/node.rs" || \
+  fail "signed remote header receipt replay missing after patch"
+search_source 'signed_receipt_path_recovers_after_observer_disconnect' "$SOURCE_DIR/src/net/node.rs" || \
+  fail "signed remote header receipt reconnect replay missing after patch"
+search_source 'receipt_rejects_wrong_genesis_unsigned_self_and_unknown_hash' "$SOURCE_DIR/src/net/node.rs" || \
+  fail "header receipt forgery and scope negative replay missing after patch"
+search_source 'TOPIC_HDR_ACK' "$SOURCE_DIR/src/net/proto.rs" || \
+  fail "signed remote header receipt topic missing after patch"
+search_source '/api/rpc/block/relay-status' "$SOURCE_DIR/src/api/mod.rs" || \
+  fail "authenticated relay receipt status endpoint missing after patch"
+search_source 'not proof of full-block validation or canonical acceptance' "$SOURCE_DIR/src/api/mod.rs" || \
+  fail "relay receipt scope is not explicit after patch"
 search_source 'InsufficientPeers' "$SOURCE_DIR/src/net/node.rs" || \
   fail "gossipsub publish failures are not classified after patch"
 search_source 'choose_pool_block_time' "$SOURCE_DIR/src/api/mod.rs" || \

@@ -701,6 +701,27 @@ publish, and `relay_remote_delivery_observed=false`. True remote delivery
 requires an application-level receipt from another node; absence of that
 receipt must remain visible but must not delay node-a's authority submit.
 
+The optional, default-off `CSD_POOL_NODE_HEADER_RECEIPT_ACK_ENABLED` protocol
+subscribes official nodes and outbound observers to the signed
+`csd/hdr-ack/1` topic. A node emits a receipt only after decoding a header and
+checking its network universe and proof of work. The publishing node keeps a
+bounded, hash-keyed set of distinct signed peer receipts and exposes only
+counts and timing through authenticated
+`/api/rpc/block/relay-status?hash=...`; peer identities and addresses are not
+returned. The receipt proves that a signed remote libp2p identity received a
+valid header. It is deliberately not described as full-block validation,
+canonical acceptance, or durable persistence. Unknown hashes, wrong-genesis
+receipts, unsigned messages, self receipts, and duplicate receipts do not
+advance the count.
+
+An independent observer can enable this protocol while binding its RPC and P2P
+listeners to loopback and dialing configured bootnodes. It is not a template
+source, submit authority, or payout component. Node-a's compact candidate
+submission and node-b's stateless full submission never await observer
+receipts. A later full-block relay stage must continue to use the official
+adapter's complete decode, persist, index, consensus-apply, and canonical path;
+the header receipt is observability, not a shortcut around validation.
+
 The pinned node sync path polls connected peers for tips every 10 seconds,
 limits header-locator requests with a 20-second cooldown, waits up to 60
 seconds for a requested block, and only penalizes a peer as stale at a

@@ -1,0 +1,47 @@
+[Unit]
+Description=CSD outbound-only relay receipt observer canary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=csd-relay-observer
+Group=csd-relay-observer
+WorkingDirectory=/opt/csd-relay-observer/current
+EnvironmentFile=/etc/csd-relay-observer/observer.env
+ExecStart=/opt/csd-relay-observer/current/ops/bin/csd-pool-relay-observer-run.sh
+Restart=no
+RuntimeMaxSec=1800
+TimeoutStopSec=20
+
+CPUQuota=50%
+CPUWeight=10
+IOWeight=10
+MemoryHigh=536870912
+MemoryMax=805306368
+TasksMax=128
+LimitNOFILE=4096
+
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateDevices=true
+DevicePolicy=closed
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/csd-relay-observer /var/log/csd-relay-observer
+StateDirectory=csd-relay-observer
+StateDirectoryMode=0700
+LogsDirectory=csd-relay-observer
+LogsDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

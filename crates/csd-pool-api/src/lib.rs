@@ -1324,6 +1324,22 @@ impl AppState {
             snapshot.totals.job_heartbeat_count
         ));
         body.push_str(
+            "# HELP csd_pool_stale_generation_fence_total Invalidated-parent shares grouped by the session job-generation fence.\n",
+        );
+        body.push_str("# TYPE csd_pool_stale_generation_fence_total counter\n");
+        body.push_str(&format!(
+            "csd_pool_stale_generation_fence_total{{reason=\"notify_delivery_lag\"}} {}\n",
+            snapshot.totals.stale_notify_delivery_lag
+        ));
+        body.push_str(&format!(
+            "csd_pool_stale_generation_fence_total{{reason=\"miner_switch_lag\"}} {}\n",
+            snapshot.totals.stale_miner_switch_lag
+        ));
+        body.push_str(&format!(
+            "csd_pool_stale_generation_fence_total{{reason=\"unclassified\"}} {}\n",
+            snapshot.totals.stale_generation_unclassified
+        ));
+        body.push_str(
             "# HELP csd_pool_job_notify_age_seconds Age of the latest job publication by this process.\n",
         );
         body.push_str("# TYPE csd_pool_job_notify_age_seconds gauge\n");
@@ -3723,6 +3739,15 @@ mod tests {
         );
         state.pool_state.record_job_notify("tip_change");
         state.pool_state.record_job_notify("heartbeat");
+        state
+            .pool_state
+            .record_stale_generation_fence("notify_delivery_lag");
+        state
+            .pool_state
+            .record_stale_generation_fence("miner_switch_lag");
+        state
+            .pool_state
+            .record_stale_generation_fence("unclassified");
         let text = state.prometheus_metrics(
             Some(&DashboardPoolStats {
                 total_blocks: 7,
@@ -3758,6 +3783,15 @@ mod tests {
         assert!(text.contains("csd_pool_round_share_difficulty 8.000000"));
         assert!(text.contains("csd_pool_job_notify_total{reason=\"tip_change\"} 1"));
         assert!(text.contains("csd_pool_job_notify_total{reason=\"heartbeat\"} 1"));
+        assert!(
+            text.contains(
+                "csd_pool_stale_generation_fence_total{reason=\"notify_delivery_lag\"} 1"
+            )
+        );
+        assert!(
+            text.contains("csd_pool_stale_generation_fence_total{reason=\"miner_switch_lag\"} 1")
+        );
+        assert!(text.contains("csd_pool_stale_generation_fence_total{reason=\"unclassified\"} 1"));
         assert!(text.contains("csd_pool_job_notify_age_seconds "));
     }
 

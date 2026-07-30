@@ -1,0 +1,48 @@
+[Unit]
+Description=CSD outbound-only relay receipt observer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=csd-relay-observer
+Group=csd-relay-observer
+WorkingDirectory=/opt/csd-relay-observer/current
+EnvironmentFile=/etc/csd-relay-observer/observer.env
+ExecStart=/opt/csd-relay-observer/current/ops/bin/csd-pool-relay-observer-run.sh
+Restart=on-failure
+RestartSec=10
+
+# Host-specific values must be rendered from isolation pressure tests and the
+# selected host's measured headroom. Unresolved templates are not valid.
+CPUQuota=@CPU_QUOTA_PERCENT@%
+CPUWeight=10
+IOWeight=10
+MemoryHigh=@MEMORY_HIGH_BYTES@
+MemoryMax=@MEMORY_MAX_BYTES@
+TasksMax=@TASKS_MAX@
+LimitNOFILE=@LIMIT_NOFILE@
+
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateDevices=true
+DevicePolicy=closed
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/csd-relay-observer /var/log/csd-relay-observer
+StateDirectory=csd-relay-observer
+StateDirectoryMode=0700
+LogsDirectory=csd-relay-observer
+LogsDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

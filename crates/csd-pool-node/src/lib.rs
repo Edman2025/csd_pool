@@ -60,6 +60,21 @@ impl CsdNodeClient {
         self
     }
 
+    pub fn with_root_certificate_pem(mut self, pem: &[u8]) -> Result<Self> {
+        let certificates = reqwest::Certificate::from_pem_bundle(pem)?;
+        if certificates.is_empty() {
+            return Err(NodeError::InvalidResponse(
+                "root certificate PEM contains no certificates",
+            ));
+        }
+        let mut builder = reqwest::Client::builder();
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+        self.http = builder.build()?;
+        Ok(self)
+    }
+
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self.bearer_token.as_deref() {
             Some(token) => request.bearer_auth(token),
@@ -784,7 +799,57 @@ mod tests {
         http::{HeaderMap, StatusCode},
         routing::{get, post},
     };
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+
+    async fn spawn_self_signed_health_server(
+        connection_count: usize,
+    ) -> (std::net::SocketAddr, String) {
+        let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+            .expect("self-signed test certificate");
+        let certificate_der = certificate.serialize_der().expect("certificate DER");
+        let private_key_der = certificate.serialize_private_key_der();
+        let certificate_pem = certificate.serialize_pem().expect("certificate PEM");
+        let tls = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(certificate_der)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der)),
+            )
+            .expect("TLS server config");
+        let acceptor = TlsAcceptor::from(Arc::new(tls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("TLS test listener");
+        let address = listener.local_addr().expect("TLS test address");
+        tokio::spawn(async move {
+            for _ in 0..connection_count {
+                let (stream, _) = listener.accept().await.expect("TLS test accept");
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request).await;
+                    let body = r#"{"height":42,"tip":"00","chainwork":"100","peer_count":3}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("TLS test response");
+                });
+            }
+        });
+        (address, certificate_pem)
+    }
 
     #[test]
     fn node_health_accepts_official_peer_count_field() {
@@ -830,6 +895,48 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.target_block_secs, 60);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn instance_root_certificate_trusts_only_the_configured_self_signed_server() {
+        let (address, certificate_pem) = spawn_self_signed_health_server(4).await;
+        let url = format!("https://{address}");
+
+        let untrusted = CsdNodeClient::new(url.clone()).health().await;
+        assert!(untrusted.is_err());
+
+        let wrong_certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+            .unwrap()
+            .serialize_pem()
+            .unwrap();
+        let wrong_trust = CsdNodeClient::new(url.clone())
+            .with_root_certificate_pem(wrong_certificate.as_bytes())
+            .unwrap()
+            .health()
+            .await;
+        assert!(wrong_trust.is_err());
+
+        let health = CsdNodeClient::new(url)
+            .with_root_certificate_pem(certificate_pem.as_bytes())
+            .unwrap()
+            .health()
+            .await
+            .unwrap();
+        assert_eq!(health.height, Some(42));
+        assert_eq!(health.peers, Some(3));
+
+        let fresh_untrusted = CsdNodeClient::new(format!("https://{address}"))
+            .health()
+            .await;
+        assert!(fresh_untrusted.is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_instance_root_certificate_pem() {
+        let error = CsdNodeClient::new("https://127.0.0.1")
+            .with_root_certificate_pem(b"not a certificate")
+            .unwrap_err();
+        assert!(matches!(error, NodeError::InvalidResponse(_)));
     }
 
     #[tokio::test]

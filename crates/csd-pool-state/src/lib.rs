@@ -87,6 +87,16 @@ impl SharedPoolState {
         state.updated_ts = now_ts();
     }
 
+    pub fn record_stale_generation_fence(&self, reason: &str) {
+        let mut state = self.inner.write().expect("pool state lock");
+        match reason {
+            "notify_delivery_lag" => state.stale_notify_delivery_lag += 1,
+            "miner_switch_lag" => state.stale_miner_switch_lag += 1,
+            _ => state.stale_generation_unclassified += 1,
+        }
+        state.updated_ts = now_ts();
+    }
+
     pub fn record_share_validation(&self, elapsed: Duration) {
         let mut state = self.inner.write().expect("pool state lock");
         state.share_validation_count += 1;
@@ -176,6 +186,9 @@ struct PoolState {
     shares_accepted: u64,
     shares_rejected: u64,
     shares_stale: u64,
+    stale_notify_delivery_lag: u64,
+    stale_miner_switch_lag: u64,
+    stale_generation_unclassified: u64,
     blocks_found: u64,
     stratum_connections: u64,
     share_validation_count: u64,
@@ -210,6 +223,9 @@ impl PoolState {
                 shares_accepted: self.shares_accepted,
                 shares_rejected: self.shares_rejected,
                 shares_stale: self.shares_stale,
+                stale_notify_delivery_lag: self.stale_notify_delivery_lag,
+                stale_miner_switch_lag: self.stale_miner_switch_lag,
+                stale_generation_unclassified: self.stale_generation_unclassified,
                 blocks_found: self.blocks_found,
                 stratum_connections: self.stratum_connections,
                 share_validation_count: self.share_validation_count,
@@ -278,6 +294,9 @@ pub struct TotalsSnapshot {
     pub shares_accepted: u64,
     pub shares_rejected: u64,
     pub shares_stale: u64,
+    pub stale_notify_delivery_lag: u64,
+    pub stale_miner_switch_lag: u64,
+    pub stale_generation_unclassified: u64,
     pub blocks_found: u64,
     pub stratum_connections: u64,
     pub share_validation_count: u64,
@@ -443,6 +462,19 @@ mod tests {
         assert_eq!(totals.job_tip_change_count, 1);
         assert_eq!(totals.job_heartbeat_count, 1);
         assert!(totals.last_job_notify_ts.is_some());
+    }
+
+    #[test]
+    fn records_safe_stale_generation_fence_reasons() {
+        let state = SharedPoolState::new();
+        state.record_stale_generation_fence("notify_delivery_lag");
+        state.record_stale_generation_fence("miner_switch_lag");
+        state.record_stale_generation_fence("future_reason");
+
+        let totals = state.snapshot().totals;
+        assert_eq!(totals.stale_notify_delivery_lag, 1);
+        assert_eq!(totals.stale_miner_switch_lag, 1);
+        assert_eq!(totals.stale_generation_unclassified, 1);
     }
 
     #[test]

@@ -1,5 +1,7 @@
 #![allow(clippy::collapsible_if)] // Production remains on Rust 1.86, before stable let chains.
 
+mod replacement_latency;
+
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, symlink_metadata};
 use std::io::Write;
@@ -28,15 +30,18 @@ use csd_pool_protocol::{
 use csd_pool_state::SharedPoolState;
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval, timeout};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use replacement_latency::{FanoutOutcome, ReplacementLatencyTelemetry, UpstreamClass};
+
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 const STALE_JOB_RECONNECT_THRESHOLD: u32 = 3;
+const CLIENT_WRITE_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub enum BridgeError {
@@ -54,6 +59,8 @@ pub enum BridgeError {
     InvalidConfig(String),
     #[error("repository error: {0}")]
     Repository(#[from] csd_pool_db::RepositoryError),
+    #[error("client write exceeded the bounded deadline")]
+    ClientWriteTimeout,
 }
 
 pub type Result<T> = std::result::Result<T, BridgeError>;
@@ -211,25 +218,56 @@ impl JobReason {
 struct RetainedJob {
     job: Arc<PoolJob>,
     published_at: TokioInstant,
+    clean_generation: u64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct RetainedJobs {
     inner: Arc<RwLock<HashMap<String, RetainedJob>>>,
     invalidated_parents: Arc<RwLock<HashSet<[u8; 32]>>>,
+    current_clean_generation: Arc<AtomicU64>,
+    replacement_latency: Arc<ReplacementLatencyTelemetry>,
+}
+
+impl Default for RetainedJobs {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+            invalidated_parents: Arc::new(RwLock::new(HashSet::new())),
+            current_clean_generation: Arc::new(AtomicU64::new(0)),
+            replacement_latency: ReplacementLatencyTelemetry::disabled(),
+        }
+    }
 }
 
 impl RetainedJobs {
+    #[cfg(test)]
     fn with_initial(job: Arc<PoolJob>) -> Self {
-        let jobs = Self::default();
+        Self::with_initial_and_telemetry(job, ReplacementLatencyTelemetry::disabled())
+    }
+
+    fn with_initial_and_telemetry(
+        job: Arc<PoolJob>,
+        replacement_latency: Arc<ReplacementLatencyTelemetry>,
+    ) -> Self {
+        let jobs = Self {
+            replacement_latency,
+            ..Self::default()
+        };
+        jobs.current_clean_generation.store(1, Ordering::Release);
         jobs.inner.write().expect("retained jobs lock").insert(
             job.template.job_id.clone(),
             RetainedJob {
                 job,
                 published_at: TokioInstant::now(),
+                clean_generation: 1,
             },
         );
         jobs
+    }
+
+    fn replacement_latency(&self) -> Arc<ReplacementLatencyTelemetry> {
+        self.replacement_latency.clone()
     }
 
     fn get(&self, job_id: &str) -> Option<Arc<PoolJob>> {
@@ -250,6 +288,36 @@ impl RetainedJobs {
             .is_some_and(|job| self.parent_is_invalidated(&job.template.prev))
     }
 
+    fn clean_generation(&self, job_id: &str) -> Option<u64> {
+        self.inner
+            .read()
+            .expect("retained jobs lock")
+            .get(job_id)
+            .map(|entry| entry.clean_generation)
+    }
+
+    fn current_clean_generation(&self) -> u64 {
+        self.current_clean_generation.load(Ordering::Acquire)
+    }
+
+    fn stale_generation_class(
+        &self,
+        job_id: &str,
+        last_delivered_generation: u64,
+    ) -> StaleGenerationClass {
+        let current_generation = self.current_clean_generation();
+        if last_delivered_generation < current_generation {
+            return StaleGenerationClass::NotifyDeliveryLag;
+        }
+        if self
+            .clean_generation(job_id)
+            .is_some_and(|submitted_generation| submitted_generation < current_generation)
+        {
+            return StaleGenerationClass::MinerSwitchLag;
+        }
+        StaleGenerationClass::Unclassified
+    }
+
     fn parent_is_invalidated(&self, parent: &[u8; 32]) -> bool {
         self.invalidated_parents
             .read()
@@ -259,6 +327,13 @@ impl RetainedJobs {
 
     fn publish(&self, job: Arc<PoolJob>, reason: JobReason, retention: Duration) {
         let now = TokioInstant::now();
+        let clean_generation = match reason {
+            JobReason::TipChange => self
+                .current_clean_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1),
+            JobReason::Heartbeat => self.current_clean_generation(),
+        };
         let mut jobs = self.inner.write().expect("retained jobs lock");
         jobs.retain(|_, entry| now.saturating_duration_since(entry.published_at) <= retention);
         let retained_parents = jobs
@@ -284,6 +359,7 @@ impl RetainedJobs {
             RetainedJob {
                 job,
                 published_at: now,
+                clean_generation,
             },
         );
     }
@@ -316,6 +392,23 @@ impl RetainedJobs {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.read().expect("retained jobs lock").len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StaleGenerationClass {
+    NotifyDeliveryLag,
+    MinerSwitchLag,
+    Unclassified,
+}
+
+impl StaleGenerationClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotifyDeliveryLag => "notify_delivery_lag",
+            Self::MinerSwitchLag => "miner_switch_lag",
+            Self::Unclassified => "unclassified",
+        }
     }
 }
 
@@ -529,6 +622,32 @@ impl SharedJobWatch {
         retention: Duration,
         sentinel_poll: Duration,
     ) -> Result<Self> {
+        Self::start_with_policy_and_sentinel_and_telemetry(
+            provider,
+            tip_sentinel,
+            repository,
+            pool_state,
+            refresh,
+            heartbeat,
+            retention,
+            sentinel_poll,
+            ReplacementLatencyTelemetry::from_env(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_policy_and_sentinel_and_telemetry(
+        provider: Arc<dyn TemplateProvider>,
+        tip_sentinel: Option<Arc<dyn JobTipSentinel>>,
+        repository: Option<Arc<dyn MiningRepository>>,
+        pool_state: SharedPoolState,
+        refresh: Duration,
+        heartbeat: Option<Duration>,
+        retention: Duration,
+        sentinel_poll: Duration,
+        replacement_latency: Arc<ReplacementLatencyTelemetry>,
+    ) -> Result<Self> {
         let mut initial_job = provider.current_job().await?;
         initial_job.notify.clean_jobs = true;
         let initial = Arc::new(initial_job);
@@ -538,7 +657,8 @@ impl SharedJobWatch {
                 .await?;
         }
         pool_state.record_job_notify(JobReason::TipChange.as_str());
-        let retained_jobs = RetainedJobs::with_initial(initial.clone());
+        let retained_jobs =
+            RetainedJobs::with_initial_and_telemetry(initial.clone(), replacement_latency.clone());
         let (sender, _) = watch::channel(initial);
         let refresh_sender = sender.clone();
         let refresh_retained_jobs = retained_jobs.clone();
@@ -550,7 +670,9 @@ impl SharedJobWatch {
             sentinel_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             sentinel_ticker.tick().await;
             let mut last_publish_at = TokioInstant::now();
+            let mut active_latency_event = None;
             loop {
+                replacement_latency.expire();
                 let sentinel_observation = if let Some(sentinel) = tip_sentinel.as_ref() {
                     tokio::select! {
                         _ = ticker.tick() => None,
@@ -574,6 +696,16 @@ impl SharedJobWatch {
                         tip_sentinel_invalidates_parent(&current.template.prev, observation)
                     });
                 if sentinel_forced_refresh {
+                    let source = if sentinel_observation.as_ref().is_some_and(|observation| {
+                        observation.primary.tip_hex != hex::encode(current.template.prev)
+                    }) {
+                        UpstreamClass::PrimaryAlreadyReady
+                    } else {
+                        UpstreamClass::IndependentSentinelAhead
+                    };
+                    active_latency_event = replacement_latency
+                        .observe_upstream(&current.template.job_id, source)
+                        .or(active_latency_event);
                     let invalidated =
                         refresh_retained_jobs.invalidate_parent(&current.template.prev);
                     warn!(
@@ -600,14 +732,28 @@ impl SharedJobWatch {
                     }
                     Ok(tip) => tip,
                     Err(err) => {
+                        if let Some(event_id) = active_latency_event.take() {
+                            replacement_latency.fail_event(event_id, "a_tip_read_failed");
+                        }
                         warn!(%err, "mining tip refresh failed; retaining current job");
                         continue;
                     }
                 };
+                if observed_tip.is_some_and(|tip| tip != current.template.prev) {
+                    active_latency_event = replacement_latency
+                        .observe_upstream(
+                            &current.template.job_id,
+                            UpstreamClass::PrimaryAlreadyReady,
+                        )
+                        .or(active_latency_event);
+                }
                 let refresh_started = Instant::now();
                 let mut next = match provider.current_job().await {
                     Ok(job) => job,
                     Err(err) => {
+                        if let Some(event_id) = active_latency_event.take() {
+                            replacement_latency.fail_event(event_id, "a_template_read_failed");
+                        }
                         warn!(%err, "mining template refresh failed; retaining current job");
                         continue;
                     }
@@ -615,6 +761,9 @@ impl SharedJobWatch {
                 let latest_tip = match provider.current_tip().await {
                     Ok(tip) => tip.or(observed_tip),
                     Err(err) => {
+                        if let Some(event_id) = active_latency_event.take() {
+                            replacement_latency.fail_event(event_id, "a_tip_revalidation_failed");
+                        }
                         warn!(
                             %err,
                             job_id = next.template.job_id,
@@ -654,11 +803,19 @@ impl SharedJobWatch {
                     continue;
                 }
                 let next = Arc::new(next);
+                if reason == JobReason::TipChange {
+                    if let Some(event_id) = active_latency_event {
+                        replacement_latency.mark_a_ready(event_id);
+                    }
+                }
                 if let Some(repository) = repository.as_deref() {
                     if let Err(err) = repository
                         .upsert_job(&job_record_from_pool_job(&next, reason))
                         .await
                     {
+                        if let Some(event_id) = active_latency_event.take() {
+                            replacement_latency.fail_event(event_id, "replacement_persist_failed");
+                        }
                         warn!(%err, job_id = next.template.job_id, "refusing unpersisted mining job");
                         continue;
                     }
@@ -674,6 +831,11 @@ impl SharedJobWatch {
                     refresh_ms = refresh_started.elapsed().as_millis(),
                     "broadcasting refreshed mining job"
                 );
+                if reason == JobReason::TipChange {
+                    if let Some(event_id) = active_latency_event.take() {
+                        replacement_latency.mark_published(event_id, &next.template.job_id);
+                    }
+                }
                 refresh_sender.send_replace(next);
                 last_publish_at = TokioInstant::now();
             }
@@ -754,15 +916,39 @@ fn tip_sentinel_from_env() -> Result<Option<Arc<dyn JobTipSentinel>>> {
         ));
     }
     let (primary_url, _) = live_template_config()?;
-    let secondary_url = secondary_submit_node_url_from_env(&primary_url)?;
-    if normalized_node_url(&primary_url) == normalized_node_url(&secondary_url) {
+    let explicit_sentinel_url = std::env::var("CSD_POOL_TIP_SENTINEL_NODE_URL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let sentinel_url = select_tip_sentinel_node_url(explicit_sentinel_url.as_deref(), || {
+        secondary_submit_node_url_from_env(&primary_url)
+    })?;
+    if normalized_node_url(&primary_url) == normalized_node_url(&sentinel_url) {
         return Err(BridgeError::InvalidConfig(
-            "secondary tip sentinel requires distinct primary and secondary node URLs".into(),
+            "secondary tip sentinel requires distinct primary and sentinel node URLs".into(),
         ));
     }
+    let sentinel_token = select_tip_sentinel_node_token(
+        explicit_sentinel_url.is_some(),
+        std::env::var("CSD_POOL_TIP_SENTINEL_NODE_TOKEN")
+            .ok()
+            .as_deref(),
+        std::env::var("CSD_POOL_NODE_TOKEN").ok().as_deref(),
+    )?;
+    let sentinel_ca_pem = load_tip_sentinel_ca_pem(
+        explicit_sentinel_url.is_some(),
+        &sentinel_url,
+        std::env::var("CSD_POOL_TIP_SENTINEL_NODE_CA_CERT")
+            .ok()
+            .as_deref(),
+    )?;
+    let mut secondary = CsdNodeClient::new(sentinel_url);
+    if let Some(pem) = sentinel_ca_pem.as_deref() {
+        secondary = secondary.with_root_certificate_pem(pem)?;
+    }
+    secondary = secondary.with_bearer_token(sentinel_token);
     Ok(Some(Arc::new(CsdJobTipSentinel {
         primary: CsdNodeClient::from_env(primary_url),
-        secondary: CsdNodeClient::from_env(secondary_url),
+        secondary,
         timeout: Duration::from_millis(
             env_u64("CSD_POOL_SECONDARY_TIP_SENTINEL_TIMEOUT_MS", 750).clamp(100, 5_000),
         ),
@@ -1140,6 +1326,83 @@ fn secondary_submit_node_url_from_env(primary_url: &str) -> Result<String> {
     ))
 }
 
+fn select_tip_sentinel_node_url(
+    explicit: Option<&str>,
+    fallback: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    match explicit.filter(|value| !value.is_empty()) {
+        Some(url) => Ok(url.to_owned()),
+        None => fallback(),
+    }
+}
+
+fn select_tip_sentinel_node_token(
+    independent_url: bool,
+    sentinel_token: Option<&str>,
+    node_token: Option<&str>,
+) -> Result<Option<String>> {
+    let sentinel_token = sentinel_token
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned);
+    if independent_url {
+        return sentinel_token.map(Some).ok_or_else(|| {
+            BridgeError::InvalidConfig(
+                "independent tip sentinel URL requires CSD_POOL_TIP_SENTINEL_NODE_TOKEN".into(),
+            )
+        });
+    }
+    Ok(sentinel_token.or_else(|| {
+        node_token
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+    }))
+}
+
+fn load_tip_sentinel_ca_pem(
+    independent_url: bool,
+    sentinel_url: &str,
+    path: Option<&str>,
+) -> Result<Option<Vec<u8>>> {
+    if !independent_url {
+        if path.is_none_or(|value| value.is_empty()) {
+            return Ok(None);
+        }
+        return Err(BridgeError::InvalidConfig(
+            "CSD_POOL_TIP_SENTINEL_NODE_CA_CERT is only valid with an independent sentinel URL"
+                .into(),
+        ));
+    }
+    if !sentinel_url.to_ascii_lowercase().starts_with("https://") {
+        return Err(BridgeError::InvalidConfig(
+            "CSD_POOL_TIP_SENTINEL_NODE_CA_CERT requires an HTTPS sentinel URL".into(),
+        ));
+    }
+    let path = path.filter(|value| !value.is_empty()).ok_or_else(|| {
+        BridgeError::InvalidConfig(
+            "independent HTTPS tip sentinel requires CSD_POOL_TIP_SENTINEL_NODE_CA_CERT".into(),
+        )
+    })?;
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(BridgeError::InvalidConfig(
+            "CSD_POOL_TIP_SENTINEL_NODE_CA_CERT must be an absolute path".into(),
+        ));
+    }
+    let metadata = symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(BridgeError::InvalidConfig(
+            "CSD_POOL_TIP_SENTINEL_NODE_CA_CERT must be a regular non-symlink file".into(),
+        ));
+    }
+    const MAX_SENTINEL_CA_BYTES: u64 = 64 * 1024;
+    if metadata.len() == 0 || metadata.len() > MAX_SENTINEL_CA_BYTES {
+        return Err(BridgeError::InvalidConfig(
+            "CSD_POOL_TIP_SENTINEL_NODE_CA_CERT has an invalid size".into(),
+        ));
+    }
+    Ok(Some(std::fs::read(path)?))
+}
+
 fn submit_node_name_from_env() -> String {
     std::env::var("CSD_POOL_PRIMARY_SUBMIT_NODE_NAME")
         .ok()
@@ -1172,6 +1435,42 @@ fn database_url_from_env() -> Result<Option<String>> {
         .filter(|value| !value.is_empty()))
 }
 
+async fn write_client_frame_with_deadline<W>(
+    writer: &mut W,
+    frame: &str,
+    deadline: Duration,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match timeout(deadline, writer.write_all(frame.as_bytes())).await {
+        Ok(result) => result.map_err(BridgeError::from),
+        Err(_) => Err(BridgeError::ClientWriteTimeout),
+    }
+}
+
+async fn write_client_frame<W>(writer: &mut W, frame: &str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_client_frame_with_deadline(writer, frame, CLIENT_WRITE_DEADLINE).await
+}
+
+async fn next_clean_job(receiver: &mut watch::Receiver<Arc<PoolJob>>) -> Option<Arc<PoolJob>> {
+    loop {
+        receiver.changed().await.ok()?;
+        let job = receiver.borrow_and_update().clone();
+        if job.notify.clean_jobs {
+            return Some(job);
+        }
+    }
+}
+
+enum AuthorizedSessionEvent {
+    Read(std::io::Result<usize>),
+    Job(Option<Arc<PoolJob>>),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
     stream: TcpStream,
@@ -1187,6 +1486,7 @@ async fn handle_client(
 ) -> Result<()> {
     let _connection_guard = pool_state.connection_guard();
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    let mut replacement_latency_session = retained_jobs.replacement_latency().session(session_id);
     let session_uuid = Uuid::new_v4().to_string();
     let extranonce1_le = (session_id as u32).to_le_bytes();
     // Stratum carries extranonce1 as the raw four-byte value encoded as hex.
@@ -1203,6 +1503,8 @@ async fn handle_client(
     let mut difficulty_suggestion_seen = false;
     let mut accepted_share_seen = false;
     let mut unknown_job_streak = 0_u32;
+    let mut last_delivered_clean_generation = 0_u64;
+    let mut clean_job_rx = job_rx.clone();
 
     info!(%peer, session_id, %session_uuid, "client connected");
     let (read_half, mut write_half) = stream.into_split();
@@ -1213,22 +1515,53 @@ async fn handle_client(
         loop {
         line.clear();
         let n = if authorized_worker.is_some() {
-            tokio::select! {
-                result = reader.read_line(&mut line) => result?,
+            let event = tokio::select! {
+                biased;
+                job = next_clean_job(&mut clean_job_rx) => AuthorizedSessionEvent::Job(job),
                 changed = job_rx.changed() => {
-                    if changed.is_err() {
-                        return Ok(());
-                    }
-                    let current_job = job_rx.borrow_and_update().clone();
+                    let job = changed
+                        .ok()
+                        .map(|()| job_rx.borrow_and_update().clone());
+                    AuthorizedSessionEvent::Job(job)
+                }
+                result = reader.read_line(&mut line) => AuthorizedSessionEvent::Read(result),
+            };
+            match event {
+                AuthorizedSessionEvent::Read(result) => result?,
+                AuthorizedSessionEvent::Job(Some(current_job)) => {
+                    job_rx.borrow_and_update();
+                    clean_job_rx.borrow_and_update();
                     if retained_jobs
                         .get_for_submit(&current_job.template.job_id)
                         .is_some()
                     {
-                        write_half
-                            .write_all(serialize_line(&notify(&current_job.notify))?.as_bytes())
-                            .await?;
+                        let frame = serialize_line(&notify(&current_job.notify))?;
+                        let result = write_client_frame(&mut write_half, &frame).await;
+                        replacement_latency_session.record_notify(
+                            &current_job.template.job_id,
+                            if result.is_ok() {
+                                FanoutOutcome::Success
+                            } else {
+                                FanoutOutcome::Failed
+                            },
+                        );
+                        result?;
+                        if let Some(generation) =
+                            retained_jobs.clean_generation(&current_job.template.job_id)
+                        {
+                            last_delivered_clean_generation =
+                                last_delivered_clean_generation.max(generation);
+                        }
+                    } else {
+                        replacement_latency_session.record_notify(
+                            &current_job.template.job_id,
+                            FanoutOutcome::Skipped,
+                        );
                     }
                     continue;
+                }
+                AuthorizedSessionEvent::Job(None) => {
+                        return Ok(());
                 }
             }
         } else {
@@ -1308,6 +1641,7 @@ async fn handle_client(
                                         "client authorized"
                                     );
                                     authorized_worker = Some(worker);
+                                    replacement_latency_session.authorize();
                                     _address_permit = Some(permit);
                                     response_ok(request.id.unwrap_or(0))
                                 }
@@ -1382,7 +1716,13 @@ async fn handle_client(
                             } else if invalidated_parent {
                                 unknown_job_streak = unknown_job_streak.saturating_add(1);
                                 resync_after_stale_submit = true;
+                                let generation_class = retained_jobs.stale_generation_class(
+                                    &submit.job_id,
+                                    last_delivered_clean_generation,
+                                );
                                 pool_state.record_share_stale(worker_address);
+                                pool_state
+                                    .record_stale_generation_fence(generation_class.as_str());
                                 persist_share_event(
                                     repository.as_deref(),
                                     &share_event_from_submit(
@@ -1562,9 +1902,7 @@ async fn handle_client(
             _ => response_error(request.id.unwrap_or(0), 20, "unknown method"),
         };
 
-        write_half
-            .write_all(serialize_line(&response)?.as_bytes())
-            .await?;
+        write_client_frame(&mut write_half, &serialize_line(&response)?).await?;
 
         if resync_after_stale_submit {
             let mut current_job = (*job_rx.borrow_and_update().clone()).clone();
@@ -1573,9 +1911,17 @@ async fn handle_client(
                 .is_some()
             {
                 current_job.notify.clean_jobs = true;
-                write_half
-                    .write_all(serialize_line(&notify(&current_job.notify))?.as_bytes())
-                    .await?;
+                write_client_frame(
+                    &mut write_half,
+                    &serialize_line(&notify(&current_job.notify))?,
+                )
+                .await?;
+                if let Some(generation) =
+                    retained_jobs.clean_generation(&current_job.template.job_id)
+                {
+                    last_delivered_clean_generation =
+                        last_delivered_clean_generation.max(generation);
+                }
                 info!(
                     %peer,
                     session_id,
@@ -1603,33 +1949,51 @@ async fn handle_client(
         }
 
         if request.method == "mining.authorize" && authorized_worker.is_some() {
-            write_half
-                .write_all(
-                    serialize_line(&set_difficulty(vardiff.current_difficulty()))?.as_bytes(),
-                )
-                .await?;
+            write_client_frame(
+                &mut write_half,
+                &serialize_line(&set_difficulty(vardiff.current_difficulty()))?,
+            )
+            .await?;
             let current_job = job_rx.borrow_and_update().clone();
             if retained_jobs
                 .get_for_submit(&current_job.template.job_id)
                 .is_some()
             {
-                write_half
-                    .write_all(serialize_line(&notify(&current_job.notify))?.as_bytes())
-                    .await?;
+                write_client_frame(
+                    &mut write_half,
+                    &serialize_line(&notify(&current_job.notify))?,
+                )
+                .await?;
+                if let Some(generation) =
+                    retained_jobs.clean_generation(&current_job.template.job_id)
+                {
+                    last_delivered_clean_generation =
+                        last_delivered_clean_generation.max(generation);
+                }
             }
         } else if let Some(difficulty) = pending_difficulty {
-            write_half
-                .write_all(serialize_line(&set_difficulty(difficulty))?.as_bytes())
-                .await?;
+            write_client_frame(
+                &mut write_half,
+                &serialize_line(&set_difficulty(difficulty))?,
+            )
+            .await?;
             let mut difficulty_job = (*job_rx.borrow().clone()).clone();
             difficulty_job.notify.clean_jobs = false;
             if retained_jobs
                 .get_for_submit(&difficulty_job.template.job_id)
                 .is_some()
             {
-                write_half
-                    .write_all(serialize_line(&notify(&difficulty_job.notify))?.as_bytes())
-                    .await?;
+                write_client_frame(
+                    &mut write_half,
+                    &serialize_line(&notify(&difficulty_job.notify))?,
+                )
+                .await?;
+                if let Some(generation) =
+                    retained_jobs.clean_generation(&difficulty_job.template.job_id)
+                {
+                    last_delivered_clean_generation =
+                        last_delivered_clean_generation.max(generation);
+                }
             }
             if session_persisted {
                 if let Some(repository) = repository.as_deref() {
@@ -4695,6 +5059,86 @@ mod tests {
         assert!(!retained.parent_is_retained(&parent));
     }
 
+    #[test]
+    fn clean_generation_fence_distinguishes_delivery_from_miner_switch_lag() {
+        let initial = Arc::new(csd_pool_node::easy_static_job("generation-1"));
+        let retained = RetainedJobs::with_initial(initial.clone());
+        assert_eq!(retained.clean_generation("generation-1"), Some(1));
+
+        let mut heartbeat = csd_pool_node::easy_static_job("generation-1-heartbeat");
+        heartbeat.notify.clean_jobs = false;
+        retained.publish(
+            Arc::new(heartbeat),
+            JobReason::Heartbeat,
+            Duration::from_secs(60),
+        );
+        assert_eq!(retained.clean_generation("generation-1-heartbeat"), Some(1));
+
+        let mut replacement = csd_pool_node::easy_static_job("generation-2");
+        replacement.template.prev = [2; 32];
+        replacement.notify.prev_hash_be_hex = "02".repeat(32);
+        replacement.notify.clean_jobs = true;
+        retained.publish(
+            Arc::new(replacement),
+            JobReason::TipChange,
+            Duration::from_secs(60),
+        );
+        assert_eq!(retained.clean_generation("generation-2"), Some(2));
+        assert_eq!(
+            retained.stale_generation_class("generation-1", 1),
+            StaleGenerationClass::NotifyDeliveryLag
+        );
+        assert_eq!(
+            retained.stale_generation_class("generation-1", 2),
+            StaleGenerationClass::MinerSwitchLag
+        );
+
+        let current = Arc::new(csd_pool_node::easy_static_job("sentinel-invalidated"));
+        let parent = current.template.prev;
+        let sentinel_retained = RetainedJobs::with_initial(current);
+        sentinel_retained.invalidate_parent(&parent);
+        assert_eq!(
+            sentinel_retained.stale_generation_class("sentinel-invalidated", 1),
+            StaleGenerationClass::Unclassified
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_client_write_times_out_instead_of_blocking_clean_job_delivery() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let task = tokio::spawn(async move {
+            write_client_frame_with_deadline(
+                &mut writer,
+                "a frame larger than the one-byte transport",
+                Duration::from_millis(20),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(21)).await;
+        let result = task.await.unwrap();
+        assert!(matches!(result, Err(BridgeError::ClientWriteTimeout)));
+    }
+
+    #[tokio::test]
+    async fn clean_job_waiter_skips_heartbeat_and_returns_replacement() {
+        let initial = Arc::new(csd_pool_node::easy_static_job("waiter-initial"));
+        let (sender, mut receiver) = watch::channel(initial);
+        let waiter = tokio::spawn(async move { next_clean_job(&mut receiver).await });
+
+        let mut heartbeat = csd_pool_node::easy_static_job("waiter-heartbeat");
+        heartbeat.notify.clean_jobs = false;
+        sender.send_replace(Arc::new(heartbeat));
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        let mut clean = csd_pool_node::easy_static_job("waiter-clean");
+        clean.notify.clean_jobs = true;
+        sender.send_replace(Arc::new(clean));
+        let observed = waiter.await.unwrap().expect("clean replacement");
+        assert_eq!(observed.template.job_id, "waiter-clean");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn same_tip_heartbeat_refreshes_without_cleaning_and_retains_old_jobs() {
         let provider = Arc::new(SameTipHeartbeatProvider {
@@ -4997,6 +5441,102 @@ mod tests {
     }
 
     #[test]
+    fn secondary_tip_sentinel_accepts_an_independent_observer_url() {
+        assert_eq!(
+            select_tip_sentinel_node_url(Some("http://127.0.0.1:8792"), || {
+                panic!("independent sentinel URL must not resolve the submit fallback")
+            })
+            .unwrap(),
+            "http://127.0.0.1:8792"
+        );
+    }
+
+    #[test]
+    fn secondary_tip_sentinel_defaults_to_the_secondary_submit_node() {
+        for explicit in [None, Some("")] {
+            assert_eq!(
+                select_tip_sentinel_node_url(explicit, || {
+                    Ok("http://127.0.0.1:8791".to_owned())
+                })
+                .unwrap(),
+                "http://127.0.0.1:8791"
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_tip_sentinel_uses_an_independent_token_with_compatible_fallback() {
+        assert_eq!(
+            select_tip_sentinel_node_token(true, Some("node-c-token"), Some("node-a-token"))
+                .unwrap(),
+            Some("node-c-token".to_owned()),
+        );
+        assert_eq!(
+            select_tip_sentinel_node_token(false, None, Some("node-a-token")).unwrap(),
+            Some("node-a-token".to_owned()),
+        );
+        assert_eq!(
+            select_tip_sentinel_node_token(false, Some(""), Some("")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn secondary_tip_sentinel_requires_a_dedicated_token_for_an_independent_url() {
+        let error = select_tip_sentinel_node_token(true, None, Some("node-a-token")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires CSD_POOL_TIP_SENTINEL_NODE_TOKEN")
+        );
+    }
+
+    #[test]
+    fn secondary_tip_sentinel_ca_is_scoped_to_independent_https() {
+        let path = std::env::temp_dir().join(format!(
+            "csd-pool-sentinel-ca-{}-{}.pem",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"test certificate bytes").unwrap();
+        let path_text = path.to_str().unwrap();
+
+        assert_eq!(
+            load_tip_sentinel_ca_pem(true, "https://127.0.0.1:18900", Some(path_text))
+                .unwrap()
+                .unwrap(),
+            b"test certificate bytes"
+        );
+        assert!(
+            load_tip_sentinel_ca_pem(false, "https://127.0.0.1:18900", Some(path_text)).is_err()
+        );
+        assert!(load_tip_sentinel_ca_pem(true, "http://127.0.0.1:18900", Some(path_text)).is_err());
+        assert!(load_tip_sentinel_ca_pem(true, "https://public.example", None).is_err());
+        assert!(
+            load_tip_sentinel_ca_pem(false, "http://127.0.0.1:8791", None)
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn secondary_tip_sentinel_ca_rejects_bad_paths() {
+        assert!(
+            load_tip_sentinel_ca_pem(true, "https://127.0.0.1:18900", Some("relative.pem"))
+                .is_err()
+        );
+        let missing = std::env::temp_dir().join(format!(
+            "missing-csd-pool-sentinel-ca-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(
+            load_tip_sentinel_ca_pem(true, "https://127.0.0.1:18900", missing.to_str()).is_err()
+        );
+    }
+
+    #[test]
     fn secondary_tip_sentinel_does_not_invalidate_when_b_is_behind() {
         let current = [1; 32];
         let behind = TipSentinelObservation {
@@ -5051,7 +5591,8 @@ mod tests {
         let sentinel = Arc::new(ScriptedTipSentinel {
             state: state.clone(),
         });
-        let jobs = SharedJobWatch::start_with_policy_and_sentinel(
+        let telemetry = ReplacementLatencyTelemetry::enabled_for_test(0x5566_7788);
+        let jobs = SharedJobWatch::start_with_policy_and_sentinel_and_telemetry(
             provider,
             Some(sentinel),
             None,
@@ -5060,6 +5601,7 @@ mod tests {
             None,
             Duration::from_secs(60),
             Duration::from_millis(5),
+            telemetry.clone(),
         )
         .await
         .unwrap();
@@ -5095,6 +5637,20 @@ mod tests {
         assert!(current.notify.clean_jobs);
         assert!(jobs.retained_jobs().get(&old_job_id).is_some());
         assert!(jobs.retained_jobs().get_for_submit(&old_job_id).is_none());
+        let summary = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(summary) = telemetry.take_completed().pop() {
+                    break summary;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(summary.source, "independent_sentinel_ahead");
+        assert_eq!(summary.reason, "zero_sessions");
+        assert!(summary.observed_to_a_ready_ms.is_some());
+        assert!(summary.a_ready_to_published_ms.is_some());
     }
 
     #[tokio::test]
@@ -5150,6 +5706,261 @@ mod tests {
         }
 
         assert_eq!(observed_jobs, ["job-initial", "job-refreshed"]);
+        session.abort();
+    }
+
+    #[tokio::test]
+    async fn queued_clean_job_precedes_a_ready_client_request() {
+        let jobs = SharedJobWatch::start_with_policy(
+            Arc::new(StaticTemplateProvider::easy_job("priority-initial")),
+            None,
+            SharedPoolState::new(),
+            Duration::from_secs(60),
+            None,
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_stream, peer) = listener.accept().await.unwrap();
+        let abuse = Arc::new(AbuseManager::default());
+        let permit = abuse.try_open(peer.ip()).unwrap();
+        let session = tokio::spawn(handle_client(
+            server_stream,
+            peer,
+            SharedPoolState::new(),
+            jobs.subscribe(),
+            jobs.retained_jobs(),
+            None,
+            None,
+            abuse,
+            VardiffConfig::default(),
+            permit,
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+        write_half
+            .write_all(
+                b"{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"0123456789abcdef0123456789abcdef01234567.priority\",\"x\"]}\n",
+            )
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+        }
+
+        write_half
+            .write_all(b"{\"id\":9,\"method\":\"unknown.ready.request\",\"params\":[]}\n")
+            .await
+            .unwrap();
+        let mut replacement = csd_pool_node::easy_static_job("priority-clean");
+        replacement.template.prev = [3; 32];
+        replacement.notify.prev_hash_be_hex = "03".repeat(32);
+        replacement.notify.clean_jobs = true;
+        let replacement = Arc::new(replacement);
+        jobs.retained_jobs().publish(
+            replacement.clone(),
+            JobReason::TipChange,
+            Duration::from_secs(600),
+        );
+        jobs.sender.send_replace(replacement);
+
+        let mut first_line = String::new();
+        reader.read_line(&mut first_line).await.unwrap();
+        let first: serde_json::Value = serde_json::from_str(first_line.trim()).unwrap();
+        assert_eq!(first["method"], "mining.notify");
+        assert_eq!(first["params"][0], "priority-clean");
+        assert_eq!(first["params"][8], true);
+
+        let mut second_line = String::new();
+        reader.read_line(&mut second_line).await.unwrap();
+        let second: serde_json::Value = serde_json::from_str(second_line.trim()).unwrap();
+        assert_eq!(second["id"], 9);
+        session.abort();
+    }
+
+    #[tokio::test]
+    async fn replacement_latency_tracks_primary_tip_through_clean_session_fanout() {
+        let provider = Arc::new(TipAwareTemplateProvider {
+            calls: AtomicUsize::new(0),
+            tip_changed: AtomicBool::new(false),
+        });
+        let telemetry = ReplacementLatencyTelemetry::enabled_for_test(0x1122_3344);
+        let jobs = SharedJobWatch::start_with_policy_and_sentinel_and_telemetry(
+            provider.clone(),
+            None,
+            None,
+            SharedPoolState::new(),
+            Duration::from_millis(20),
+            None,
+            Duration::from_secs(60),
+            Duration::from_millis(20),
+            telemetry.clone(),
+        )
+        .await
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_stream, peer) = listener.accept().await.unwrap();
+        let abuse = Arc::new(AbuseManager::default());
+        let permit = abuse.try_open(peer.ip()).unwrap();
+        let session = tokio::spawn(handle_client(
+            server_stream,
+            peer,
+            SharedPoolState::new(),
+            jobs.subscribe(),
+            jobs.retained_jobs(),
+            None,
+            None,
+            abuse,
+            VardiffConfig::default(),
+            permit,
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+        write_half
+            .write_all(
+                b"{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"0123456789abcdef0123456789abcdef01234567\",\"x\"]}\n",
+            )
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(telemetry.stats().active_session_total, 1);
+
+        provider.tip_changed.store(true, Ordering::SeqCst);
+        let replacement_job = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                if frame["method"] == "mining.notify" {
+                    break frame["params"][0].as_str().unwrap().to_owned();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(replacement_job, "job-refreshed");
+
+        let summary = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(summary) = telemetry.take_completed().pop() {
+                    break summary;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(summary.source, "primary_already_ready");
+        assert_eq!(summary.status, "complete");
+        assert_eq!(summary.reason, "all_notified");
+        assert_eq!(summary.target_sessions, 1);
+        assert_eq!(summary.notify_success, 1);
+        assert!(summary.observed_to_a_ready_ms.is_some());
+        assert!(summary.a_ready_to_published_ms.is_some());
+        assert!(summary.published_to_fanout_ms.is_some());
+        session.abort();
+    }
+
+    #[tokio::test]
+    async fn contended_replacement_latency_never_delays_tcp_clean_job() {
+        let provider = Arc::new(TipAwareTemplateProvider {
+            calls: AtomicUsize::new(0),
+            tip_changed: AtomicBool::new(false),
+        });
+        let telemetry = ReplacementLatencyTelemetry::enabled_for_test(0x2233_4455);
+        let jobs = SharedJobWatch::start_with_policy_and_sentinel_and_telemetry(
+            provider.clone(),
+            None,
+            None,
+            SharedPoolState::new(),
+            Duration::from_millis(20),
+            None,
+            Duration::from_secs(60),
+            Duration::from_millis(20),
+            telemetry.clone(),
+        )
+        .await
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_stream, peer) = listener.accept().await.unwrap();
+        let abuse = Arc::new(AbuseManager::default());
+        let permit = abuse.try_open(peer.ip()).unwrap();
+        let session = tokio::spawn(handle_client(
+            server_stream,
+            peer,
+            SharedPoolState::new(),
+            jobs.subscribe(),
+            jobs.retained_jobs(),
+            None,
+            None,
+            abuse,
+            VardiffConfig::default(),
+            permit,
+        ));
+
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+        write_half
+            .write_all(
+                b"{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"0123456789abcdef0123456789abcdef01234567\",\"x\"]}\n",
+            )
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let blocking_telemetry = telemetry.clone();
+        let blocker = std::thread::spawn(move || {
+            blocking_telemetry.hold_state_until_released_for_test(ready_tx, release_rx);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        provider.tip_changed.store(true, Ordering::SeqCst);
+        let frame = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                if frame["method"] == "mining.notify" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(frame["params"][0], "job-refreshed");
+        assert_eq!(frame["params"].as_array().unwrap().last().unwrap(), true);
+
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+        assert!(telemetry.stats().lock_contention_total > 0);
+        assert!(telemetry.take_completed().is_empty());
         session.abort();
     }
 
