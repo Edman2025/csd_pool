@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="${1:-${CSD_SOURCE_DIR:-}}"
 EXPECTED_COMMIT="d2884dd7d8dbcdb6322af66afa0f0f833a9ab98c"
-EXPECTED_PATCH_SHA256="39a36f3af0f6d3bc6ab5f6efe538d45377a58302f90b80fc0a6678f4019f9b05"
+EXPECTED_PATCH_SHA256="06b2d72e59feacb9c30b6bea0607e4c49fc633cae8689687f51f5844b04a8c41"
 EXPECTED_P2P_PATCH_SHA256="51dd08cc9cfc0a4539afa67558c1ae005c165d615223e825e75130352eec2075"
 PATCH_FILE="$SCRIPT_DIR/compute-substrate-pool-adapter.patch"
 P2P_PATCH_FILE="$SCRIPT_DIR/compute-substrate-p2p-backoff.patch"
@@ -44,15 +44,14 @@ search_source() {
 for path in src/api/mod.rs src/chain/mine.rs src/cli/main.rs src/net/mempool.rs src/net/mod.rs src/net/node.rs src/net/proto.rs; do
   git -C "$SOURCE_DIR" diff --quiet -- "$path" || fail "source file already modified: $path"
 done
+for path in src/net/full_block_delivery.rs src/net/receipt.rs tests/idle_connection_timeout.rs; do
+  [[ ! -e "$SOURCE_DIR/$path" ]] || fail "adapter-owned source already exists: $path"
+done
 
-# The pinned upstream files are not rustfmt-clean. Normalize only the three
-# adapter-owned files so the compact reviewed patch applies deterministically.
-rustfmt --edition 2021 \
-  "$SOURCE_DIR/src/api/mod.rs" \
-  "$SOURCE_DIR/src/chain/mine.rs" \
-  "$SOURCE_DIR/src/cli/main.rs"
+# The adapter patch is self-contained against the exact pinned upstream bytes.
+# It folds in the separately reviewed P2P backoff change so replay cannot apply
+# that overlapping node.rs patch twice.
 patch -d "$SOURCE_DIR" -p1 --forward <"$PATCH_FILE"
-patch -d "$SOURCE_DIR" -p1 --forward <"$P2P_PATCH_FILE"
 
 search_source 'CSD_POOL_ADAPTER_TOKEN' "$SOURCE_DIR/src/api/mod.rs" || \
   fail "adapter authentication code missing after patch"
@@ -93,18 +92,22 @@ search_source 'duplicate_publish_is_idempotent_not_a_new_broadcast' "$SOURCE_DIR
   fail "duplicate mined-header publish idempotency replay missing after patch"
 search_source 'actual_gossipsub_peer_ack_corresponds_to_delivered_header' "$SOURCE_DIR/src/net/node.rs" || \
   fail "actual gossipsub peer delivery replay missing after patch"
-search_source 'signed_application_receipt_round_trips_from_remote_peer' "$SOURCE_DIR/src/net/node.rs" || \
-  fail "signed remote header receipt replay missing after patch"
-search_source 'signed_receipt_path_recovers_after_observer_disconnect' "$SOURCE_DIR/src/net/node.rs" || \
-  fail "signed remote header receipt reconnect replay missing after patch"
-search_source 'receipt_rejects_wrong_genesis_unsigned_self_and_unknown_hash' "$SOURCE_DIR/src/net/node.rs" || \
-  fail "header receipt forgery and scope negative replay missing after patch"
-search_source 'TOPIC_HDR_ACK' "$SOURCE_DIR/src/net/proto.rs" || \
-  fail "signed remote header receipt topic missing after patch"
-search_source '/api/rpc/block/relay-status' "$SOURCE_DIR/src/api/mod.rs" || \
-  fail "authenticated relay receipt status endpoint missing after patch"
-search_source 'not proof of full-block validation or canonical acceptance' "$SOURCE_DIR/src/api/mod.rs" || \
-  fail "relay receipt scope is not explicit after patch"
+search_source 'local_publish_never_becomes_gossip_seen_but_remote_signal_is_signed' "$SOURCE_DIR/src/net/receipt.rs" || \
+  fail "remote-signal/local-publish boundary replay missing after patch"
+search_source 'simultaneous_same_header_publish_is_deduplicated_before_inbound_callbacks' "$SOURCE_DIR/src/net/node.rs" || \
+  fail "simultaneous header deduplication replay missing after patch"
+search_source 'actual_remote_receipt_follows_real_gossipsub_delivery' "$SOURCE_DIR/src/net/node.rs" || \
+  fail "actual remote gossip delivery replay missing after patch"
+search_source 'actual_sync_full_block_flush_remains_delivery_attempt_without_remote_ack' "$SOURCE_DIR/src/net/node.rs" || \
+  fail "full-block delivery-attempt replay missing after patch"
+search_source '/api/rpc/block/full-delivery-status' "$SOURCE_DIR/src/api/mod.rs" || \
+  fail "authenticated full-block delivery status endpoint missing after patch"
+search_source 'NOT_OBSERVABLE_PROTOCOL_NO_ACK' "$SOURCE_DIR/src/net/full_block_delivery.rs" || \
+  fail "protocol no-ACK evidence boundary missing after patch"
+search_source 'remote_application_ack_supported: false' "$SOURCE_DIR/src/net/full_block_delivery.rs" || \
+  fail "remote application ACK boundary missing after patch"
+search_source 'CSD_HEADER_RECEIPT_OBSERVER_PEER' "$SOURCE_DIR/src/cli/main.rs" || \
+  fail "explicit receipt observer configuration missing after patch"
 search_source 'InsufficientPeers' "$SOURCE_DIR/src/net/node.rs" || \
   fail "gossipsub publish failures are not classified after patch"
 search_source 'choose_pool_block_time' "$SOURCE_DIR/src/api/mod.rs" || \
@@ -130,7 +133,10 @@ fi
 if [[ "${CSD_NODE_ADAPTER_SKIP_BUILD:-0}" != "1" ]]; then
   cargo test --manifest-path "$SOURCE_DIR/Cargo.toml" --lib pool_candidate_tests
   cargo test --manifest-path "$SOURCE_DIR/Cargo.toml" --lib pool_header_publish_tests
+  cargo test --manifest-path "$SOURCE_DIR/Cargo.toml" --lib full_block_delivery
+  cargo test --manifest-path "$SOURCE_DIR/Cargo.toml" --lib receipt
   cargo test --manifest-path "$SOURCE_DIR/Cargo.toml" --lib dial_backoff_tests
+  cargo test --manifest-path "$SOURCE_DIR/Cargo.toml" --test idle_connection_timeout
   cargo check --manifest-path "$SOURCE_DIR/Cargo.toml" --lib --bin csd
   if [[ "${CSD_NODE_ADAPTER_SKIP_RELEASE_BUILD:-0}" != "1" ]]; then
     cargo build --manifest-path "$SOURCE_DIR/Cargo.toml" --release --bin csd
@@ -140,5 +146,6 @@ fi
 printf 'source_commit=%s\n' "$EXPECTED_COMMIT"
 printf 'patch_sha256=%s\n' "$EXPECTED_PATCH_SHA256"
 printf 'p2p_patch_sha256=%s\n' "$EXPECTED_P2P_PATCH_SHA256"
+printf 'p2p_patch_mode=folded_into_adapter\n'
 printf 'adapter_token_env=CSD_POOL_ADAPTER_TOKEN\n'
 printf 'summary: official CSD node pool adapter applied and built\n'
